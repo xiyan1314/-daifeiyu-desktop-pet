@@ -7,11 +7,11 @@
 对外接口：
 - init(sounds_dir)：扫描 sounds_dir 下的 ya1.wav / ya2.wav / d1.wav / d2.wav，
   记录存在的文件路径；在 GUI 环境下（QCoreApplication 已创建）预建 QtMultimedia
-  QSoundEffect 效果器；同时预合成 3 个回退音。
+  QSoundEffect 效果器（回退音在模块加载时已合成）。
 - play(kind)：kind ∈ {press, release, feed}，按三级链路播放：
-    1) winsound SND_FILENAME 播放 wav 文件（主链路：老 waveOut 通道，独立于
-       WASAPI 会话，实测最稳；NOWAIT 防驱动忙时阻塞 UI）；
-    2) QSoundEffect 播放 wav 文件（备用：winsound 异常/非 Windows 时）；
+    1) winsound SND_FILENAME 播放 wav 文件（主链路：waveOut 渲染路径，与
+       Qt 的进程级 WASAPI 会话是不同路径，实测最稳；SND_ASYNC 异步替换播放）；
+    2) QSoundEffect 播放 wav 文件（仅 winsound 不存在时——非 Windows）；
     3) winsound SND_MEMORY 播放合成回退音。
   任何一级失败静默降级到下一级，绝不抛出。
 
@@ -32,6 +32,7 @@ Copyright (c) 大肥鱼桌宠项目
 import math
 import os
 import struct
+import time
 import wave
 
 try:
@@ -59,6 +60,9 @@ _QSoundEffect = None
 _device_hooked = False
 # QMediaDevices 实例保活引用（PySide6 6.11 的信号需从实例连接）
 _media_devices = None
+# 设备切换去抖状态（_on_default_device_changed 用）
+_last_rebuild_ts = 0.0
+_last_device_id = None
 
 
 # ---------------- 合成回退音（参考现有 play_sound 实现） ----------------
@@ -166,6 +170,12 @@ def _rebuild_effects():
         if path is None:
             _effects[name] = None
             continue
+        old = _effects.get(name)
+        if old is not None:
+            try:
+                old.stop()  # 停掉旧效果器再替换，避免掐断瞬间的残余播放
+            except Exception:
+                pass
         try:
             eff = _QSoundEffect()
             eff.setSource(QUrl.fromLocalFile(path))
@@ -176,18 +186,43 @@ def _rebuild_effects():
 
 
 def _on_default_device_changed(*_args):
-    """默认音频输出设备切换：重建效果器，避免切设备后静默无声。"""
+    """音频输出设备变化：去抖合并成批事件，且仅当默认输出设备真的变了才重建。
+
+    Windows 一次插拔会连发多个 audioOutputsChanged（新增/默认变化/状态变化），
+    300ms 去抖 + 设备 id 比对避免风暴式重建（每次重建会掐断正在播的备用音）。
+    """
+    global _last_rebuild_ts, _last_device_id
+    try:
+        from PySide6.QtMultimedia import QMediaDevices
+        dev_id = QMediaDevices.defaultAudioOutput().id()
+    except Exception:
+        dev_id = None
+    now = time.monotonic()
+    if dev_id is not None and dev_id == _last_device_id:
+        return  # 默认设备没变：忽略列表噪声
+    if now - _last_rebuild_ts < 0.3:
+        return  # 去抖：合并成批事件
+    _last_rebuild_ts = now
+    _last_device_id = dev_id
     _rebuild_effects()
 
 
 def _winsound_file_play(wav_name):
-    """winsound 文件播放（主链路，老 waveOut 通道，独立于 WASAPI 会话最稳）。
+    """winsound 文件播放（主链路，waveOut 渲染路径，与 Qt 进程级 WASAPI 会话不同）。
 
-    NOWAIT：驱动忙时立即返回不阻塞 UI（代价是偶发跳过一次音，比卡顿/无声好）。
+    SND_ASYNC：异步播放，新音替换未放完的旧音（快速连按时后一声截断前一声）。
+    SND_NOWAIT：现代 Windows 上为空操作，保留仅为兼容遗留系统。
     返回是否已发出（异常为 False）。
     """
     path = _wav_paths.get(wav_name)
     if winsound is None or path is None:
+        return False
+    # SND_ASYNC 下 PlaySound 对「已不存在/不可读」的文件仍返回成功且不抛异常，
+    # 故播放前重探一次文件存在性，失败时让链路继续降级
+    try:
+        if not os.path.isfile(path):
+            return False
+    except Exception:
         return False
     try:
         winsound.PlaySound(
@@ -225,21 +260,26 @@ def play(kind):
         return  # 未知 kind：直接返回
     wav_name, fb_name = pair
 
-    # 1) winsound 播放真实 wav 文件（主链路：waveOut 通道独立于 WASAPI 会话，
-    #    不受 QSoundEffect 运行中静默失声影响；NOWAIT 防驱动忙时阻塞 UI）
+    # 1) winsound 播放真实 wav 文件（主链路：waveOut 渲染路径，与 Qt 的进程级
+    #    WASAPI 会话不同，不受 QSoundEffect 运行中静默失声影响；SND_ASYNC 异步替换）
     if _winsound_file_play(wav_name):
         return
 
-    # 2) QSoundEffect（备用：winsound 异常/非 Windows 时；多音可叠加）
-    eff = _effects.get(wav_name)
-    if _qt_playable(eff):
-        try:
-            eff.play()
-            return
-        except Exception:
-            pass  # 播放入口异常：降级到合成回退
+    # 2) QSoundEffect 备用：仅在 winsound 不存在（非 Windows）时使用。
+    #    在 Windows 上跳过它——Qt 的「status Ready 但无声」正是本次要修的故障，
+    #    若 winsound 瞬时失败而 Qt 静默占位，会挡住第 3 级合成兜底发声。
+    if winsound is None:
+        eff = _effects.get(wav_name)
+        if _qt_playable(eff):
+            try:
+                eff.play()
+                return
+            except Exception:
+                pass  # 播放入口异常：降级到合成回退
 
-    # 3) 合成回退音（SND_MEMORY；NOWAIT 仅作最后兜底的防阻塞保险）
+    # 3) 合成回退音（SND_MEMORY 同步播放：CPython 硬编码禁止
+    #    SND_MEMORY|SND_ASYNC 组合——会无条件抛 RuntimeError 被吞，导致兜底从不发声。
+    #    同步播放会阻塞 0.09~0.24s，仅在最兜底路径发生，可接受）
     if winsound is None:
         return
     data = _fallback.get(fb_name)
@@ -248,7 +288,7 @@ def play(kind):
     try:
         winsound.PlaySound(
             data,
-            winsound.SND_MEMORY | winsound.SND_ASYNC | winsound.SND_NODEFAULT | winsound.SND_NOWAIT,
+            winsound.SND_MEMORY | winsound.SND_NODEFAULT,
         )
     except Exception:
         pass  # 任何异常静默跳过，不抛
@@ -271,7 +311,7 @@ if __name__ == "__main__":
     print("  effects built:", sum(1 for e in _effects.values() if e is not None))
 
     print("=== 冒烟 2：不存在的目录（验证回退路径） ===")
-    init(r"E:\deep seek\desktop-pet\assets\__no_such_dir__")
+    init(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "__no_such_dir__"))
     for name in _WAV_NAMES:
         print("  %s.wav -> path=%s" % (name, "None" if _wav_paths[name] is None else "set"))
     for k in ("press", "release", "feed"):
