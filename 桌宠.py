@@ -299,6 +299,9 @@ LINES_SAJIAO = [
     "略略略，抓不到我~",
     "我、我什么都不知道！",
     "证据呢？没有证据不能冤枉鱼！",
+    "嘶——本专员只是路过案发现场~",
+    "蛇蛇我呀，才没有偷吃小鱼干呢！",
+    "本专员宣布：蛋糕失窃案与我无关！",
 ]
 LINES_GREEDY = [
     "小鱼干！小鱼干在哪里！",
@@ -358,6 +361,9 @@ WEATHER_CODES = {
 MAX_REPLY_LEN = 25
 SYSTEM_PROMPT = (
     "你是一只叫大肥鱼的桌面宠物，又娇又耍赖、贪吃、被吓到就浑身发抖。"
+    "性格参考绝区零的希希芙（网友叫她「啥子蛇」）：自称只遵循本能、自私任性的「坏蛋」，"
+    "嘴上冷血毒舌，其实心软护短；经常「嘶~」地吐蛇信子，爱用「本专员」自称，"
+    "把贪吃耍赖包装成案件调查（比如小鱼干失踪案、蛋糕失窃案）。"
     "你把用户称呼为「绳匠」。"
     "回答必须中文、俏皮贱萌、不超过%d个字。"
     "喜欢说：喜欢的，就咬住不放~"
@@ -1634,16 +1640,25 @@ class PetWindow(QWidget):
             if not self.cfg.get("api_key"):
                 self.cfg["ai_enabled"] = False
                 save_config(self.cfg)
+                if self._ai_act:
+                    self._ai_act.setChecked(False)  # 同步菜单勾选状态，避免残留
                 self.show_bubble("要先填 DeepSeek API Key 才能开 AI 对话哦~")
 
     def _set_api_key(self):
-        dlg = QInputDialog(None)
+        # 挂到桌宠窗口（置顶窗口的子对话框必然显示在最上层）：
+        # 桌宠本身 WindowDoesNotAcceptFocus + 无父对话框会被 Windows 前台锁拦下（只响一声）
+        dlg = QInputDialog(self)
         dlg.setWindowTitle("设置DeepSeek API Key")
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         if self.cfg.get("api_key"):
             dlg.setLabelText("已配置 Key（加密保存）。输入新值可覆盖；清空请用菜单「清除DeepSeek API Key」：")
         else:
             dlg.setLabelText("请输入 DeepSeek API Key（sk-开头）：")
         dlg.setTextEchoMode(QLineEdit.EchoMode.Password)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.setFocus()  # 前台锁残余风险：显式请求键盘焦点
         if dlg.exec() == QDialog.DialogCode.Accepted:
             key = dlg.textValue().strip()
             if key:
@@ -1680,10 +1695,19 @@ class PetWindow(QWidget):
         if self._ai_inflight:
             self.show_bubble("还在想呢，等一下下~")
             return
-        msg, ok = QInputDialog.getText(None, "和它说话", "你想对大肥鱼说什么？")
-        if not (ok and msg.strip()):
+        dlg = QInputDialog(self)  # 挂到桌宠窗口，确保对话框正常显示（见 _set_api_key 注释）
+        dlg.setWindowTitle("和它说话")
+        dlg.setLabelText("你想对大肥鱼说什么？")
+        dlg.setTextValue("")
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.setFocus()  # 前台锁残余风险：显式请求键盘焦点
+        ok = dlg.exec() == QDialog.DialogCode.Accepted
+        msg = dlg.textValue().strip()
+        if not (ok and msg):
             return
-        msg = msg.strip()
         # 夸夸检测：本地触发害羞脸红，无需 API Key
         if any(k in msg for k in self.PRAISE_KEYWORDS):
             self.mood.blush()
@@ -1694,7 +1718,9 @@ class PetWindow(QWidget):
             save_config(self.cfg)
         if not self.cfg.get("api_key"):
             self._set_api_key()
-            return
+            if not self.cfg.get("api_key"):
+                return  # 没填 Key：放弃本次对话
+            # 刚填好 Key：继续用刚才输入的话发起对话，不用重新再打一遍
         self._ai_inflight = True
         threading.Thread(target=self._ai_worker, args=(msg, self.cfg.get("api_key", "")), daemon=True).start()
 
@@ -1721,6 +1747,12 @@ class PetWindow(QWidget):
             )
             if resp.status_code == 401:
                 signals.reply.emit("API Key 不对，查一下？")
+                return
+            if resp.status_code == 402:
+                signals.reply.emit("DeepSeek 余额不足，去平台充点~")
+                return
+            if resp.status_code == 429:
+                signals.reply.emit("问太多次啦，歇会儿再来~")
                 return
             resp.raise_for_status()
             data = resp.json()
@@ -1996,9 +2028,11 @@ class PetWindow(QWidget):
         self.show()
 
     def _about(self):
-        QMessageBox.information(
-            None, "关于", "%s v%s\nPySide6 桌宠 · MIT License\n喜欢的，就咬住不放~" % (APP_NAME, VERSION)
-        )
+        box = QMessageBox(self)
+        box.setWindowTitle("关于")
+        box.setText("%s v%s\nPySide6 桌宠 · MIT License\n喜欢的，就咬住不放~" % (APP_NAME, VERSION))
+        box.setWindowFlags(box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        box.exec()
 
     def _quit(self):
         """退出：停止全部定时器/动画、隐藏窗口、清理临时文件，然后结束进程。"""
@@ -2051,7 +2085,24 @@ def _excepthook(exc_type, exc_value, tb):
         pass
     try:
         if threading.current_thread() is threading.main_thread():
-            QMessageBox.critical(None, "大肥鱼桌宠出错了", "发生了未处理的错误，详情见 error.log")
+            # 父窗口优先取桌宠本体（顶层可见窗口顺序不契约，可能先匹配到气泡等小窗）
+            parent = None
+            app = QApplication.instance()
+            if app is not None:
+                for w in app.topLevelWidgets():
+                    if isinstance(w, PetWindow) and w.isVisible():
+                        parent = w
+                        break
+                if parent is None:
+                    for w in app.topLevelWidgets():
+                        if w.isVisible():
+                            parent = w
+                            break
+            box = QMessageBox(parent)
+            box.setWindowFlags(box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+            box.setWindowTitle("大肥鱼桌宠出错了")
+            box.setText("发生了未处理的错误，详情见 error.log")
+            box.exec()
     except Exception:
         pass
 
