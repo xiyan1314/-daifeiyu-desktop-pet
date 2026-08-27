@@ -9,16 +9,18 @@
   记录存在的文件路径；在 GUI 环境下（QCoreApplication 已创建）预建 QtMultimedia
   QSoundEffect 效果器；同时预合成 3 个回退音。
 - play(kind)：kind ∈ {press, release, feed}，按三级链路播放：
-    1) QSoundEffect 播放 wav 文件（现代音频通道，多音可叠加、不阻塞）；
-    2) winsound SND_FILENAME 播放 wav 文件；
+    1) winsound SND_FILENAME 播放 wav 文件（主链路：老 waveOut 通道，独立于
+       WASAPI 会话，实测最稳；NOWAIT 防驱动忙时阻塞 UI）；
+    2) QSoundEffect 播放 wav 文件（备用：winsound 异常/非 Windows 时）；
     3) winsound SND_MEMORY 播放合成回退音。
   任何一级失败静默降级到下一级，绝不抛出。
 
 实现要点：
 - 仅 winsound / wave / os / math / struct 为顶层依赖；PySide6.QtMultimedia 惰性导入，
   模块本身在无 GUI 环境下也可正常 import（冒烟测试走 winsound 路径）。
-- 不再依赖 SND_MEMORY + SND_NOWAIT 作为主链路：SND_NOWAIT 在驱动忙时会直接丢音，
-  导致用户「听不到音效」；QSoundEffect 三个独立效果器可叠加播放且全程不阻塞。
+- 曾用 QSoundEffect 作主链路：它在部分 Windows 机器上会「运行中静默失声」
+  （status 仍 Ready、isPlaying 仍 True，但不出声），表现为音效过一会/换形态后消失；
+  故主链路回归 winsound，Qt 效果器仅作备份，并监听音频设备变化自动重建。
 - 所有播放路径都静默处理异常，绝不抛出，避免打断主循环。
 
 Python 3.8+ 兼容。
@@ -53,14 +55,10 @@ _wav_duration = {name: None for name in _WAV_NAMES}
 _effects = {name: None for name in _WAV_NAMES}
 # QSoundEffect 类引用缓存（init 时惰性导入一次，play() 热路径直接使用）
 _QSoundEffect = None
-# 播放验证定时器：play() 后 90ms 检查是否真的在响，静默失败则补一发 winsound
-_verify_timers = {}
 # 默认音频设备切换钩子是否已连接（init 幂等调用防重复连接）
 _device_hooked = False
 # QMediaDevices 实例保活引用（PySide6 6.11 的信号需从实例连接）
 _media_devices = None
-# 最短音效时长（秒）：验证检查必须小于它，否则音已放完误判
-_MIN_WAV_SECONDS = 0.10
 
 
 # ---------------- 合成回退音（参考现有 play_sound 实现） ----------------
@@ -183,48 +181,22 @@ def _on_default_device_changed(*_args):
 
 
 def _winsound_file_play(wav_name):
-    """winsound 文件播放（二级链路）；返回是否已发出。"""
+    """winsound 文件播放（主链路，老 waveOut 通道，独立于 WASAPI 会话最稳）。
+
+    NOWAIT：驱动忙时立即返回不阻塞 UI（代价是偶发跳过一次音，比卡顿/无声好）。
+    返回是否已发出（异常为 False）。
+    """
     path = _wav_paths.get(wav_name)
     if winsound is None or path is None:
         return False
     try:
         winsound.PlaySound(
             path,
-            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT | winsound.SND_NOWAIT,
         )
         return True
     except Exception:
         return False
-
-
-def _verify_playback(kind, wav_name):
-    """play() 90ms 后验证：QSoundEffect 静默失败（如音频会话切换瞬间）时补一发 winsound。"""
-    eff = _effects.get(wav_name)
-    if eff is None:
-        return
-    try:
-        if eff.status() == _QSoundEffect.Status.Ready and not eff.isPlaying():
-            _winsound_file_play(wav_name)  # Qt 没响：保证用户至少听到一版
-    except Exception:
-        pass
-
-
-def _schedule_verify(kind, wav_name):
-    """安排 90ms 播放验证（QTimer 需要 GUI 事件循环；无 GUI 时跳过）。"""
-    try:
-        from PySide6.QtCore import QCoreApplication, QTimer
-    except Exception:
-        return
-    if QCoreApplication.instance() is None:
-        return
-    t = _verify_timers.get(kind)
-    if t is None:
-        t = QTimer()
-        t.setSingleShot(True)
-        t.setInterval(90)
-        t.timeout.connect(lambda: _verify_playback(kind, wav_name))
-        _verify_timers[kind] = t
-    t.start()
 
 
 # kind -> (素材名, 回退音名)
@@ -253,19 +225,19 @@ def play(kind):
         return  # 未知 kind：直接返回
     wav_name, fb_name = pair
 
-    # 1) QSoundEffect（现代音频通道，多音可叠加，不阻塞）
+    # 1) winsound 播放真实 wav 文件（主链路：waveOut 通道独立于 WASAPI 会话，
+    #    不受 QSoundEffect 运行中静默失声影响；NOWAIT 防驱动忙时阻塞 UI）
+    if _winsound_file_play(wav_name):
+        return
+
+    # 2) QSoundEffect（备用：winsound 异常/非 Windows 时；多音可叠加）
     eff = _effects.get(wav_name)
     if _qt_playable(eff):
         try:
             eff.play()
-            _schedule_verify(kind, wav_name)  # 90ms 后静默失败检测 → winsound 补发
             return
         except Exception:
-            pass  # 播放入口异常：降级到 winsound 文件
-
-    # 2) winsound 播放真实 wav 文件（异步、驱动忙时以新音替换旧音，不阻塞）
-    if _winsound_file_play(wav_name):
-        return
+            pass  # 播放入口异常：降级到合成回退
 
     # 3) 合成回退音（SND_MEMORY；NOWAIT 仅作最后兜底的防阻塞保险）
     if winsound is None:
