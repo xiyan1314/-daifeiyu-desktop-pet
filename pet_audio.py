@@ -53,6 +53,14 @@ _wav_duration = {name: None for name in _WAV_NAMES}
 _effects = {name: None for name in _WAV_NAMES}
 # QSoundEffect 类引用缓存（init 时惰性导入一次，play() 热路径直接使用）
 _QSoundEffect = None
+# 播放验证定时器：play() 后 90ms 检查是否真的在响，静默失败则补一发 winsound
+_verify_timers = {}
+# 默认音频设备切换钩子是否已连接（init 幂等调用防重复连接）
+_device_hooked = False
+# QMediaDevices 实例保活引用（PySide6 6.11 的信号需从实例连接）
+_media_devices = None
+# 最短音效时长（秒）：验证检查必须小于它，否则音已放完误判
+_MIN_WAV_SECONDS = 0.10
 
 
 # ---------------- 合成回退音（参考现有 play_sound 实现） ----------------
@@ -131,17 +139,92 @@ def init(sounds_dir):
     if QCoreApplication.instance() is None:
         return  # 无 GUI 环境（如冒烟测试）：不构建效果器
 
+    _rebuild_effects()
+
+    # 音频输出设备变化（插拔耳机/切换扬声器）时重建效果器，避免切设备后无声。
+    # PySide6 6.11 无 defaultAudioOutputChanged 信号，退而用 audioOutputsChanged
+    # （输出设备列表变化即触发），两者皆无则保持旧行为。
+    global _device_hooked, _media_devices
+    if not _device_hooked:
+        try:
+            from PySide6.QtMultimedia import QMediaDevices
+            # PySide6 6.11：信号必须从 QMediaDevices 实例连接（类属性只是 Signal 描述符）
+            _media_devices = QMediaDevices()
+            if hasattr(_media_devices, "defaultAudioOutputChanged"):
+                _media_devices.defaultAudioOutputChanged.connect(_on_default_device_changed)
+                _device_hooked = True
+            elif hasattr(_media_devices, "audioOutputsChanged"):
+                _media_devices.audioOutputsChanged.connect(_on_default_device_changed)
+                _device_hooked = True
+        except Exception:
+            pass  # 无可用信号：忽略，仍按旧行为运行
+
+
+def _rebuild_effects():
+    """按当前 _wav_paths 重建全部 QSoundEffect 效果器（init / 设备切换共用）。"""
+    from PySide6.QtCore import QUrl
     for name in _WAV_NAMES:
         path = _wav_paths.get(name)
         if path is None:
+            _effects[name] = None
             continue
         try:
-            eff = QSoundEffect()
+            eff = _QSoundEffect()
             eff.setSource(QUrl.fromLocalFile(path))
             eff.setVolume(0.9)
             _effects[name] = eff
         except Exception:
-            _effects[name] = None  # 该素材效果器构建失败：留给 winsound 兜底
+            _effects[name] = None  # 构建失败：留给 winsound 兜底
+
+
+def _on_default_device_changed(*_args):
+    """默认音频输出设备切换：重建效果器，避免切设备后静默无声。"""
+    _rebuild_effects()
+
+
+def _winsound_file_play(wav_name):
+    """winsound 文件播放（二级链路）；返回是否已发出。"""
+    path = _wav_paths.get(wav_name)
+    if winsound is None or path is None:
+        return False
+    try:
+        winsound.PlaySound(
+            path,
+            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _verify_playback(kind, wav_name):
+    """play() 90ms 后验证：QSoundEffect 静默失败（如音频会话切换瞬间）时补一发 winsound。"""
+    eff = _effects.get(wav_name)
+    if eff is None:
+        return
+    try:
+        if eff.status() == _QSoundEffect.Status.Ready and not eff.isPlaying():
+            _winsound_file_play(wav_name)  # Qt 没响：保证用户至少听到一版
+    except Exception:
+        pass
+
+
+def _schedule_verify(kind, wav_name):
+    """安排 90ms 播放验证（QTimer 需要 GUI 事件循环；无 GUI 时跳过）。"""
+    try:
+        from PySide6.QtCore import QCoreApplication, QTimer
+    except Exception:
+        return
+    if QCoreApplication.instance() is None:
+        return
+    t = _verify_timers.get(kind)
+    if t is None:
+        t = QTimer()
+        t.setSingleShot(True)
+        t.setInterval(90)
+        t.timeout.connect(lambda: _verify_playback(kind, wav_name))
+        _verify_timers[kind] = t
+    t.start()
 
 
 # kind -> (素材名, 回退音名)
@@ -175,21 +258,14 @@ def play(kind):
     if _qt_playable(eff):
         try:
             eff.play()
+            _schedule_verify(kind, wav_name)  # 90ms 后静默失败检测 → winsound 补发
             return
         except Exception:
             pass  # 播放入口异常：降级到 winsound 文件
 
     # 2) winsound 播放真实 wav 文件（异步、驱动忙时以新音替换旧音，不阻塞）
-    path = _wav_paths.get(wav_name)
-    if winsound is not None and path is not None:
-        try:
-            winsound.PlaySound(
-                path,
-                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
-            )
-            return
-        except Exception:
-            pass  # 文件播放失败：降级到合成回退
+    if _winsound_file_play(wav_name):
+        return
 
     # 3) 合成回退音（SND_MEMORY；NOWAIT 仅作最后兜底的防阻塞保险）
     if winsound is None:
