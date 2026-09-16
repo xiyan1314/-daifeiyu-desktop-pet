@@ -27,7 +27,7 @@ Transparent frameless window, always-on-top, draggable, feedable, chatty — per
 
 **Option 1: Portable build (recommended, no Python needed)**
 
-Download `大肥鱼桌宠_绿色版.zip` from [Releases](../../releases) → extract → double-click `启动桌宠.vbs`.
+Download `daifeiyu-desktop-pet.zip` from [Releases](../../releases) → extract → double-click `启动桌宠.vbs`.
 (Uses Microsoft-signed pythonw.exe + bundled runtime; no self-extracting exe that antivirus flags.)
 
 **Option 2: Run from source**
