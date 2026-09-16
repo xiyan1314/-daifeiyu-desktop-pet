@@ -8,7 +8,7 @@
 - init(sounds_dir)：扫描 sounds_dir 下的 ya1.wav / ya2.wav / d1.wav / d2.wav，
   记录存在的文件路径；在 GUI 环境下（QCoreApplication 已创建）预建 QtMultimedia
   QSoundEffect 效果器（回退音在模块加载时已合成）。
-- play(kind)：kind ∈ {press, release, feed}，按三级链路播放：
+- play(kind)：kind ∈ {press, release, feed, reply, coin}，按三级链路播放：
     1) winsound SND_FILENAME 播放 wav 文件（主链路：waveOut 渲染路径，与
        Qt 的进程级 WASAPI 会话是不同路径，实测最稳；SND_ASYNC 异步替换播放）；
     2) QSoundEffect 播放 wav 文件（仅 winsound 不存在时——非 Windows）；
@@ -44,8 +44,8 @@ except ImportError:
 # 采样率（与素材 / 参考实现一致）
 _SAMPLE_RATE = 22050
 
-# 素材文件名（d1 为预留音效，暂未被 play() 映射）
-_WAV_NAMES = ("ya1", "ya2", "d1", "d2")
+# 素材文件名（task-end-a/exp-orb 借自参考插件「任务结束音」概念）
+_WAV_NAMES = ("ya1", "ya2", "d1", "d2", "task-end-a", "exp-orb")
 _WAV_FILES = {name: name + ".wav" for name in _WAV_NAMES}
 
 # 素材文件路径：name -> 存在文件的绝对路径（缺失 / 损坏为 None）
@@ -239,6 +239,8 @@ _PLAY_MAP = {
     "press": ("ya1", "press"),
     "release": ("ya2", "release"),
     "feed": ("d2", "feed"),
+    "reply": ("task-end-a", "feed"),   # AI 回复完成音（任务结束，借自参考插件概念）
+    "coin": ("exp-orb", "release"),    # 余额到账音（金币）
 }
 
 
@@ -296,7 +298,7 @@ def play(kind):
 
 # ---------------- 冒烟测试（无需 GUI，可直接运行本文件） ----------------
 if __name__ == "__main__":
-    SOUNDS_DIR = r"E:\deep seek\desktop-pet\assets\sounds"
+    SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "sounds")
 
     print("=== 冒烟 1：真实素材目录（无 GUI → 不建效果器，走 winsound 文件路径） ===")
     init(SOUNDS_DIR)
@@ -314,14 +316,17 @@ if __name__ == "__main__":
     init(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "__no_such_dir__"))
     for name in _WAV_NAMES:
         print("  %s.wav -> path=%s" % (name, "None" if _wav_paths[name] is None else "set"))
-    for k in ("press", "release", "feed"):
-        fb = _fallback.get(k)
-        print("  fallback[%s] -> %s" % (k, "OK (%d bytes)" % len(fb) if fb else "None"))
+    for k, pair in _PLAY_MAP.items():
+        fb_name = pair[1]
+        fb = _fallback.get(fb_name)
+        print("  fallback[%s] (via %s) -> %s" % (k, fb_name, "OK (%d bytes)" % len(fb) if fb else "None"))
 
     print("=== 冒烟 3：调用 play 不抛异常 ===")
     play("press")
     play("release")
     play("feed")
+    play("reply")
+    play("coin")
     play("未知kind")
 
     print("AUDIO SMOKE OK")

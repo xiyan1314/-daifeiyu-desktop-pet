@@ -17,7 +17,9 @@ Transparent frameless window, always-on-top, draggable, feedable, chatty — per
 - 🐍 **Xixifu-style personality** (Zenless Zone Zero's Cissia, aka "啥子蛇"): self-proclaimed "villain" who follows only her instincts — cold-tongued but soft-hearted, calls herself "本专员" (this commissioner) and wraps her gluttony in fake case investigations, sometimes hisses "嘶~"
 - 💰 **Balance widget** (optional): DeepSeek API balance + today's usage, rolling numbers, auto-refresh every 60s
 - 🔐 **Key security**: API Key encrypted with Windows DPAPI, never stored in plaintext
-- 🎵 **Sounds**: press / release / feed (winsound-first chain, fallback-safe)
+- 🎵 **Sounds**: press / release / feed / AI-reply-done / balance-credit (winsound-first chain, fallback-safe)
+- 🖐️ **Petting**: hold the pet for 1.5s → petpet animation + shy line (inspired by the whale widget's petpet)
+- 💸 **Money rain**: successful balance check → coin sound + money GIF frames
 - 😴 **Idle life**: falls asleep after 60s, occasional mischievous grins, blushes when praised
 - 📌 Single instance, tray icon, follow mouse / wander, wheel resize, edge snapping
 
@@ -25,7 +27,7 @@ Transparent frameless window, always-on-top, draggable, feedable, chatty — per
 
 **Option 1: Portable build (recommended, no Python needed)**
 
-Download `daifeiyu-desktop-pet.zip` from [Releases](../../releases) → extract → double-click `启动桌宠.vbs`.
+Download `大肥鱼桌宠_绿色版.zip` from [Releases](../../releases) → extract → double-click `启动桌宠.vbs`.
 (Uses Microsoft-signed pythonw.exe + bundled runtime; no self-extracting exe that antivirus flags.)
 
 **Option 2: Run from source**
@@ -64,6 +66,7 @@ desktop-pet/
 ├── pet_anim.py          # frame animation module
 ├── pet_mood.py          # mood state machine
 ├── pet_audio.py         # sound module (winsound-first, 3-level fallback)
+├── pet_fx.py            # frame-fx module (petting / money rain)
 ├── assets/              # frames / expressions / sounds (256px)
 ├── 去背景.py            # background removal tool
 ├── 生成占位角色.py      # placeholder generator
@@ -71,6 +74,8 @@ desktop-pet/
 ├── 大肥鱼桌宠.spec      # PyInstaller spec (optional exe build)
 └── docs/                # design docs
 ```
+
+> Asset note: the petpet/money animations and task-end-a/exp-orb sounds are inspired by the MIT-licensed dsh-whale-widget plugin (DeepSeek-Balance-Whale-Widget series); frame images were converted from GIFs.
 
 ## 📜 License
 

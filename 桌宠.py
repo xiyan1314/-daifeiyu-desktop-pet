@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 import requests
 import psutil
 import pet_anim
+import pet_fx
 import pet_mood
 import pet_audio
 import time
@@ -41,7 +42,7 @@ from ctypes import wintypes
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -344,6 +345,13 @@ LINES_STARTUP = [
     "绳匠，欢迎回来，小鱼干带了吗？",
     "绳匠，今天也要一起玩哦~",
 ]
+# 摸摸头（长按 1.5 秒触发，借参考插件 petpet 动图概念）
+LINES_PETTING = [
+    "嘿嘿，摸头好舒服~",
+    "嘶——就、就允许你摸一下下…",
+    "被绳匠摸头了，尾巴都翘起来了~",
+    "再多摸摸嘛，本专员批准了！",
+]
 FOOD_LINES = {
     "小鱼干": ["小鱼干！最爱啦！", "啊呜~好吃！", "再来一条嘛~"],
     "蛋糕": ["蛋糕！甜到心里啦！", "啊呜~幸福！", "奶油沾到脸上了……"],
@@ -373,6 +381,7 @@ SYSTEM_PROMPT = (
 # ---------------- 跨线程信号 ----------------
 class Signals(QObject):
     reply = Signal(str)
+    reply_ok = Signal()  # AI 回复成功（主线程播任务完成音）
     weather = Signal(str)
     weather_done = Signal()
     ai_done = Signal()
@@ -705,6 +714,7 @@ class PetWindow(QWidget):
         self._usage = 0.0
         self._currency = "CNY"
         self._manual_pending = False
+        self._pending_manual = False  # 在途自动刷新结束后需补发的手动查询
         self._weather_inflight = False
         self._ai_inflight = False
         self._save_scale_timer = None
@@ -741,6 +751,31 @@ class PetWindow(QWidget):
         self._emote_gen = 0
         self._emote_anim = None
         self._cur_state = None  # 当前展示的表情/睡眠状态名（切形态重绘用）
+        # 帧特效层（摸摸头 petpet / 撒钱 money，借参考插件动图概念）
+        self.fx_item = QGraphicsPixmapItem()
+        self.fx_item.hide()
+        self.scene.addItem(self.fx_item)
+        self.fx = pet_fx.AnimatedEmote(self.fx_item)
+        # 撒钱用独立层：与摸摸头互不抢占（S2 修复）
+        self.fx_money_item = QGraphicsPixmapItem()
+        self.fx_money_item.hide()
+        self.fx_money_item.setZValue(1)  # 撒钱在 petpet 之上
+        self.scene.addItem(self.fx_money_item)
+        self.fx_money = pet_fx.AnimatedEmote(self.fx_money_item)
+        self.fx_money.finished.connect(lambda: setattr(self, "_fx_money_on", False))  # 只连一次
+        # emote 提到最上层，避免被特效层完全遮挡（S3 修复）
+        self.emote_item.setZValue(2)
+        self._petting = False  # 摸摸头进行中
+        self._press_dist = 0   # 本次按压累计移动距离（摸头 32px 阈值判定）
+        self._fx_petpet_on = False  # petpet 特效层在播（缩放跟随用，独立于 money）
+        self._fx_money_on = False   # money 特效层在播
+        self._pet_watchdog_ended = False  # 摸摸头被看门狗结束（松手不戳）
+        self._hold_timer = QTimer(self)  # 长按 1.5s 触发摸摸头
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._start_petting)
+        self._pet_max = QTimer(self)  # 摸摸头最长 15s 看门狗（release 丢失兜底）
+        self._pet_max.setSingleShot(True)
+        self._pet_max.timeout.connect(self._on_pet_watchdog)
 
         self._build_sprites()
         self.form = "normal"
@@ -755,6 +790,11 @@ class PetWindow(QWidget):
         assets_dir = resource_dir("assets")
         self._idle_frames = pet_anim.load_frame_set(assets_dir, "idle", 10)
         self._eat_frames = pet_anim.load_frame_set(assets_dir, "eat", 7)
+        self._fx_petpet = pet_anim.load_frame_set(os.path.join(assets_dir, "fx"), "petpet", 10)
+        if len(self._fx_petpet) != 10:
+            _log_error("fx frames petpet incomplete: %d/10" % len(self._fx_petpet))
+        self._fx_money = []  # 86 帧较大：首次撒钱时才加载（约 6.7MB）
+        self._fx_money_dir = os.path.join(assets_dir, "fx")
         self.has_frames = bool(self._idle_frames)
         if self._idle_frames:
             self.anim.add_set("idle", self._idle_frames)
@@ -845,6 +885,7 @@ class PetWindow(QWidget):
         # 跨线程信号
         signals.weather.connect(self.show_bubble)
         signals.reply.connect(self.show_bubble)
+        signals.reply_ok.connect(self._on_reply_ok)  # 任务完成音回主线程播
         signals.balance_updated.connect(self._on_balance_updated)
         signals.balance_err.connect(self._on_balance_err)
         signals.weather_done.connect(lambda: setattr(self, "_weather_inflight", False))
@@ -1014,21 +1055,26 @@ class PetWindow(QWidget):
 
     def _on_mood_state(self, state):
         self._wake()
-        if self.busy:
-            return  # 动画进行中：丢弃情绪展示，避免打断吃帧导致 busy 卡死
+        if self.busy or self._petting:
+            return  # 动画进行中 / 摸摸头中：丢弃情绪展示（S3 补全）
         self._show_state(state, self.MOOD_STATE_DURATION_MS.get(state, STATE_DURATION_MS))
 
     def _mood_bubble(self, text):
         if not self.busy:
             self.show_bubble(text)
 
+    def _on_reply_ok(self):
+        """AI 回复成功（主线程）：播任务完成音（借参考插件概念）。"""
+        if self.cfg.get("sound", True):
+            play_sound("reply")
+
     def _mood_emote(self, kind):
-        if not self.busy:
+        if not self.busy and not self._petting:  # 摸摸头期间抑制 heart 等（S3 修复）
             self._show_emote(kind)
 
     def _mood_tick(self):
-        if not self._sleeping and not self.busy:
-            self.mood.tick()
+        if not self._sleeping and not self.busy and not self._petting:
+            self.mood.tick()  # 摸摸头中不切 smug/angry（S3 补全）
 
     _emote_cache = {}
 
@@ -1094,6 +1140,60 @@ class PetWindow(QWidget):
             self._emote_cache.clear()  # 缩放连续变化会产生大量尺寸，上限防无界增长
         self._emote_cache[key] = pm
         return pm
+
+    def _start_petting(self):
+        """长按 1.5 秒：播放摸摸头帧动画 + 台词（借参考插件 petpet 动图概念）。"""
+        if self._petting:
+            return
+        if self._press_dist > 32:
+            return  # 已明确拖动（与取消阈值一致），不再触发（M-3 修复）
+        if self.busy:
+            # busy（吃帧/跳跃）中暂不触发：继续按住则 400ms 后补判（M1 修复）
+            self._hold_timer.start(400)
+            return
+        if not self._fx_petpet:
+            return
+        self._petting = True
+        self._fx_petpet_on = True
+        self._place_fx("petpet")
+        self.fx.play(self._fx_petpet, interval_ms=80, loops=-1)
+        self._pet_max.start(15000)  # 看门狗：release 丢失时 15s 自停（M2 修复）
+        self.show_bubble(random.choice(LINES_PETTING))
+
+    def _on_pet_watchdog(self):
+        """看门狗超时结束摸摸头：标记后收尾，随后的松手不再算「戳一下」。"""
+        self._pet_watchdog_ended = True
+        self._end_petting()
+
+    def _end_petting(self):
+        self._petting = False
+        self._fx_petpet_on = False
+        self._pet_max.stop()
+        self.fx.stop()
+
+    def _place_fx(self, kind):
+        """按当前缩放摆放特效层（贴头顶，水平居中）。缩放变化后由 set_scale 重排。"""
+        w = self.width()
+        if kind == "petpet":
+            fw = self._fx_petpet[0].width() if self._fx_petpet else 128
+            self.fx_item.setScale(self.scale)
+            self.fx_item.setPos((w - fw * self.scale) / 2, 0)
+        elif kind == "money":
+            fw = self._fx_money[0].width() if self._fx_money else 160
+            self.fx_money_item.setScale(self.scale)
+            self.fx_money_item.setPos((w - fw * self.scale) / 2, 0)
+
+    def _fx_celebrate(self):
+        """余额到账：撒钱帧动画（借参考插件 money 动图概念，独立特效层）。"""
+        if not self._fx_money:
+            self._fx_money = pet_anim.load_frame_set(self._fx_money_dir, "money", 86)
+            if len(self._fx_money) != 86:
+                _log_error("fx frames money incomplete: %d/86" % len(self._fx_money))
+        if not self._fx_money:
+            return
+        self._fx_money_on = True
+        self._place_fx("money")
+        self.fx_money.play(self._fx_money, interval_ms=30, loops=1)
 
     def _show_emote(self, kind):
         if self._emote_anim is not None:
@@ -1162,6 +1262,10 @@ class PetWindow(QWidget):
         self.view.setGeometry(0, 0, w, h)
         self.scene.setSceneRect(0, 0, w, h)
         self._apply_transform()
+        if self._fx_petpet_on:
+            self._place_fx("petpet")  # 特效层各自跟随缩放（L1 修复）
+        if self._fx_money_on:
+            self._place_fx("money")
 
     def _reset_squash(self):
         self.squash_x = 1.0
@@ -1322,6 +1426,9 @@ class PetWindow(QWidget):
 
     def _on_balance_updated(self, total, currency, granted):
         self._fetching_balance = False
+        if self._pending_manual:
+            self._pending_manual = False
+            QTimer.singleShot(0, lambda: self._refresh_balance(manual=True))  # 补发排队的手动查询
         if not self.cfg.get("api_key"):
             return  # Key 已清空，忽略在途请求结果
         self._currency = currency
@@ -1329,6 +1436,9 @@ class PetWindow(QWidget):
         if self._manual_pending:
             self._manual_pending = False
             self.show_bubble("余额 %s %.2f · 今日已用 %.2f（赠送 %.2f）" % (currency, total, self._usage, granted))
+            if self.cfg.get("sound", True):
+                play_sound("coin")  # 金币音（借参考插件任务结束音概念）
+            self._fx_celebrate()   # 撒钱动画
         if self._balance_anim is not None:
             try:
                 self._balance_anim.stop()
@@ -1360,6 +1470,9 @@ class PetWindow(QWidget):
 
     def _on_balance_err(self):
         self._fetching_balance = False
+        if self._pending_manual:
+            self._pending_manual = False
+            QTimer.singleShot(0, lambda: self._refresh_balance(manual=True))  # 补发排队的手动查询
         if self._manual_pending:
             self._manual_pending = False
             self.show_bubble("余额查不到……API Key 对吗？")
@@ -1396,7 +1509,12 @@ class PetWindow(QWidget):
 
     def _refresh_balance(self, manual=False):
         key = self.cfg.get("api_key", "")
-        if not key or self._fetching_balance:
+        if not key:
+            return
+        if self._fetching_balance:
+            # 在途请求未结束：手动查询排队，本次响应落地后自动补发
+            if manual:
+                self._pending_manual = True
             return
         self._fetching_balance = True
         self._manual_pending = manual
@@ -1768,6 +1886,7 @@ class PetWindow(QWidget):
                     self._chat_history.append(("assistant", text))
                     if len(self._chat_history) > 6:
                         del self._chat_history[:len(self._chat_history) - 6]
+            signals.reply_ok.emit()  # 回复成功：由主线程播任务完成音（线程安全）
             signals.reply.emit(text)
         except Exception as e:
             _log_error("ai_worker: %r" % (e,))
@@ -1819,8 +1938,8 @@ class PetWindow(QWidget):
 
     # ---------- 定时 / 闲逛 ----------
     def _idle_tick(self):
-        if self.busy or self.cfg.get("follow_mouse") or self.cfg.get("wander"):
-            return
+        if self.busy or self._petting or self.cfg.get("follow_mouse") or self.cfg.get("wander"):
+            return  # 摸摸头期间不跳不发 zzz（S3 修复）
         if self._sleeping:
             return
         if self.anim_mode in ("idle", "full_idle") and (time.monotonic() - self._last_activity) > SLEEP_AFTER_SECONDS:
@@ -1872,34 +1991,60 @@ class PetWindow(QWidget):
             self._press_global = e.globalPosition().toPoint()
             self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
             self._moved = False
+            self._press_dist = 0  # 本次按压累计移动距离（摸头 32px 阈值判定）
             self._was_walking = self.walk_timer.isActive()
             self.walk_timer.stop()
             self._press_squash(True)
             if self.cfg.get("sound", True):
                 play_sound("boing")
+            self._hold_timer.start(1500)  # 长按 1.5 秒 → 摸摸头
         elif e.button() == Qt.MouseButton.RightButton:
+            self._hold_timer.stop()
+            if self._petting:
+                self._pet_watchdog_ended = True  # 右键取消同看门狗语义：后续松手不戳
+                self._end_petting()
+            # 菜单会抓走后续 release：这里完整复位按压状态，防压扁/散步滞留
+            self._drag_offset = None
+            self._press_global = None
+            self._press_squash(False)
+            if self._was_walking:
+                self.walk_timer.start(self._walk_interval)
             self._open_menu(e.globalPosition().toPoint())
 
     def mouseMoveEvent(self, e):
         if e.buttons() & Qt.MouseButton.LeftButton and self._drag_offset is not None:
             gp = e.globalPosition().toPoint()
-            if (gp - self._press_global).manhattanLength() > 4:
+            dist = (gp - self._press_global).manhattanLength()
+            self._press_dist = max(self._press_dist, dist)
+            if dist > 4:
                 self._moved = True
+            if dist > 32:
+                # 明确是拖动（>32px）才取消长按，避免 4px 手抖误判（M-3 修复）
+                self._hold_timer.stop()
+                if self._petting:
+                    self._end_petting()
             self.move(gp - self._drag_offset)
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._drag_offset = None
             self._press_global = None
+            self._hold_timer.stop()
+            was_petting = self._petting or self._pet_watchdog_ended
+            self._pet_watchdog_ended = False
+            if self._petting:
+                self._end_petting()
             self._press_squash(False)
             if self.cfg.get("sound", True):
                 play_sound("pop")
+            if self._was_walking:
+                self.walk_timer.start(self._walk_interval)
+            if was_petting:
+                return  # 摸头成功的松手：不戳、不贴边（M-1 修复）
             if not self._moved:
                 self.mood.poke()
             else:
                 self._snap_to_edge()
-            if self._was_walking:
-                self.walk_timer.start(self._walk_interval)
 
     def wheelEvent(self, e):
         delta = e.angleDelta().y()
@@ -2044,10 +2189,16 @@ class PetWindow(QWidget):
             self.tray.hide()
             self.hide()
             self.anim.stop()
+            try:
+                self.fx.stop()
+                self.fx_money.stop()
+            except Exception:
+                pass
             self.mood.stop_all()
             for t in (self.idle_timer, self.walk_timer, self.cpu_timer, self.mood_timer,
                       self._state_timer, self._drag_timer, self._balance_timer, self._digest_timer,
-                      self._fly_timer, self._save_scale_timer, self._food_shown_timer):
+                      self._fly_timer, self._save_scale_timer, self._food_shown_timer,
+                      self._hold_timer, self._pet_max):
                 if t is not None:
                     t.stop()
             for a in (getattr(self, "_tween_anim", None), getattr(self, "_emote_anim", None),
