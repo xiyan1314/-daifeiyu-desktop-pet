@@ -34,7 +34,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMenu, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QInputDialog, QMessageBox, QFrame, QLineEdit, QDialog,
-    QSystemTrayIcon,
+    QSystemTrayIcon, QSlider, QLabel, QHBoxLayout, QVBoxLayout, QWidgetAction,
 )
 
 import pet_anim
@@ -47,7 +47,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -130,28 +130,31 @@ DEFAULT_CONFIG = {
 # 气泡样式（配置驱动；apply_bubble_style 更新，Bubble.paintEvent 读取）
 BUBBLE_STYLE = dict(DEFAULT_CONFIG["bubble_style"])
 
-# 右键菜单美化：深色圆角主题（app 级 QSS，托盘菜单同主题）
+# 右键菜单美化：深色圆角紧凑主题（参考小鲸鱼挂件布局：滑块 + 平铺开关 + 少量子菜单）
 MENU_QSS = """
 QMenu {
     background-color: rgba(26, 30, 48, 0.97);
     color: #e8ecff;
     border: 1px solid #3b4370;
     border-radius: 10px;
-    padding: 6px;
+    padding: 4px;
 }
 QMenu::item {
-    padding: 7px 28px 7px 14px;
-    border-radius: 7px;
+    padding: 5px 24px 5px 12px;
+    border-radius: 6px;
+    font-size: 12px;
 }
 QMenu::item:selected { background-color: #39426e; }
 QMenu::item:disabled { color: #6b7399; }
-QMenu::separator { height: 1px; background: #333a5e; margin: 5px 12px; }
-QMenu::indicator { width: 14px; height: 14px; }
-QMenu::section {
-    color: #ffd65a;
-    padding: 6px 14px 2px 14px;
-    font-weight: bold;
+QMenu::separator { height: 1px; background: #333a5e; margin: 3px 10px; }
+QMenu::indicator { width: 13px; height: 13px; }
+QSlider::groove:horizontal {
+    height: 4px; background: #2e3560; border-radius: 2px;
 }
+QSlider::handle:horizontal {
+    width: 12px; margin: -5px 0; background: #ffd65a; border-radius: 6px;
+}
+QSlider::sub-page:horizontal { background: #ffd65a; border-radius: 2px; }
 """
 
 
@@ -882,8 +885,9 @@ class PetWindow(QWidget):
         self._build_sprites()
         self.form = "normal"
         self._digest_timer = None
-        self.base_w = self.sprites["normal"]["side"].width()
-        self.base_h = self.sprites["normal"]["side"].height()
+        # 双形态时两套图尺寸可能不同：窗口按较大者定，避免吃饱形态溢出/不居中
+        self.base_w = max(self.sprites["normal"]["side"].width(), self.sprites["full"]["side"].width())
+        self.base_h = max(self.sprites["normal"]["side"].height(), self.sprites["full"]["side"].height())
         self.item.setPixmap(self.sprites[self.form]["front"])
         self._using_front = True
 
@@ -1054,7 +1058,9 @@ class PetWindow(QWidget):
         role_pix = self._role_pix()
         if role_pix is not None:
             self._custom_role = True
-            normal_side = normal_front = full_side = full_front = role_pix
+            role_full = self._role_full_pix(role_pix) or role_pix  # 单形态：吃饱用同一张图
+            normal_side = normal_front = role_pix
+            full_side = full_front = role_full
         else:
             self._custom_role = False
             normal_side = self._load_img(["character.png", "assets/character.png"]) or self._fallback_pix()
@@ -1082,6 +1088,23 @@ class PetWindow(QWidget):
         except Exception:
             return None
 
+    def _role_full_pix(self, base=None):
+        """自定义角色的「吃饱」形态图；单形态/旧角色无变体时回退 base（同图双形态）。
+
+        base 由调用方传入（_build_sprites 已解码过），避免同一 PNG 重复解码。"""
+        base = base if base is not None else self._role_pix()
+        if base is None:
+            return None
+        rid = self.cfg.get("role", "")
+        try:
+            path = self.role_lib.path_for_full(rid)  # rid="" 时 get("") 返回 None → 回退 base
+            if not path or not os.path.isfile(path):
+                return base
+            pix = QPixmap(path)
+            return pix if not pix.isNull() else base
+        except Exception:
+            return base
+
     def apply_role(self, role_id):
         """切换角色（""=默认角色）：持久化并立即重载贴图，无需重启。"""
         rid = str(role_id or "")
@@ -1093,8 +1116,9 @@ class PetWindow(QWidget):
     def _reload_sprites(self):
         """重建角色贴图 / 窗口尺寸 / 动画能力（角色切换与恢复默认共用）。"""
         self._build_sprites()
-        self.base_w = self.sprites["normal"]["side"].width()
-        self.base_h = self.sprites["normal"]["side"].height()
+        # 双形态时两套图尺寸可能不同：窗口按较大者定，避免吃饱形态溢出/不居中
+        self.base_w = max(self.sprites["normal"]["side"].width(), self.sprites["full"]["side"].width())
+        self.base_h = max(self.sprites["normal"]["side"].height(), self.sprites["full"]["side"].height())
         self.has_frames = bool(self._idle_frames) and not self._custom_role
         self.anim.add_set("idle", self._idle_frames if self.has_frames else [])
         self.anim.add_set("eat", self._eat_frames if self.has_frames else [])
@@ -1778,7 +1802,11 @@ class PetWindow(QWidget):
                 self.squash_y = 1.0 - 0.12 * s
                 self._apply_transform()
 
-            self._run_anim(900, onval)
+            def _squash_done():
+                self._reset_squash()
+                self._play_idle()  # H1：无吃帧角色（自定义角色）喂食后落到吃饱形态贴图
+
+            self._run_anim(900, onval, on_finished=_squash_done)
         self._show_emote("note")
         self.show_bubble(line)
 
@@ -2225,15 +2253,12 @@ class PetWindow(QWidget):
         factor = 1.1 if delta > 0 else (1.0 / 1.1)
         self.set_scale(self.scale * factor)
         self.cfg["scale"] = self.scale
-        # 防抖：滚动停止 400ms 后才落盘，避免高频全量写 config.json
-        if self._save_scale_timer is None:
-            self._save_scale_timer = QTimer(self)
-            self._save_scale_timer.setSingleShot(True)
-            self._save_scale_timer.timeout.connect(lambda: save_config(self.cfg))
-        self._save_scale_timer.start(400)
+        self._schedule_scale_save()
 
     # ---------- 右键菜单（v1.3 美化：分区标题 + emoji 图标 + 信息行） ----------
     def _open_menu(self, gp):
+        """右键菜单（v1.3.1 紧凑化，参考小鲸鱼挂件布局）：
+        大小滑块 + 高频开关平铺，低频项收进「记账」「设置…」子菜单。"""
         menu = QMenu(self)
 
         # 顶部信息行：余额 / 今日已用（仅展示，不可点）
@@ -2242,12 +2267,11 @@ class PetWindow(QWidget):
         else:
             info_text = "📒 今日已用 %.2f" % (self._usage or 0.0)
         menu.addAction(info_text).setEnabled(False)
+        menu.addSeparator()
 
-        menu.addSection("外观")
-        size_menu = menu.addMenu("🔍 调整大小")
-        for pct in (50, 75, 100, 125, 150, 200):
-            act = size_menu.addAction("%d%%" % pct)
-            act.triggered.connect(lambda checked=False, p=pct: self._set_scale_pct(p))
+        # 大小滑块（拖动实时缩放，替代原来的 6 项子菜单）
+        menu.addAction(self._make_size_action(menu))
+
         self._top_act = menu.addAction("📌 窗口置顶")
         self._top_act.setCheckable(True)
         self._top_act.setChecked(self.cfg.get("always_on_top", True))
@@ -2256,18 +2280,31 @@ class PetWindow(QWidget):
         sound_act.setCheckable(True)
         sound_act.setChecked(self.cfg.get("sound", True))
         sound_act.toggled.connect(self._set_sound)
-        self._follow_act = menu.addAction("🖱️ 跟随鼠标")
-        self._follow_act.setCheckable(True)
-        self._follow_act.setChecked(self.cfg.get("follow_mouse", False))
-        self._follow_act.toggled.connect(self._set_follow_mouse)
-        self._wander_act = menu.addAction("🚶 散步")
-        self._wander_act.setCheckable(True)
-        self._wander_act.setChecked(self.cfg.get("wander", False))
-        self._wander_act.toggled.connect(self._set_wander)
-        bubble_style_act = menu.addAction("🎨 气泡样式…")
-        bubble_style_act.triggered.connect(self._open_bubble_style)
+        self._ai_act = menu.addAction("🤖 AI对话")
+        self._ai_act.setCheckable(True)
+        self._ai_act.setChecked(self.cfg.get("ai_enabled", False))
+        self._ai_act.toggled.connect(self._set_ai_enabled)
+        menu.addSeparator()
 
-        menu.addSection("角色与资源")
+        talk_act = menu.addAction("💭 和它说话")
+        talk_act.triggered.connect(self._ask_talk)
+
+        food_menu = menu.addMenu("🍖 喂食")
+        for food in ("小鱼干", "蛋糕", "钻石"):
+            act = food_menu.addAction(food)
+            act.triggered.connect(lambda checked=False, f=food: self.feed(f))
+        food_menu.addSeparator()
+        tray_act = food_menu.addAction("🍱 食物托盘")
+        tray_act.setCheckable(True)
+        tray_act.setChecked(self.food_tray.isVisible())
+        tray_act.toggled.connect(self._set_food_tray)
+        food_menu.addSeparator()
+        form_menu = food_menu.addMenu("🐡 形态")
+        form_normal = form_menu.addAction("常态")
+        form_normal.triggered.connect(lambda checked=False: self._set_form("normal"))
+        form_full = form_menu.addAction("吃饱")
+        form_full.triggered.connect(lambda checked=False: self._set_form("full"))
+
         role_menu = menu.addMenu("🐟 角色")
         role_group = QActionGroup(menu)
         role_group.setExclusive(True)  # 单选互斥：勾选状态不残留
@@ -2285,79 +2322,74 @@ class PetWindow(QWidget):
         role_menu.addSeparator()
         role_import_act = role_menu.addAction("导入角色…")
         role_import_act.triggered.connect(lambda: self._open_resource_manager(0))
-        lines_act = menu.addAction("💬 自定义台词…")
-        lines_act.triggered.connect(self._open_lines)
-        snd_menu = menu.addMenu("🎵 音效设置")
+
+        book_menu = menu.addMenu("💰 记账")
+        balance_act = book_menu.addAction("查询余额")
+        balance_act.triggered.connect(self._fetch_balance)
+        badge_act = book_menu.addAction("📊 余额挂件")
+        badge_act.setCheckable(True)
+        badge_act.setChecked(self.cfg.get("badge", False))
+        badge_act.toggled.connect(self._set_badge)
+        book_menu.addSeparator()
+        ledger_act = book_menu.addAction("📒 账本…")
+        ledger_act.triggered.connect(self._open_ledger)
+        manual_act = book_menu.addAction("✏️ 记一笔…")
+        manual_act.triggered.connect(self._add_manual_record)
+        book_menu.addSeparator()
+        budget_act = book_menu.addAction("💸 今日预算…")
+        budget_act.triggered.connect(self._set_budget)
+        bal_alert_act = book_menu.addAction("🚨 余额预警…")
+        bal_alert_act.triggered.connect(self._set_balance_alert)
+
+        res_act = menu.addAction("📦 资源管理…")
+        res_act.triggered.connect(lambda: self._open_resource_manager(0))
+
+        set_menu = menu.addMenu("⚙️ 设置…")
+        self._follow_act = set_menu.addAction("🖱️ 跟随鼠标")
+        self._follow_act.setCheckable(True)
+        self._follow_act.setChecked(self.cfg.get("follow_mouse", False))
+        self._follow_act.toggled.connect(self._set_follow_mouse)
+        self._wander_act = set_menu.addAction("🚶 散步")
+        self._wander_act.setCheckable(True)
+        self._wander_act.setChecked(self.cfg.get("wander", False))
+        self._wander_act.toggled.connect(self._set_wander)
+        set_menu.addSeparator()
+        bubble_style_act = set_menu.addAction("🎨 气泡样式…")
+        bubble_style_act.triggered.connect(self._open_bubble_style)
+        snd_set = set_menu.addMenu("🎵 音效设置")
         grp_group = QActionGroup(menu)
         grp_group.setExclusive(True)  # 单选互斥：勾选状态不残留
-        grp_def = snd_menu.addAction("默认音效")
+        grp_def = snd_set.addAction("默认音效")
         grp_def.setCheckable(True)
         grp_def.setChecked(self.cfg.get("sound_group") != "custom")
         grp_def.triggered.connect(lambda checked=False: self._set_sound_group("default"))
         grp_group.addAction(grp_def)
-        grp_cus = snd_menu.addAction("自定义音效组")
+        grp_cus = snd_set.addAction("自定义音效组")
         grp_cus.setCheckable(True)
         grp_cus.setChecked(self.cfg.get("sound_group") == "custom")
         grp_cus.triggered.connect(lambda checked=False: self._set_sound_group("custom"))
         grp_group.addAction(grp_cus)
-        snd_menu.addSeparator()
-        snd_manage_act = snd_menu.addAction("管理音频片段…")
+        snd_set.addSeparator()
+        snd_manage_act = snd_set.addAction("管理音频片段…")
         snd_manage_act.triggered.connect(lambda: self._open_resource_manager(1))
-        res_act = menu.addAction("📦 资源管理…")
-        res_act.triggered.connect(lambda: self._open_resource_manager(0))
+        lines_act = set_menu.addAction("💬 自定义台词…")
+        lines_act.triggered.connect(self._open_lines)
+        set_menu.addSeparator()
+        key_act = set_menu.addAction("🔑 设置DeepSeek API Key")
+        key_act.triggered.connect(self._set_api_key)
+        clear_key_act = set_menu.addAction("🧹 清除DeepSeek API Key")
+        clear_key_act.triggered.connect(self._clear_api_key)
+        menu.addSeparator()
 
-        menu.addSection("互动")
-        food_menu = menu.addMenu("🍖 喂食")
-        for food in ("小鱼干", "蛋糕", "钻石"):
-            act = food_menu.addAction(food)
-            act.triggered.connect(lambda checked=False, f=food: self.feed(f))
-        tray_act = menu.addAction("🍱 食物托盘")
-        tray_act.setCheckable(True)
-        tray_act.setChecked(self.food_tray.isVisible())
-        tray_act.toggled.connect(self._set_food_tray)
-        form_menu = menu.addMenu("🐡 形态")
-        form_normal = form_menu.addAction("常态")
-        form_normal.triggered.connect(lambda checked=False: self._set_form("normal"))
-        form_full = form_menu.addAction("吃饱")
-        form_full.triggered.connect(lambda checked=False: self._set_form("full"))
-
-        menu.addSection("AI 与记账")
-        self._ai_act = menu.addAction("🤖 AI对话")
-        self._ai_act.setCheckable(True)
-        self._ai_act.setChecked(self.cfg.get("ai_enabled", False))
-        self._ai_act.toggled.connect(self._set_ai_enabled)
-        talk_act = menu.addAction("💭 和它说话")
-        talk_act.triggered.connect(self._ask_talk)
         praise_act = menu.addAction("❤️ 夸夸她")
         praise_act.triggered.connect(lambda checked=False: self.mood.blush())
-        key_act = menu.addAction("🔑 设置DeepSeek API Key")
-        key_act.triggered.connect(self._set_api_key)
-        clear_key_act = menu.addAction("🧹 清除DeepSeek API Key")
-        clear_key_act.triggered.connect(self._clear_api_key)
-        badge_act = menu.addAction("📊 余额挂件")
-        badge_act.setCheckable(True)
-        badge_act.setChecked(self.cfg.get("badge", False))
-        badge_act.toggled.connect(self._set_badge)
-        balance_act = menu.addAction("💰 查询余额")
-        balance_act.triggered.connect(self._fetch_balance)
-        ledger_act = menu.addAction("📒 账本…")
-        ledger_act.triggered.connect(self._open_ledger)
-        manual_act = menu.addAction("✏️ 记一笔…")
-        manual_act.triggered.connect(self._add_manual_record)
-        budget_act = menu.addAction("💸 今日预算…")
-        budget_act.triggered.connect(self._set_budget)
-        bal_alert_act = menu.addAction("🚨 余额预警…")
-        bal_alert_act.triggered.connect(self._set_balance_alert)
-
-        menu.addSection("小工具")
         weather_act = menu.addAction("☀️ 今日天气")
         weather_act.triggered.connect(self._fetch_weather)
         cpu_act = menu.addAction("🖥️ 系统状态")
         cpu_act.triggered.connect(self._show_system_status)
-
-        menu.addSection("其他")
         about_act = menu.addAction("ℹ️ 关于")
         about_act.triggered.connect(self._about)
+        menu.addSeparator()
         quit_act = menu.addAction("⏹ 退出")
         quit_act.triggered.connect(self._quit)
 
@@ -2365,11 +2397,41 @@ class PetWindow(QWidget):
         self._top_act = self._follow_act = self._wander_act = self._ai_act = None
         menu.deleteLater()
 
-    def _set_scale_pct(self, pct):
-        s = pct / 100.0
-        self.set_scale(s)
-        self.cfg["scale"] = s
-        save_config(self.cfg)
+    def _make_size_action(self, menu):
+        """大小滑块（QWidgetAction）：拖动实时缩放，落盘走 400ms 防抖。"""
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(12, 2, 12, 2)
+        lbl = QLabel("🎚️ 大小")
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(25, 400)  # 与 set_scale 的 0.2~4.0 夹紧一致（滚轮可到 4x）
+        slider.setFixedWidth(130)
+        pct = QLabel()
+        lay.addWidget(lbl)
+        lay.addWidget(slider, 1)
+        lay.addWidget(pct)
+
+        def onval(v):
+            pct.setText("%d%%" % v)
+            self.set_scale(v / 100.0)
+            self.cfg["scale"] = self.scale
+            self._schedule_scale_save()
+
+        slider.valueChanged.connect(onval)
+        # 先设值再预填文本：scale 恰为滑块当前值时不触发信号，标签也要有初值
+        slider.setValue(int(round(self.scale * 100)))
+        pct.setText("%d%%" % slider.value())
+        act = QWidgetAction(menu)
+        act.setDefaultWidget(w)
+        return act
+
+    def _schedule_scale_save(self):
+        """缩放落盘防抖：滚动/滑块停止 400ms 后才写 config.json（高频操作不整写）。"""
+        if self._save_scale_timer is None:
+            self._save_scale_timer = QTimer(self)
+            self._save_scale_timer.setSingleShot(True)
+            self._save_scale_timer.timeout.connect(lambda: save_config(self.cfg))
+        self._save_scale_timer.start(400)
 
     def _set_always_on_top(self, on):
         self.cfg["always_on_top"] = bool(on)
@@ -2598,6 +2660,9 @@ class PetWindow(QWidget):
                       self._hold_timer, self._pet_max):
                 if t is not None:
                     t.stop()
+            # 缩放防抖未到期就退出：立即落盘，避免最后一次调大小丢失
+            if self._save_scale_timer is not None and self._save_scale_timer.isActive():
+                save_config(self.cfg)
             for a in (getattr(self, "_tween_anim", None), getattr(self, "_emote_anim", None),
                       getattr(self, "_balance_anim", None)):
                 if a is not None:

@@ -9,10 +9,13 @@
 - DIALOG_QSS（常量）：统一深色圆角主题（#1e2234 底 / #2e3560 控件底 /
   #e8ecff 文字 / #ffd65a 强调 / 圆角 8px），覆盖 QDialog/QPushButton/
   QListWidget/QTableWidget/QComboBox/QTabWidget/QLineEdit/QPlainTextEdit/
-  QSpinBox/QDoubleSpinBox/QLabel。
+  QSpinBox/QDoubleSpinBox/QLabel/QRadioButton，以及弹窗类
+  QMessageBox/QInputDialog/QFileDialog 与滚动条/表头等辅助控件。
 - modal(dlg)：加 WindowStaysOnTopHint + show/raise_/activateWindow/setFocus
   后 exec（应对 Windows 前台锁，参考主程序 _set_api_key）。
 - class RolePanel(QWidget)：角色列表 + 预览 + 导入 / 设为当前 / 删除 / 恢复默认。
+- class RoleImportDialog(QDialog)：角色导入向导——单形态（一张图）/
+  双形态（常态+吃饱两张图）由用户选择，素材自动处理（去背景/裁剪/缩放）。
 - class SoundPanel(QWidget)：音频片段列表（试听 / 导入 / 重命名 / 删除）+
   自定义音效组 5 行槽位（默认 / 静音 / 片段）。
 - class ResourceManagerDialog(QDialog)：QTabWidget 两页签（角色 / 音效），
@@ -38,8 +41,9 @@
 
 实现要点：
 - 不 import 桌宠.py（避免循环依赖）；顶层 import PySide6 没问题。
-- 所有对话框统一 DIALOG_QSS 深色主题；文件导入前先做大小 / 尺寸 /
-  透明通道校验（角色 PNG 必须可加载且 hasAlphaChannel）。
+- 所有对话框统一 DIALOG_QSS 深色主题；角色导入支持单 / 双形态：
+  单形态一张图、双形态常态 + 吃饱两张图，素材导入时自动处理
+  （无透明通道自动去背景、裁剪透明边距、超大图等比缩小）。
 - 金额统一 "%.2f" 显示，表格金额列右对齐。
 
 Python 3.8+ 兼容。
@@ -49,10 +53,12 @@ Copyright (c) 大肥鱼桌宠项目
 """
 
 import os
+import shutil
+import tempfile
 import time
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QColorDialog,
@@ -71,6 +77,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -287,31 +294,151 @@ def _fill_detail(table, records):
             table.setItem(i, j, item)
 
 
-def _png_has_alpha(src):
-    """PNG 是否带透明：QPixmap 判定优先；另兼容「调色板+tRNS」的合法透明 PNG。"""
+# ---------------- 角色素材自动处理（导入向导用） ----------------
+_IMG_MAX_PROCESS_PX = 2048   # 去背景前的预缩放上限（限制泛洪耗时）
+_IMG_TARGET_MAX_PX = 512     # 输出统一上限（角色太大/太小都不合适）
+_IMG_BG_TOL = 40             # 去背景颜色容差（RGB 各通道最大差值）
+_IMG_MIN_PX = 8
+
+
+def _remove_background(img):
+    """无透明通道图自动去背景：从四边泛洪「与边界同色相连」的区域并置透明。
+
+    返回处理后的 QImage；若剩余内容不足 1%（背景色与主体大面积同色相连）
+    判定失败并返回 None（调用方保留原图并提示）。
+    """
+    from collections import deque
+    w, h = img.width(), img.height()
+    if w <= 0 or h <= 0:
+        return None
     try:
-        pix = QPixmap(src)
-        if pix.isNull():
-            return False
-        if pix.hasAlphaChannel():
-            return True
-        import struct
-        with open(src, "rb") as f:
-            if f.read(8) != b"\x89PNG\r\n\x1a\n":
-                return False
-            while True:
-                head = f.read(8)
-                if len(head) < 8:
-                    return False
-                (length,) = struct.unpack(">I", head[:4])
-                ctype = head[4:8]
-                if ctype == b"tRNS":
-                    return True  # tRNS 出现在 IDAT 之前即视为有透明
-                if ctype == b"IDAT":
-                    return False
-                f.seek(length + 4, 1)
+        raw = bytearray(img.bits())
     except Exception:
-        return False
+        return None
+    bpl = img.bytesPerLine()
+    n = w * h
+    visited = bytearray(n)
+    dq = deque()
+    for x in range(w):
+        dq.append((x, 0))
+        dq.append((x, h - 1))
+    for y in range(1, h - 1):
+        dq.append((0, y))
+        dq.append((w - 1, y))
+    from PySide6.QtWidgets import QApplication
+    processed = 0
+    while dq:
+        x, y = dq.popleft()
+        i = y * w + x
+        if visited[i]:
+            continue
+        visited[i] = 1
+        processed += 1
+        if processed % 8192 == 0:
+            QApplication.processEvents()  # 大图泛洪数秒：周期让事件循环喘气，避免假死
+        p = y * bpl + x * 4  # 行对齐：与 _content_bbox 的 y*bpl+x*4 一致
+        r, g, b = raw[p], raw[p + 1], raw[p + 2]
+        if x > 0 and not visited[i - 1]:
+            q = p - 4
+            if abs(raw[q] - r) <= _IMG_BG_TOL and abs(raw[q + 1] - g) <= _IMG_BG_TOL and abs(raw[q + 2] - b) <= _IMG_BG_TOL:
+                dq.append((x - 1, y))
+        if x < w - 1 and not visited[i + 1]:
+            q = p + 4
+            if abs(raw[q] - r) <= _IMG_BG_TOL and abs(raw[q + 1] - g) <= _IMG_BG_TOL and abs(raw[q + 2] - b) <= _IMG_BG_TOL:
+                dq.append((x + 1, y))
+        if y > 0 and not visited[i - w]:
+            q = p - bpl
+            if abs(raw[q] - r) <= _IMG_BG_TOL and abs(raw[q + 1] - g) <= _IMG_BG_TOL and abs(raw[q + 2] - b) <= _IMG_BG_TOL:
+                dq.append((x, y - 1))
+        if y < h - 1 and not visited[i + w]:
+            q = p + bpl
+            if abs(raw[q] - r) <= _IMG_BG_TOL and abs(raw[q + 1] - g) <= _IMG_BG_TOL and abs(raw[q + 2] - b) <= _IMG_BG_TOL:
+                dq.append((x, y + 1))
+    keep = 0
+    for y in range(h):
+        row = y * bpl
+        for x in range(w):
+            i = y * w + x
+            if visited[i]:
+                raw[row + x * 4 + 3] = 0
+            elif raw[row + x * 4 + 3] > 0:
+                keep += 1
+    if keep < max(64, n // 100):
+        return None  # 几乎全被吃：判定失败，保留原图
+    out = QImage(raw, w, h, bpl, QImage.Format.Format_ARGB32)
+    return out.copy()
+
+
+def _content_bbox(img):
+    """非透明像素包围盒 (x, y, w, h)；全透明返回 None。"""
+    w, h = img.width(), img.height()
+    try:
+        raw = bytearray(img.bits())
+    except Exception:
+        return None
+    bpl = img.bytesPerLine()
+    minx, miny, maxx, maxy = w, h, -1, -1
+    from PySide6.QtWidgets import QApplication
+    for y in range(h):
+        row = y * bpl
+        if y % 256 == 0:
+            QApplication.processEvents()  # 大图扫描：周期让事件循环喘气
+        for x in range(w):
+            if raw[row + x * 4 + 3] > 8:
+                if x < minx:
+                    minx = x
+                if x > maxx:
+                    maxx = x
+                if y < miny:
+                    miny = y
+                if y > maxy:
+                    maxy = y
+    if maxx < 0:
+        return None
+    return (minx, miny, maxx - minx + 1, maxy - miny + 1)
+
+
+def _prepare_role_png(src, out_path):
+    """导入素材自动处理：无透明通道→去背景；裁剪透明边距；>512px 等比缩小。
+
+    成功返回 (True, notes)；失败返回 (False, err)。notes 为中文说明列表。
+    """
+    img = QImage(src)
+    if img.isNull():
+        return False, "无法加载该图片"
+    # 必须先查原图的 alpha（convertToFormat 成 ARGB32 后 hasAlphaChannel 恒为 True）
+    had_alpha = img.hasAlphaChannel()
+    img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    notes = []
+    if max(img.width(), img.height()) > _IMG_MAX_PROCESS_PX:
+        img = img.scaled(_IMG_MAX_PROCESS_PX, _IMG_MAX_PROCESS_PX,
+                         Qt.AspectRatioMode.KeepAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+        notes.append("超大图已预缩放")
+    if not had_alpha:
+        removed = _remove_background(img)
+        if removed is None:
+            notes.append("背景与主体相连，保留原图")
+        else:
+            img = removed
+            notes.append("已自动去背景")
+    bbox = _content_bbox(img)
+    if bbox is None:
+        return False, "图片没有可见内容"
+    x, y, w, h = bbox
+    if (x, y, w, h) != (0, 0, img.width(), img.height()):
+        img = img.copy(x, y, w, h)
+        notes.append("已裁剪透明边距")
+    if max(img.width(), img.height()) > _IMG_TARGET_MAX_PX:
+        img = img.scaled(_IMG_TARGET_MAX_PX, _IMG_TARGET_MAX_PX,
+                         Qt.AspectRatioMode.KeepAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+        notes.append("已等比缩放（最长边 ≤%dpx）" % _IMG_TARGET_MAX_PX)
+    if img.width() < _IMG_MIN_PX or img.height() < _IMG_MIN_PX:
+        return False, "图片内容太小"
+    if not img.save(out_path, "PNG"):
+        return False, "保存处理结果失败"
+    return True, notes
 
 
 def _qt_parent(pet):
@@ -319,12 +446,203 @@ def _qt_parent(pet):
     return pet if isinstance(pet, QWidget) else None
 
 
+# ---------------- 角色导入向导 ----------------
+class RoleImportDialog(QDialog):
+    """导入角色向导：单形态（一张图）/ 双形态（常态+吃饱两张图）由用户自选。
+
+    点「导入」时对每张素材自动处理（去背景/裁剪/缩放，见 _prepare_role_png），
+    处理结果经 result_data() 交给 RolePanel 落库；临时文件在 closeEvent 清理。
+    """
+
+    MAX_BYTES = 10 * 1024 * 1024
+
+    def __init__(self, parent=None):
+        super().__init__(_qt_parent(parent))
+        self.setWindowTitle("导入角色")
+        self.setStyleSheet(DIALOG_QSS)
+        self.resize(600, 430)
+        self._tmpdir = None
+        self._result = None
+
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("选好图片点「导入」即可：自动去背景、裁剪边距、统一大小。"))
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("角色名"))
+        self._name_edit = QLineEdit()
+        name_row.addWidget(self._name_edit, 1)
+        root.addLayout(name_row)
+
+        mode_row = QHBoxLayout()
+        self._single = QRadioButton("单形态（只有一张图）")
+        self._dual = QRadioButton("双形态（常态 + 吃饱 两张图）")
+        self._single.setChecked(True)
+        self._single.toggled.connect(self._on_mode)
+        self._dual.toggled.connect(self._on_mode)
+        mode_row.addWidget(self._single)
+        mode_row.addWidget(self._dual)
+        mode_row.addStretch(1)
+        root.addLayout(mode_row)
+
+        self._base_edit = QLineEdit()
+        self._base_edit.setReadOnly(True)
+        self._base_edit.setPlaceholderText("常态图（必选）")
+        self._full_edit = QLineEdit()
+        self._full_edit.setReadOnly(True)
+        self._full_edit.setPlaceholderText("吃饱图（双形态必选）")
+        b_row = QHBoxLayout()
+        b_row.addWidget(QLabel("常态图"))
+        b_row.addWidget(self._base_edit, 1)
+        b_btn = QPushButton("浏览…")
+        b_btn.clicked.connect(lambda: self._pick(self._base_edit, self._prev_base, "常态图"))
+        b_row.addWidget(b_btn)
+        root.addLayout(b_row)
+        f_row = QHBoxLayout()
+        f_row.addWidget(QLabel("吃饱图"))
+        f_row.addWidget(self._full_edit, 1)
+        f_btn = QPushButton("浏览…")
+        f_btn.clicked.connect(lambda: self._pick(self._full_edit, self._prev_full, "吃饱图"))
+        f_row.addWidget(f_btn)
+        root.addLayout(f_row)
+        self._full_ctl = (self._full_edit, f_btn)
+
+        prev_row = QHBoxLayout()
+        base_lay, self._prev_base = self._make_preview("常态")
+        full_lay, self._prev_full = self._make_preview("吃饱（双形态）")
+        prev_row.addLayout(base_lay)
+        prev_row.addLayout(full_lay)
+        root.addLayout(prev_row)
+
+        self._notes = QLabel("")
+        self._notes.setWordWrap(True)
+        root.addWidget(self._notes)
+
+        btns = QHBoxLayout()
+        self._ok = QPushButton("导入")
+        self._cancel = QPushButton("取消")
+        self._ok.setDefault(True)
+        self._ok.clicked.connect(self._do_import)
+        self._cancel.clicked.connect(self.reject)
+        btns.addStretch(1)
+        btns.addWidget(self._ok)
+        btns.addWidget(self._cancel)
+        root.addLayout(btns)
+
+        self._on_mode()
+
+    @staticmethod
+    def _make_preview(title):
+        """构建「标题 + 预览框」子布局；返回 (QLayout, QLabel)。
+
+        注意：不能用局部包装 QWidget 挂预览框——局部变量被 GC 会连带销毁
+        子控件的 C++ 对象（libshiboken 已删除错误），必须返回布局交给调用方挂载。
+        """
+        lay = QVBoxLayout()
+        cap = QLabel(title)
+        cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        prev = QLabel("未选择")
+        prev.setFixedSize(240, 170)
+        prev.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        prev.setStyleSheet(
+            "background-color:#2e3560;border:1px solid #3d477f;"
+            "border-radius:8px;color:#8f97c0;")
+        lay.addWidget(cap)
+        lay.addWidget(prev, 0, Qt.AlignmentFlag.AlignCenter)
+        return lay, prev
+
+    def _on_mode(self):
+        dual = self._dual.isChecked()
+        for w in self._full_ctl:
+            w.setEnabled(dual)
+
+    def _pick(self, edit, preview, title):
+        src, _f = QFileDialog.getOpenFileName(
+            self, "选择" + title, "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not src:
+            return
+        try:
+            if os.path.getsize(src) > self.MAX_BYTES:
+                _warn(self, title, "文件超过 10MB，无法导入")
+                return
+            pix = QPixmap(src)
+            if pix.isNull():
+                _warn(self, title, "无法加载该图片")
+                return
+        except Exception:
+            _warn(self, title, "读取图片失败")
+            return
+        edit.setText(src)
+        preview.setText("")
+        preview.setPixmap(pix.scaled(240, 170, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation))
+        if title == "常态图" and not self._name_edit.text().strip():
+            self._name_edit.setText(os.path.splitext(os.path.basename(src))[0])
+
+    def _do_import(self):
+        base_src = self._base_edit.text().strip()
+        if not base_src or not os.path.isfile(base_src):
+            _warn(self, "导入角色", "请先选择常态图")
+            return
+        dual = self._dual.isChecked()
+        full_src = self._full_edit.text().strip() if dual else ""
+        if dual and (not full_src or not os.path.isfile(full_src)):
+            _warn(self, "导入角色", "双形态需要提供「吃饱图」")
+            return
+        # 大图去背景/裁剪要几秒：禁按钮（含取消，防处理中途关闭导致临时目录泄漏）
+        self._ok.setEnabled(False)
+        self._ok.setText("处理中…")
+        self._cancel.setEnabled(False)
+        self._notes.setText("正在自动处理素材（去背景 / 裁剪 / 缩放）……")
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
+        try:
+            self._tmpdir = tempfile.mkdtemp(prefix="role_prep_")
+            base_out = os.path.join(self._tmpdir, "role_base.png")
+            ok1, notes1 = _prepare_role_png(base_src, base_out)
+            if not ok1:
+                self._cleanup()
+                _warn(self, "导入角色", "常态图处理失败：%s" % notes1)
+                return
+            notes = ["常态图：%s" % ("、".join(notes1) if notes1 else "无需处理")]
+            full_out = None
+            if dual:
+                full_out = os.path.join(self._tmpdir, "role_full.png")
+                ok2, notes2 = _prepare_role_png(full_src, full_out)
+                if not ok2:
+                    self._cleanup()
+                    _warn(self, "导入角色", "吃饱图处理失败：%s" % notes2)
+                    return
+                notes.append("吃饱图：%s" % ("、".join(notes2) if notes2 else "无需处理"))
+            self._result = {
+                "name": self._name_edit.text().strip()
+                        or os.path.splitext(os.path.basename(base_src))[0],
+                "base": base_out,
+                "full": full_out,
+                "notes": notes,
+            }
+            self.accept()
+        finally:
+            self._ok.setEnabled(True)
+            self._ok.setText("导入")
+            self._cancel.setEnabled(True)
+
+    def _cleanup(self):
+        if self._tmpdir:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
+
+    def closeEvent(self, event):
+        self._cleanup()
+        super().closeEvent(event)
+
+    def result_data(self):
+        """accepted 后取处理结果：{"name","base","full","notes"} 或 None。"""
+        return self._result
+
+
 # ---------------- a) 角色面板 ----------------
 class RolePanel(QWidget):
     """角色列表 + 预览 + 导入 / 设为当前 / 删除 / 恢复默认。"""
-
-    MAX_BYTES = 10 * 1024 * 1024
-    MAX_PX = 2048
 
     def __init__(self, parent=None):
         super().__init__(_qt_parent(parent))
@@ -355,6 +673,9 @@ class RolePanel(QWidget):
         root.addLayout(left, 1)
 
         right = QVBoxLayout()
+        cap1 = QLabel("常态")
+        cap1.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right.addWidget(cap1)
         self._preview = QLabel("预览")
         self._preview.setFixedSize(200, 200)
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -362,7 +683,18 @@ class RolePanel(QWidget):
             "background-color:#2e3560;border:1px solid #3d477f;"
             "border-radius:8px;color:#8f97c0;")
         right.addWidget(self._preview)
+        cap2 = QLabel("吃饱")
+        cap2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right.addWidget(cap2)
+        self._preview_full = QLabel("预览")
+        self._preview_full.setFixedSize(200, 200)
+        self._preview_full.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview_full.setStyleSheet(
+            "background-color:#2e3560;border:1px solid #3d477f;"
+            "border-radius:8px;color:#8f97c0;")
+        right.addWidget(self._preview_full)
         self._meta = QLabel("")
+        self._meta.setWordWrap(True)
         right.addWidget(self._meta)
         right.addStretch(1)
         root.addLayout(right)
@@ -379,6 +711,8 @@ class RolePanel(QWidget):
             self._info.setText("当前：默认角色")
             self._preview.setText("角色库不可用")
             self._preview.setPixmap(QPixmap())
+            self._preview_full.setText("角色库不可用")
+            self._preview_full.setPixmap(QPixmap())
             self._meta.setText("")
             return
         for b in (self._btn_import, self._btn_set, self._btn_del, self._btn_default):
@@ -396,7 +730,8 @@ class RolePanel(QWidget):
                 except Exception:
                     pass
             mark = " [当前]" if role["id"] == active else ""
-            it = QListWidgetItem("%s  %s  %s%s" % (role["name"], size_text, role.get("added", ""), mark))
+            form_text = "双形态" if (role.get("file_full") or role.get("form") == "dual") else "单形态"
+            it = QListWidgetItem("%s  %s  %s  %s%s" % (role["name"], size_text, form_text, role.get("added", ""), mark))
             it.setData(Qt.ItemDataRole.UserRole, role["id"])
             self._list.addItem(it)
             if role["id"] == active:
@@ -405,12 +740,15 @@ class RolePanel(QWidget):
         self._info.setText(("当前：%s" % active_name) if active else "当前：默认角色")
         if self._list.count() == 0:
             self._preview.setPixmap(QPixmap())
-            self._preview.setText("暂无角色\n导入透明底 PNG 即可换装")
+            self._preview.setText("暂无角色\n点「导入角色…」加一个")
+            self._preview_full.setPixmap(QPixmap())
+            self._preview_full.setText("暂无角色")
             self._meta.setText("")
 
     def _on_select(self, item, _prev):
         if item is None or self._lib is None:
             self._preview.setPixmap(QPixmap())
+            self._preview_full.setPixmap(QPixmap())
             self._meta.setText("")
             return
         rid = item.data(Qt.ItemDataRole.UserRole)
@@ -418,54 +756,70 @@ class RolePanel(QWidget):
         if not p:
             self._preview.setPixmap(QPixmap())
             self._preview.setText("文件缺失，无法预览")
+            self._preview_full.setPixmap(QPixmap())
             self._meta.setText("")
             return
         pix = QPixmap(p)
         if pix.isNull():
             self._preview.setPixmap(QPixmap())
             self._preview.setText("无法预览")
+            self._preview_full.setPixmap(QPixmap())
             self._meta.setText("")
             return
         scaled = pix.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
                             Qt.TransformationMode.SmoothTransformation)
         self._preview.setText("")
         self._preview.setPixmap(scaled)
-        self._meta.setText("%dx%d" % (pix.width(), pix.height()))
+        fp = self._lib.path_for_full(rid)
+        if fp:
+            try:
+                pf = QPixmap(fp)
+                if not pf.isNull():
+                    self._preview_full.setText("")
+                    self._preview_full.setPixmap(pf.scaled(
+                        200, 200, Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation))
+                    self._meta.setText("%dx%d · 双形态" % (pix.width(), pix.height()))
+                else:
+                    self._preview_full.setPixmap(QPixmap())
+                    self._preview_full.setText("吃饱图无法预览")
+                    self._meta.setText("%dx%d · 双形态" % (pix.width(), pix.height()))
+            except Exception:
+                self._preview_full.setPixmap(QPixmap())
+                self._preview_full.setText("吃饱图无法预览")
+        else:
+            self._preview_full.setPixmap(QPixmap())
+            self._preview_full.setText("单形态：无吃饱图")
+            self._meta.setText("%dx%d · 单形态" % (pix.width(), pix.height()))
 
     def _parent_widget(self):
         return self._pet if isinstance(self._pet, QWidget) else self
 
     # ---------- 动作 ----------
     def _import(self):
+        """导入角色：弹出向导（单/双形态自选 + 素材自动处理）→ 落库 → 切换。"""
         if self._lib is None:
             return
-        src, _f = QFileDialog.getOpenFileName(self._parent_widget(), "导入角色", "", "PNG 图片 (*.png)")
-        if not src:
-            return
+        dlg = RoleImportDialog(self._parent_widget())
         try:
-            if os.path.getsize(src) > self.MAX_BYTES:
-                _warn(self._parent_widget(), "导入角色", "文件超过 10MB，无法导入")
+            if modal(dlg) != QDialog.DialogCode.Accepted:
                 return
-            pix = QPixmap(src)
-            if pix.isNull():
-                _warn(self._parent_widget(), "导入角色", "无法加载该图片，可能不是有效的 PNG")
+            data = dlg.result_data()
+            if not data:
                 return
-            if pix.width() > self.MAX_PX or pix.height() > self.MAX_PX:
-                _warn(self._parent_widget(), "导入角色", "图片超过 %dpx，无法导入" % self.MAX_PX)
+            role, err = self._lib.import_processed(data["base"], data["full"], data["name"])
+            if role is None:
+                _warn(self._parent_widget(), "导入角色", err or "导入失败")
                 return
-            if not _png_has_alpha(src):
-                _warn(self._parent_widget(), "导入角色",
-                      "需要透明背景 PNG（可用「去背景.py」处理后再导入）")
-                return
-        except Exception:
-            _warn(self._parent_widget(), "导入角色", "读取图片失败")
-            return
-        role, err = self._lib.import_file(src)
-        if role is None:
-            _warn(self._parent_widget(), "导入角色", err or "导入失败")
-            return
-        _call(self._pet, "apply_role", role["id"])  # 导入即切换为新角色
-        self._refresh()
+            _call(self._pet, "apply_role", role["id"])  # 导入即切换为新角色
+            self._refresh()
+            tip = ("双形态角色：喂食后会在常态/吃饱之间切换形象。"
+                   if data["full"] else "单形态角色：两形态显示同一张图；"
+                   "想升级双形态，请重新导入并选择「双形态」。")
+            _info(self._parent_widget(), "导入角色",
+                  "导入成功！\n\n· %s\n\n%s" % ("\n· ".join(data["notes"]), tip))
+        finally:
+            dlg._cleanup()  # 任何路径都清理向导临时文件（含取消/失败）
 
     def _set_active(self):
         if self._lib is None:

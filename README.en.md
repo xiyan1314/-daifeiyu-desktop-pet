@@ -23,12 +23,12 @@ Transparent frameless window, always-on-top, draggable, feedable, chatty — per
 - 😴 **Idle life**: falls asleep after 60s, occasional mischievous grins, blushes when praised
 - 📌 Single instance, tray icon, follow mouse / wander, wheel resize, edge snapping
 - 🐳 **v1.3 customization & bookkeeping (inspired by the dsh-whale-widget plugin)**:
-  - 🖼️ **Character import**: right-click → "🐟 角色" to import your own transparent PNG as the pet; switch/delete/restore anytime (custom characters are static — emotions show via bubble & head emote)
+  - 🖼️ **Character import**: right-click → "🐟 角色" to import png/jpg/bmp/webp with auto background-removal / trim / scale; **choose single-form (one image) or dual-form (normal + full images)**; switch/delete/restore anytime (custom characters are static — emotions show via bubble & head emote)
   - 🔊 **Sound import + custom sound groups**: import wav/mp3 clips with preview; each of the 5 events (poke/release/feed/AI reply/coin) can use any clip or stay silent
   - 📦 **Resource manager**: one window for characters and audio clips (preview/audition/set-active/delete)
   - 📒 **Bookkeeping**: balance-diff auto-ledger (daily archive) + manual entries; ledger window with today / 7 days / all, search and CSV export; daily budget & balance alerts (once per day)
   - 🎨 **Bubble style + custom lines**: bubble colors/font/radius fully adjustable; add your own lines to four line pools
-  - 🌈 **Beautified right-click menu**: dark rounded theme, section headers, emoji icons, balance/today-usage info row
+  - 🌈 **Beautified right-click menu**: compact dark rounded theme, size slider, emoji icons, balance/today-usage info row
 
 ## 🚀 Quick Start
 
@@ -47,7 +47,7 @@ python 桌宠.py
 ## 🎮 Controls
 
 - Left-drag to move; hold for a squishy Q-bounce effect
-- Right-click menu (dark rounded theme): appearance (resize/top/sound/follow/wander/bubble style) · characters & resources (role switch & import / custom lines / sound settings / resource manager) · interactions (feed/tray/forms) · AI & ledger (chat/praise/API key/balance widget/check balance/ledger/manual entry/budget/alert) · tools · misc
+- Right-click menu (compact dark theme, whale-widget style): balance/today-usage header + 🎚️ size slider; flat toggles (always-on-top / sound / AI chat); talk · feed (incl. tray & forms) · characters · ledger (widget/books/entry/budget/alert) · resource manager · settings… (follow/wander/bubble/sound group/lines/API key); praise/weather/system/about/quit
 - Poke 3 times in a row for the full emotion chain; praise her to make her blush
 - Full form digests back to normal after ~12 seconds
 
@@ -63,7 +63,10 @@ python 桌宠.py
 
 ## 🎨 Customize your pet
 
-- **Character**: right-click → "🐟 角色" → "导入角色…" and pick a transparent PNG (≤2048px, ≤10MB); switch between imported characters anytime (static image + squish/edge/follow effects; emotions via bubble & emote)
+- **Character**: right-click → "🐟 角色" → "导入角色…" — material is auto-processed (background removed when opaque, transparent margins trimmed, oversized images scaled; png/jpg/bmp/webp supported):
+  - **Single form**: pick one image; normal/full forms share it
+  - **Dual form**: also pick a "full" image; feeding switches between the two (you choose the mode)
+  - Custom characters are static: squish/edge/follow effects kept; emotions via bubble & emote
 - **Sounds**: right-click → "🎵 音效设置" → "管理音频片段…" to import wav/mp3 and audition; assign a clip (or silence) per event in the custom group
 - **Bubble**: right-click → "🎨 气泡样式…" to tweak background/text/border colors, font size and corner radius
 - **Lines**: right-click → "💬 自定义台词…" to append your own lines to four pools

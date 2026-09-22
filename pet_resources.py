@@ -10,13 +10,16 @@
 对外接口：
 - class RoleLibrary(data_dir)
     目录 data_dir/roles/，索引 data_dir/roles.json（{"roles":[...], "active":id}）。
-    list_roles() -> [{"id","name","file","added"}...]      # 默认角色不在列表，id 恒非空
+    list_roles() -> [{"id","name","file","form","file_full","added"}...]  # 默认角色不在列表
     active_id() -> str                                     # "" = 默认角色
     set_active(role_id) -> bool                            # "" 回默认
     active_path() -> str|None                              # 当前角色 png 绝对路径；默认角色 None
     path_for(role_id) -> str|None                          # 任意角色 png 绝对路径（面板预览用）
-    import_file(src, name=None) -> (role|None, err|None)   # 复制到 roles/<id>.png，>10MB 拒绝
-    delete(role_id) -> (bool, str)                         # 删文件+索引；active 则重置 ""
+    path_for_full(role_id) -> str|None                     # 吃饱形态 png；单形态返回 None
+    import_file(src, name=None) -> (role|None, err|None)   # 旧版单图导入（v1.3.0 兼容，单形态）
+    import_processed(base_src, full_src=None, name=None)   # 单/双形态导入（面板新入口）
+                                                           #   full_src=None → form="single"
+    delete(role_id) -> (bool, str)                         # 删全部素材文件+索引；active 则重置 ""
     get(role_id) -> dict|None
 - class AudioLibrary(data_dir)
     目录 data_dir/audio/，索引 data_dir/audio.json
@@ -125,12 +128,19 @@ class RoleLibrary:
             if not isinstance(r, dict):
                 continue
             rid = str(r.get("id") or "")
-            if not rid:
+            fname = str(r.get("file") or "")
+            # 过滤非法条目：无 id / 无文件名 / 非 .png（否则 delete 会误删目录）
+            if not rid or not fname or not fname.lower().endswith(".png"):
                 continue
+            file_full = str(r.get("file_full") or "")
+            # form 归一化：只有带 file_full 的 dual 才算双形态，其余一律 single
+            form = "dual" if (str(r.get("form") or "") == "dual" and file_full) else "single"
             clean.append({
                 "id": rid,
                 "name": str(r.get("name") or "") or "未命名",
-                "file": str(r.get("file") or ""),
+                "file": fname,
+                "form": form,
+                "file_full": file_full,
                 "added": str(r.get("added") or ""),
             })
         active = str(data.get("active") or "")
@@ -151,9 +161,28 @@ class RoleLibrary:
             p = os.path.join(self._dir, p)
         return p
 
+    def _role_paths(self, role):
+        """角色全部素材文件绝对路径（base + 可选「吃饱」变体）。"""
+        out = [self._path(role)]
+        f = role.get("file_full")
+        if f:
+            out.append(f if os.path.isabs(f) else os.path.join(self._dir, f))
+        return out
+
+    @staticmethod
+    def _cleanup_files(*paths):
+        """尽力删除半成品文件（导入回滚用），任何异常静默。"""
+        for p in paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
     # ---------- 对外 ----------
     def list_roles(self):
-        """返回全部自定义角色 [{"id","name","file","added"}...]；默认角色不在列表。"""
+        """返回全部自定义角色 [{"id","name","file","form","file_full","added"}...]；
+        默认角色不在列表。"""
         return [dict(r) for r in self._data["roles"]]
 
     def active_id(self):
@@ -186,11 +215,27 @@ class RoleLibrary:
         except Exception:
             return None
 
-    def import_file(self, src, name=None):
-        """导入角色 PNG：复制到 roles/<id>.png。成功返回 (role, None)，失败 (None, err)。
+    def path_for_full(self, role_id):
+        """角色「吃饱」形态 png 绝对路径（存在才返回）；单形态返回 None（调用方回退 base）。"""
+        r = self.get(str(role_id or ""))
+        if r is None:
+            return None
+        f = r.get("file_full")
+        if not f:
+            return None
+        if not os.path.isabs(f):
+            f = os.path.join(self._dir, f)
+        try:
+            return f if os.path.isfile(f) else None
+        except Exception:
+            return None
 
-        本库保持 Qt-free，只校验扩展名与大小；PNG 可加载性与透明通道校验
-        由调用方（pet_dialogs.RolePanel）用 QPixmap 把关。"""
+    def import_file(self, src, name=None):
+        """旧版导入（v1.3.0 兼容）：只复制一张图，无「吃饱」变体（单形态）。
+
+        面板入口已改用 import_processed（支持单/双形态 + 自动处理素材）。
+        成功返回 (role, None)，失败 (None, err)。
+        本库保持 Qt-free，只校验扩展名与大小；PNG 可加载性由调用方用 QPixmap 把关。"""
         try:
             if not src or not isinstance(src, str) or not os.path.isfile(src):
                 return None, "文件不存在"
@@ -223,6 +268,7 @@ class RoleLibrary:
                 "id": rid,
                 "name": name,
                 "file": rid + ".png",
+                "form": "single",
                 "added": time.strftime("%Y-%m-%d"),
             }
             self._data["roles"].append(role)
@@ -239,16 +285,75 @@ class RoleLibrary:
         except Exception as e:
             return None, "导入失败：%s" % e
 
+    def import_processed(self, base_src, full_src=None, name=None):
+        """导入已自动处理的角色素材（面板新入口）。
+
+        full_src=None → 单形态：只复制 base（record form="single"，无 file_full）。
+        full_src 给路径 → 双形态：base + 吃饱变体都复制（form="dual"，file/file_full）。
+        成功返回 (role, None)，失败 (None, err)；任何失败都会清理半成品文件。
+        """
+        try:
+            for label, src in (("常态", base_src), ("吃饱", full_src)):
+                if src is None:
+                    continue
+                if not isinstance(src, str) or not os.path.isfile(src):
+                    return None, "%s素材文件不存在" % label
+                if os.path.splitext(src)[1].lower() != ".png":
+                    return None, "%s素材必须是 png" % label
+                try:
+                    if os.path.getsize(src) > self.MAX_BYTES:
+                        return None, "%s素材超过 10MB" % label
+                except Exception:
+                    return None, "无法读取文件大小"
+            if name is None or not str(name).strip():
+                name = "未命名"  # base_src 是临时文件，不能用其文件名当角色名
+            name = str(name).strip()[:40] or "未命名"
+            try:
+                os.makedirs(self._dir, exist_ok=True)
+            except Exception as e:
+                return None, "无法创建角色目录：%s" % e
+            rid = _new_id()
+            dst_base = os.path.join(self._dir, rid + ".png")
+            dst_full = os.path.join(self._dir, rid + "_full.png") if full_src else None
+            try:
+                shutil.copyfile(base_src, dst_base)
+                if dst_full is not None:
+                    shutil.copyfile(full_src, dst_full)
+            except Exception:
+                self._cleanup_files(dst_base, dst_full)
+                return None, "复制文件失败"
+            role = {
+                "id": rid,
+                "name": name,
+                "file": rid + ".png",
+                "form": "dual" if full_src else "single",
+                "added": time.strftime("%Y-%m-%d"),
+            }
+            if full_src:
+                role["file_full"] = rid + "_full.png"
+            self._data["roles"].append(role)
+            err = self._save()
+            if err:
+                self._cleanup_files(dst_base, dst_full)
+                self._data["roles"].pop()
+                return None, err
+            return role, None
+        except Exception as e:
+            return None, "导入失败：%s" % e
+
     def delete(self, role_id):
-        """删除角色（文件 + 索引项）；若为当前角色则重置为默认。返回 (bool, err)。"""
+        """删除角色（文件 + 索引项）；若为当前角色则重置为默认。返回 (bool, err)。
+
+        边界：素材文件被占用时可能删第一张成功、第二张失败——此时索引未动，
+        该角色仍在列表里但部分文件已消失（预览会提示文件缺失，重试删除即可）。"""
         role_id = str(role_id or "")
         r = self.get(role_id)
         if r is None:
             return False, "角色不存在"
         try:
-            p = self._path(r)
-            if os.path.exists(p):
-                os.remove(p)
+            for p in self._role_paths(r):
+                if os.path.exists(p):
+                    os.remove(p)
         except Exception as e:
             return False, "删除文件失败：%s" % e
         self._data["roles"] = [x for x in self._data["roles"] if x["id"] != role_id]

@@ -7,10 +7,11 @@
 """
 import os
 import sys
-import json
 import shutil
 import tempfile
+import time
 
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")  # 中文 Windows 默认 GBK：print 带 ¥ 会崩
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -48,6 +49,19 @@ def make_test_png(path, w=256, h=256):
     return ok
 
 
+def make_opaque_png(path, w=256, h=256):
+    """生成一张真·不透明图（RGB32 无 alpha 通道，浅灰底 + 彩色圆），供自动去背景测试。"""
+    from PySide6.QtGui import QImage, QPainter, QColor
+    img = QImage(w, h, QImage.Format.Format_RGB32)
+    img.fill(QColor("#f5f5f5"))
+    p = QPainter(img)
+    p.setPen(QColor("#333333"))
+    p.setBrush(QColor("#ff5b7a"))
+    p.drawEllipse(w // 4, h // 4, w // 2, h // 2)
+    p.end()
+    img.save(path, "PNG")
+
+
 def make_test_wav(path):
     """生成 0.2s 静音 WAV（供音频导入用）。"""
     import struct
@@ -60,8 +74,8 @@ def make_test_wav(path):
 
 
 def main_flow():
-    from PySide6.QtCore import QTimer, QPoint
-    from PySide6.QtWidgets import QApplication, QDialog
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
 
     app = QApplication(sys.argv)
     app.setStyleSheet(main.MENU_QSS)
@@ -74,18 +88,92 @@ def main_flow():
     check("lines_pools built", set(pet.lines_pools) == {"sajiao", "greedy", "happy", "idle"})
     check("bubble style default", main.BUBBLE_STYLE.get("font_size") == 10)
 
-    # ---- 2. 角色导入 + 切换 ----
+    # ---- 2. 角色导入 + 切换（v1.3.1：单/双形态 + 素材自动处理） ----
     png = os.path.join(_tmp, "role_test.png")
     make_test_png(png)
     role, err = pet.role_lib.import_file(png, "测试角色")
-    check("role import", role is not None and err is None, "err=%r" % (err,))
+    check("role import (legacy)", role is not None and err is None, "err=%r" % (err,))
     if role:
         pet.apply_role(role["id"])
         check("role active id", pet.role_lib.active_id() == role["id"])
         check("custom role sprites", pet._custom_role and not pet.has_frames)
         check("window size > 0", pet.width() > 20 and pet.height() > 20)
+        # 旧版导入无吃饱变体：单形态（吃饱形态回退同一张图）
+        check("legacy role single form",
+              pet.sprites["full"]["side"].cacheKey() == pet.sprites["normal"]["side"].cacheKey())
         pet.apply_role("")  # 恢复默认
         check("role restore default", not pet._custom_role and pet.has_frames)
+
+    # 素材自动处理：不透明图 → 去背景 + 裁剪 + 缩放
+    from PySide6.QtGui import QImage
+    opaque = os.path.join(_tmp, "opaque.png")
+    make_opaque_png(opaque, 800, 600)
+    out1 = os.path.join(_tmp, "proc_base.png")
+    okp, notesp = pet_dialogs._prepare_role_png(opaque, out1)
+    check("auto-process opaque", okp and os.path.isfile(out1), "err=%r" % (notesp,))
+    check("bg removal actually ran", okp and "已自动去背景" in notesp, "notes=%r" % (notesp,))
+    if okp:
+        img1 = QImage(out1)
+        check("processed has alpha", img1.hasAlphaChannel())
+        check("processed trimmed+scaled", max(img1.width(), img1.height()) <= 512
+              and img1.width() < 800)
+    # 已有透明通道的图：去背景不误伤
+    png2 = os.path.join(_tmp, "role_test2.png")
+    make_test_png(png2)
+    out2 = os.path.join(_tmp, "proc_alpha.png")
+    okp2, notesp2 = pet_dialogs._prepare_role_png(png2, out2)
+    check("auto-process alpha png", okp2, "err=%r" % (notesp2,))
+
+    # 双形态导入：常态+吃饱两张 → 吃饱形态切到第二张图
+    full_src = os.path.join(_tmp, "full_src.png")
+    make_test_png(full_src, 512, 512)
+    out_full = os.path.join(_tmp, "proc_full.png")
+    okf, notesf = pet_dialogs._prepare_role_png(full_src, out_full)
+    dual, errd = pet.role_lib.import_processed(out1, out_full, "双形态测试")
+    check("import dual", dual is not None and errd is None, "err=%r" % (errd,))
+    if dual:
+        check("dual form recorded", dual.get("form") == "dual"
+              and bool(pet.role_lib.path_for_full(dual["id"])))
+        # 重启重载回归：重建 RoleLibrary（模拟再次启动）后双形态关联不丢
+        lib2 = main.pet_resources.RoleLibrary(_tmp)
+        check("role reload keeps file_full", lib2.path_for_full(dual["id"]) is not None
+              and lib2.get(dual["id"]).get("form") == "dual")
+        pet.apply_role(dual["id"])
+        check("dual sprites differ",
+              pet.sprites["full"]["side"].cacheKey() != pet.sprites["normal"]["side"].cacheKey())
+        pet._set_form("full")
+        check("dual form shows full pix",
+              pet.item.pixmap().cacheKey() == pet.sprites["full"]["side"].cacheKey())
+        pet._set_form("normal")
+        # H1 回归：喂食路径（squash 动画收尾）也必须落到吃饱图
+        pet.apply_role(dual["id"])
+        pet.feed("小鱼干")
+        t0 = time.time()
+        while pet.busy and time.time() - t0 < 3:
+            app.processEvents()
+            time.sleep(0.02)
+        check("feed shows full pix (dual)", pet.form == "full"
+              and pet.item.pixmap().cacheKey() == pet.sprites["full"]["side"].cacheKey())
+        pet._set_form("normal")
+        # M4b：双形态删除——两张素材文件都删 + active 重置
+        bpath = pet.role_lib.path_for(dual["id"])
+        fpath = pet.role_lib.path_for_full(dual["id"])
+        okd, errd2 = pet.role_lib.delete(dual["id"])
+        check("dual delete both files", okd and not os.path.exists(bpath)
+              and not os.path.exists(fpath)
+              and pet.role_lib.get(dual["id"]) is None
+              and pet.role_lib.active_id() == "")
+        pet.apply_role("")
+    # 单形态导入：只有一张图 → 两形态同图
+    single, errs = pet.role_lib.import_processed(out2, None, "单形态测试")
+    check("import single", single is not None and errs is None, "err=%r" % (errs,))
+    if single:
+        check("single form recorded", single.get("form") == "single"
+              and pet.role_lib.path_for_full(single["id"]) is None)
+        pet.apply_role(single["id"])
+        check("single sprites equal",
+              pet.sprites["full"]["side"].cacheKey() == pet.sprites["normal"]["side"].cacheKey())
+        pet.apply_role("")
 
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
@@ -171,11 +259,23 @@ def main_flow():
     finally:
         main.QMenu = real_menu_cls
     if captured:
-        texts = [a.text() for a in captured._captured if a.text()]
-        check("menu has sections+items", len(texts) >= 25, "count=%d" % len(texts))
+        def _all_texts(acts):
+            out = []
+            for a in acts:
+                if a.text():
+                    out.append(a.text())
+                m2 = a.menu()
+                if m2 is not None:
+                    out.extend(_all_texts(m2.actions()))
+            return out
+        texts = _all_texts(captured._captured)
+        top = [a.text() for a in captured._captured if a.text()]
+        check("menu compact top-level", len(top) <= 18, "top=%d" % len(top))
+        check("menu all items", len(texts) >= 35, "count=%d" % len(texts))
         check("menu ledger item", any("账本" in t for t in texts))
         check("menu resource item", any("资源管理" in t for t in texts))
         check("menu role item", any("角色" in t for t in texts))
+        check("menu has size slider", any(isinstance(a, main.QWidgetAction) for a in captured._captured))
     else:
         check("menu captured", False, "no menu object captured")
 
@@ -186,6 +286,7 @@ def main_flow():
         ("BubbleStyle", lambda: pet_dialogs.BubbleStyleDialog(pet)),
         ("Lines", lambda: pet_dialogs.LinesDialog(pet)),
         ("AmountNote", lambda: pet_dialogs.AmountNoteDialog(pet)),
+        ("RoleImport", lambda: pet_dialogs.RoleImportDialog(pet)),
     ):
         try:
             dlg = mk()
@@ -195,6 +296,24 @@ def main_flow():
             check("dialog %s" % name, True)
         except Exception as e:
             check("dialog %s" % name, False, repr(e))
+
+    # ---- 7b. RoleImportDialog 拒绝路径（stub _warn 防弹窗阻塞）----
+    _real_warn = pet_dialogs._warn
+    pet_dialogs._warn = lambda *a, **k: None
+    try:
+        ridlg = pet_dialogs.RoleImportDialog(pet)
+        ridlg._do_import()
+        check("import reject: no base", ridlg.result_data() is None)
+        ridlg._single.setChecked(False)
+        ridlg._dual.setChecked(True)
+        ridlg._base_edit.setText(os.path.join(_tmp, "opaque.png"))
+        ridlg._do_import()
+        check("import reject: dual missing full", ridlg.result_data() is None)
+        ridlg.close()
+    except Exception as e:
+        check("import reject paths", False, repr(e))
+    finally:
+        pet_dialogs._warn = _real_warn
 
     # ---- 8. 清理与退出 ----
     pet._quit()  # 内部调 QApplication.quit()
