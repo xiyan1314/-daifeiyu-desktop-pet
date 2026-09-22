@@ -14,6 +14,11 @@
     2) QSoundEffect 播放 wav 文件（仅 winsound 不存在时——非 Windows）；
     3) winsound SND_MEMORY 播放合成回退音。
   任何一级失败静默降级到下一级，绝不抛出。
+- set_custom_group(group) / clear_custom_group()（v1.3.0 追加）：自定义音效组，
+  group 形如 {"press": path|""|None, ...}；play() 开头先查组：""=静音，
+  有效路径=winsound 直接播放（失败落回原三级链路），None/缺键=走默认链路。
+- preview_file(path)（v1.3.0 追加）：试听单个 wav 文件（winsound 异步），
+  成功返回 True；非 wav / 不存在 / 失败返回 False（mp3 由调用方降级 QMediaPlayer）。
 
 实现要点：
 - 仅 winsound / wave / os / math / struct 为顶层依赖；PySide6.QtMultimedia 惰性导入，
@@ -244,6 +249,52 @@ _PLAY_MAP = {
 }
 
 
+# ---------------- 自定义音效组（v1.3.0 追加） ----------------
+# kind -> 绝对路径 | ""（静音） | None（走默认链路）；None = 未启用自定义组
+_custom_group = None
+
+
+def set_custom_group(group):
+    """设置自定义音效组：group 形如 {"press": path|""|None, ...}。
+
+    值为 "" 表示该事件静音；None 或缺键表示走默认链路。非 dict 输入忽略。
+    """
+    global _custom_group
+    if isinstance(group, dict):
+        _custom_group = dict(group)
+    else:
+        _custom_group = None
+
+
+def clear_custom_group():
+    """清除自定义音效组，恢复全部默认链路。"""
+    global _custom_group
+    _custom_group = None
+
+
+def preview_file(path):
+    """试听单个音频文件：仅 wav 且存在时用 winsound 异步播放并返回 True。
+
+    非 wav / 不存在 / 播放失败返回 False，由调用方自行降级（如 mp3 走 QMediaPlayer）。
+    """
+    if winsound is None:
+        return False
+    try:
+        if not path or not isinstance(path, str):
+            return False
+        if os.path.splitext(path)[1].lower() != ".wav":
+            return False
+        if not os.path.isfile(path):
+            return False
+        winsound.PlaySound(
+            path,
+            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT | winsound.SND_NOWAIT,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _qt_playable(eff):
     """判断 QSoundEffect 是否就绪可播（需要 QSoundEffect 类可见时才能调用）。"""
     cls = _QSoundEffect
@@ -257,6 +308,23 @@ def _qt_playable(eff):
 
 def play(kind):
     """播放音效：press→ya1 / release→ya2 / feed→d2，三级链路降级；未知 kind 直接返回。"""
+    # 0) 自定义音效组优先（v1.3.0）：""=静音直接返回；有效路径=winsound 直接播放，
+    #    播放失败继续走原三级链路；None/缺键=原链路。
+    group = _custom_group
+    if group:
+        custom = group.get(kind)
+        if custom == "":
+            return  # 该事件静音
+        if custom:
+            try:
+                if winsound is not None and os.path.isfile(custom):
+                    winsound.PlaySound(
+                        custom,
+                        winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT | winsound.SND_NOWAIT,
+                    )
+                    return  # 自定义音已发出
+            except Exception:
+                pass  # 自定义音播放失败：继续原三级链路
     pair = _PLAY_MAP.get(kind)
     if pair is None:
         return  # 未知 kind：直接返回
@@ -328,5 +396,20 @@ if __name__ == "__main__":
     play("reply")
     play("coin")
     play("未知kind")
+
+    print("=== 冒烟 4：自定义音效组（v1.3.0 追加） ===")
+    set_custom_group({
+        "press": "",  # 静音
+        "release": os.path.join(os.path.dirname(os.path.abspath(__file__)), "__不存在.wav"),
+        "feed": None,  # 走默认链路
+    })
+    play("press")    # 静音：直接返回
+    play("release")  # 路径不存在：落回原链路
+    play("feed")     # None：原链路
+    play("reply")    # 缺键：原链路
+    assert preview_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "__不存在.wav")) is False
+    assert preview_file(None) is False
+    clear_custom_group()
+    play("press")    # 恢复后走原链路
 
     print("AUDIO SMOKE OK")

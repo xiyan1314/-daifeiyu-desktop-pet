@@ -1,0 +1,575 @@
+# -*- coding: utf-8 -*-
+"""
+大肥鱼桌宠 —— 资源库模块（角色库 + 音频库，v1.3.0 新增）。
+
+职责：参考 dsh-whale-widget 的「角色管理 / 音频片段管理 / 音效组」设计，把
+自定义角色（透明 PNG）与自定义音频（wav/mp3）的导入、切换、重命名、删除，
+以及自定义音效组（5 个事件槽位）的管理统一封装。供 pet_dialogs 的面板与
+主程序（桌宠.py）调用。
+
+对外接口：
+- class RoleLibrary(data_dir)
+    目录 data_dir/roles/，索引 data_dir/roles.json（{"roles":[...], "active":id}）。
+    list_roles() -> [{"id","name","file","added"}...]      # 默认角色不在列表，id 恒非空
+    active_id() -> str                                     # "" = 默认角色
+    set_active(role_id) -> bool                            # "" 回默认
+    active_path() -> str|None                              # 当前角色 png 绝对路径；默认角色 None
+    path_for(role_id) -> str|None                          # 任意角色 png 绝对路径（面板预览用）
+    import_file(src, name=None) -> (role|None, err|None)   # 复制到 roles/<id>.png，>10MB 拒绝
+    delete(role_id) -> (bool, str)                         # 删文件+索引；active 则重置 ""
+    get(role_id) -> dict|None
+- class AudioLibrary(data_dir)
+    目录 data_dir/audio/，索引 data_dir/audio.json
+    （{"fragments":[...], "group":{"custom":{"press":...,"release":...,"feed":...,"reply":...,"coin":...}}}）。
+    fragments() -> [{"id","name","file","ext","added","duration"}...]  # duration 仅 wav 探测
+    fragment_path(fid) -> str|None
+    import_file(src, name=None) -> (frag|None, err|None)   # 仅 .wav/.mp3，>20MB 拒绝
+    delete(fid) -> (bool, str)                             # 被音效组槽位引用则同步置 ""
+    rename(fid, new_name) -> (bool, str)
+    group_slots() -> dict                                 # {"custom": {kind: fid|""|None}}
+    set_slot(kind, fid) -> bool                           # kind 非法 False；""=静音；None=默认
+    group_paths() -> dict                                 # {"press": path|""|None, ...}
+                                                          #   None=未设置走内置默认；""=静音；
+                                                          #   path=绝对路径（文件缺失返回 None）
+
+实现要点：
+- 纯标准库（os/json/time/uuid/shutil/wave），不依赖 PySide6，无 GUI 可运行。
+- 全部文件 IO 走「写临时文件 + os.replace」原子替换；任何异常静默降级，
+  以错误字符串返回，绝不向调用方抛异常。
+- import_file 只校验扩展名与文件大小，不校验音频/图片内容（PNG 可加载性与
+  透明通道由 pet_dialogs 用 QPixmap 把关）。
+- 槽位三态：None（默认，走内置音效）/ ""（静音）/ 片段 id（自定义音）。
+
+Python 3.8+ 兼容。
+
+MIT License
+Copyright (c) 大肥鱼桌宠项目
+"""
+
+import json
+import os
+import shutil
+import time
+import uuid
+import wave
+
+# ---------------- 通用 IO 助手（原子替换，静默降级） ----------------
+def _read_json(path, factory=dict):
+    """读 JSON；文件缺失 / 损坏 / 结构非法时返回 factory() 默认值，绝不抛出。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return factory()
+
+
+def _write_json(path, data):
+    """原子写 JSON（临时文件 + os.replace）；成功返回 None，失败返回错误字符串。"""
+    tmp = path + ".tmp"
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return None
+    except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return str(e)
+
+
+def _new_id():
+    """生成片段/角色 id：8 位十六进制 uuid 前缀 + 时间戳，保证文件名安全且唯一。"""
+    return uuid.uuid4().hex[:8] + "_" + str(int(time.time()))
+
+
+def _wav_duration(path):
+    """用 wave 模块探测 WAV 时长（秒，两位小数）；失败 / 非 wav 返回 None。"""
+    try:
+        with wave.open(path, "rb") as wf:
+            _nch, _sw, framerate, nframes, _ct, _x = wf.getparams()
+        if framerate and nframes > 0:
+            return round(nframes / float(framerate), 2)
+    except Exception:
+        pass
+    return None
+
+
+# ---------------- 角色库 ----------------
+class RoleLibrary:
+    """自定义角色管理：导入 / 切换 / 删除透明 PNG 角色，索引 roles.json。"""
+
+    MAX_BYTES = 10 * 1024 * 1024  # 10MB 上限
+
+    def __init__(self, data_dir):
+        self._dir = os.path.join(data_dir, "roles")
+        self._index = os.path.join(data_dir, "roles.json")
+        self._data = {"roles": [], "active": ""}
+        self._load()
+
+    # ---------- 内部 ----------
+    def _load(self):
+        """读索引并归一化；active 指向已不存在的角色时重置为默认。"""
+        data = _read_json(self._index)
+        roles = data.get("roles") if isinstance(data.get("roles"), list) else []
+        clean = []
+        for r in roles:
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get("id") or "")
+            if not rid:
+                continue
+            clean.append({
+                "id": rid,
+                "name": str(r.get("name") or "") or "未命名",
+                "file": str(r.get("file") or ""),
+                "added": str(r.get("added") or ""),
+            })
+        active = str(data.get("active") or "")
+        if active and not any(r["id"] == active for r in clean):
+            active = ""
+        self._data = {"roles": clean, "active": active}
+        if active != str(data.get("active") or ""):
+            _write_json(self._index, self._data)  # 修复损坏的 active 引用（失败静默）
+
+    def _save(self):
+        """原子落盘；返回错误字符串或 None。"""
+        return _write_json(self._index, self._data)
+
+    def _path(self, role):
+        """角色 dict -> 文件绝对路径（file 为纯文件名时拼到 roles/ 目录下）。"""
+        p = role.get("file") or ""
+        if not os.path.isabs(p):
+            p = os.path.join(self._dir, p)
+        return p
+
+    # ---------- 对外 ----------
+    def list_roles(self):
+        """返回全部自定义角色 [{"id","name","file","added"}...]；默认角色不在列表。"""
+        return [dict(r) for r in self._data["roles"]]
+
+    def active_id(self):
+        """当前角色 id；"" = 默认角色。"""
+        return str(self._data.get("active") or "")
+
+    def set_active(self, role_id):
+        """切换角色；role_id="" 回默认。角色不存在返回 False。"""
+        role_id = str(role_id or "")
+        if role_id and self.get(role_id) is None:
+            return False
+        self._data["active"] = role_id
+        return self._save() is None
+
+    def active_path(self):
+        """当前角色 png 绝对路径；默认角色或文件缺失返回 None。"""
+        rid = self.active_id()
+        if not rid:
+            return None
+        return self.path_for(rid)
+
+    def path_for(self, role_id):
+        """任意角色 png 绝对路径（存在才返回）；供面板预览使用。"""
+        r = self.get(str(role_id or ""))
+        if r is None:
+            return None
+        p = self._path(r)
+        try:
+            return p if os.path.isfile(p) else None
+        except Exception:
+            return None
+
+    def import_file(self, src, name=None):
+        """导入角色 PNG：复制到 roles/<id>.png。成功返回 (role, None)，失败 (None, err)。
+
+        本库保持 Qt-free，只校验扩展名与大小；PNG 可加载性与透明通道校验
+        由调用方（pet_dialogs.RolePanel）用 QPixmap 把关。"""
+        try:
+            if not src or not isinstance(src, str) or not os.path.isfile(src):
+                return None, "文件不存在"
+            if os.path.splitext(src)[1].lower() != ".png":
+                return None, "仅支持 .png 角色图"
+            try:
+                if os.path.getsize(src) > self.MAX_BYTES:
+                    return None, "文件超过 10MB，无法导入"
+            except Exception:
+                return None, "无法读取文件大小"
+            if name is None or not str(name).strip():
+                name = os.path.splitext(os.path.basename(src))[0]
+            name = str(name).strip()[:40] or "未命名"
+            try:
+                os.makedirs(self._dir, exist_ok=True)
+            except Exception as e:
+                return None, "无法创建角色目录：%s" % e
+            rid = _new_id()
+            dst = os.path.join(self._dir, rid + ".png")
+            try:
+                shutil.copyfile(src, dst)
+            except Exception:
+                try:
+                    if os.path.exists(dst):
+                        os.remove(dst)  # 半截文件清理，不留孤儿
+                except Exception:
+                    pass
+                return None, "复制文件失败"
+            role = {
+                "id": rid,
+                "name": name,
+                "file": rid + ".png",
+                "added": time.strftime("%Y-%m-%d"),
+            }
+            self._data["roles"].append(role)
+            err = self._save()
+            if err:
+                # 索引写失败：回滚复制，避免孤儿文件
+                try:
+                    os.remove(dst)
+                except Exception:
+                    pass
+                self._data["roles"].pop()
+                return None, err
+            return role, None
+        except Exception as e:
+            return None, "导入失败：%s" % e
+
+    def delete(self, role_id):
+        """删除角色（文件 + 索引项）；若为当前角色则重置为默认。返回 (bool, err)。"""
+        role_id = str(role_id or "")
+        r = self.get(role_id)
+        if r is None:
+            return False, "角色不存在"
+        try:
+            p = self._path(r)
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception as e:
+            return False, "删除文件失败：%s" % e
+        self._data["roles"] = [x for x in self._data["roles"] if x["id"] != role_id]
+        if self._data["active"] == role_id:
+            self._data["active"] = ""
+        err = self._save()
+        if err:
+            return False, err
+        return True, ""
+
+    def get(self, role_id):
+        """按 id 取角色 dict（副本）；不存在返回 None。"""
+        role_id = str(role_id or "")
+        for r in self._data["roles"]:
+            if r["id"] == role_id:
+                return dict(r)
+        return None
+
+
+# ---------------- 音频库 ----------------
+# 自定义音效组支持的 5 个事件槽位
+SLOT_KINDS = ("press", "release", "feed", "reply", "coin")
+_AUDIO_EXTS = (".wav", ".mp3")
+
+
+class AudioLibrary:
+    """自定义音频片段与音效组管理：导入 / 重命名 / 删除 / 槽位映射，索引 audio.json。"""
+
+    MAX_BYTES = 20 * 1024 * 1024  # 20MB 上限
+
+    def __init__(self, data_dir):
+        self._dir = os.path.join(data_dir, "audio")
+        self._index = os.path.join(data_dir, "audio.json")
+        self._data = {
+            "fragments": [],
+            "group": {"custom": {k: None for k in SLOT_KINDS}},
+        }
+        self._load()
+
+    # ---------- 内部 ----------
+    def _load(self):
+        """读索引并归一化：片段字段补齐、槽位三态（fid/""/None）校验。"""
+        data = _read_json(self._index)
+        frags = data.get("fragments") if isinstance(data.get("fragments"), list) else []
+        clean = []
+        for f in frags:
+            if not isinstance(f, dict):
+                continue
+            fid = str(f.get("id") or "")
+            if not fid:
+                continue
+            ext = str(f.get("ext") or "").lower()
+            if ext and not ext.startswith("."):
+                ext = "." + ext
+            if ext not in _AUDIO_EXTS:
+                continue  # 非法扩展名的残留项直接丢弃
+            clean.append({
+                "id": fid,
+                "name": str(f.get("name") or "") or "未命名",
+                "file": str(f.get("file") or ""),
+                "ext": ext,
+                "added": str(f.get("added") or ""),
+                "duration": f.get("duration") if isinstance(f.get("duration"), (int, float)) else None,
+            })
+        group = data.get("group") if isinstance(data.get("group"), dict) else {}
+        custom = group.get("custom") if isinstance(group.get("custom"), dict) else {}
+        slots = {}
+        for k in SLOT_KINDS:
+            v = custom.get(k)
+            if v is None or v == "" or isinstance(v, str):
+                slots[k] = v
+            else:
+                slots[k] = None
+        self._data = {"fragments": clean, "group": {"custom": slots}}
+
+    def _save(self):
+        """原子落盘；返回错误字符串或 None。"""
+        return _write_json(self._index, self._data)
+
+    def _get(self, fid):
+        fid = str(fid or "")
+        for f in self._data["fragments"]:
+            if f["id"] == fid:
+                return f
+        return None
+
+    # ---------- 对外 ----------
+    def fragments(self):
+        """全部片段 [{"id","name","file","ext","added","duration"}...]。"""
+        return [dict(f) for f in self._data["fragments"]]
+
+    def fragment_path(self, fid):
+        """片段绝对路径；片段不存在或文件缺失返回 None。"""
+        f = self._get(fid)
+        if f is None:
+            return None
+        p = f.get("file") or ""
+        if not os.path.isabs(p):
+            p = os.path.join(self._dir, p)
+        try:
+            return p if os.path.isfile(p) else None
+        except Exception:
+            return None
+
+    def import_file(self, src, name=None):
+        """导入音频：复制到 audio/<id>.<ext>。仅 .wav/.mp3、>20MB 拒绝，不校验音频内容。"""
+        try:
+            if not src or not isinstance(src, str) or not os.path.isfile(src):
+                return None, "文件不存在"
+            ext = os.path.splitext(src)[1].lower()
+            if ext not in _AUDIO_EXTS:
+                return None, "仅支持 .wav / .mp3 音频"
+            try:
+                if os.path.getsize(src) > self.MAX_BYTES:
+                    return None, "文件超过 20MB，无法导入"
+            except Exception:
+                return None, "无法读取文件大小"
+            if name is None or not str(name).strip():
+                name = os.path.splitext(os.path.basename(src))[0]
+            name = str(name).strip()[:40] or "未命名"
+            try:
+                os.makedirs(self._dir, exist_ok=True)
+            except Exception as e:
+                return None, "无法创建音频目录：%s" % e
+            fid = _new_id()
+            dst = os.path.join(self._dir, fid + ext)
+            try:
+                shutil.copyfile(src, dst)
+            except Exception:
+                try:
+                    if os.path.exists(dst):
+                        os.remove(dst)  # 半截文件清理，不留孤儿
+                except Exception:
+                    pass
+                return None, "复制文件失败"
+            duration = _wav_duration(dst) if ext == ".wav" else None
+            frag = {
+                "id": fid,
+                "name": name,
+                "file": fid + ext,
+                "ext": ext,
+                "added": time.strftime("%Y-%m-%d"),
+                "duration": duration,
+            }
+            self._data["fragments"].append(frag)
+            err = self._save()
+            if err:
+                try:
+                    os.remove(dst)
+                except Exception:
+                    pass
+                self._data["fragments"].pop()
+                return None, err
+            return frag, None
+        except Exception as e:
+            return None, "导入失败：%s" % e
+
+    def delete(self, fid):
+        """删除片段（文件 + 索引项）；被音效组槽位引用的槽位同步置 ""（静音）。"""
+        f = self._get(fid)
+        if f is None:
+            return False, "音频片段不存在"
+        try:
+            p = f.get("file") or ""
+            if not os.path.isabs(p):
+                p = os.path.join(self._dir, p)
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception as e:
+            return False, "删除文件失败：%s" % e
+        self._data["fragments"] = [x for x in self._data["fragments"] if x["id"] != fid]
+        for k, v in self._data["group"]["custom"].items():
+            if v == fid:
+                self._data["group"]["custom"][k] = ""
+        err = self._save()
+        if err:
+            return False, err
+        return True, ""
+
+    def rename(self, fid, new_name):
+        """重命名片段；空名字返回错误。返回 (bool, err)。"""
+        f = self._get(fid)
+        if f is None:
+            return False, "音频片段不存在"
+        name = str(new_name or "").strip()
+        if not name:
+            return False, "名字不能为空"
+        f["name"] = name[:40]
+        err = self._save()
+        if err:
+            return False, err
+        return True, ""
+
+    def group_slots(self):
+        """音效组槽位原始值：{"custom": {kind: fid|""|None}}（副本，改它不影响内部）。"""
+        return {"custom": dict(self._data["group"].get("custom", {}))}
+
+    def set_slot(self, kind, fid):
+        """设置槽位：fid=片段 id；""=静音；None=恢复默认。kind 非法返回 False。
+
+        事件播放走 winsound 仅支持 wav：非 wav 片段拒绝入槽位（可试听但不可绑定）。
+        """
+        if kind not in SLOT_KINDS:
+            return False
+        if fid is None:
+            val = None
+        elif fid == "":
+            val = ""
+        else:
+            fid = str(fid)
+            f = self._get(fid)
+            if f is None:
+                return False
+            if str(f.get("ext", "")).lower() != ".wav":
+                return False  # 槽位仅支持 wav
+            val = fid
+        self._data["group"]["custom"][kind] = val
+        return self._save() is None
+
+    def group_paths(self):
+        """解析槽位为可播放路径：{"press": path|""|None, ...}。
+
+        None = 未设置（走内置默认音效）；"" = 静音；path = 片段绝对路径
+        （文件缺失返回 None，等价于走默认）。
+        """
+        out = {}
+        slots = self._data["group"].get("custom", {})
+        for k in SLOT_KINDS:
+            v = slots.get(k)
+            if v is None or v == "":
+                out[k] = v
+            else:
+                out[k] = self.fragment_path(v)
+        return out
+
+
+# ---------------- 冒烟测试（无 GUI，可直接运行本文件） ----------------
+if __name__ == "__main__":
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="pet_resources_smoke_")
+
+    print("=== 冒烟 1：RoleLibrary 导入 / 切换 / 删除 ===")
+    rl = RoleLibrary(tmp)
+    assert rl.active_id() == "" and rl.active_path() is None and rl.list_roles() == []
+    fake = os.path.join(tmp, "测试角色.png")
+    with open(fake, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)  # 假 PNG（import 不校验内容）
+    role, err = rl.import_file(fake)
+    assert err is None and role is not None, err
+    assert rl.list_roles()[0]["id"] and rl.list_roles()[0]["name"] == "测试角色"
+    assert rl.get(role["id"]) is not None and rl.get("不存在") is None
+    assert rl.set_active(role["id"]) is True
+    p = rl.active_path()
+    assert p and os.path.isfile(p) and p.lower().endswith(".png")
+    assert rl.path_for(role["id"]) == p
+    assert rl.set_active("不存在的id") is False
+    assert rl.set_active("") is True and rl.active_path() is None
+    big = os.path.join(tmp, "big.png")
+    with open(big, "wb") as f:
+        f.write(b"\x89PNG" + b"\x00" * (10 * 1024 * 1024 + 1))
+    r2, e2 = rl.import_file(big)
+    assert r2 is None and e2
+    txt = os.path.join(tmp, "note.txt")
+    with open(txt, "w", encoding="utf-8") as f:
+        f.write("hi")
+    r3, e3 = rl.import_file(txt)
+    assert r3 is None and e3
+    assert rl.delete(role["id"]) == (True, "")
+    assert rl.get(role["id"]) is None and rl.list_roles() == []
+    assert rl.delete(role["id"]) == (False, "角色不存在")
+    # 删除 active 角色应重置为默认
+    role2, _ = rl.import_file(fake, "第二个")
+    rl.set_active(role2["id"])
+    rl.delete(role2["id"])
+    assert rl.active_id() == ""
+
+    print("=== 冒烟 2：AudioLibrary 导入 / 重命名 / 槽位 ===")
+    al = AudioLibrary(tmp)
+    assert al.fragments() == [] and al.group_slots()["custom"]["press"] is None
+    wav = os.path.join(tmp, "clip.wav")
+    with open(wav, "wb") as f:
+        f.write(b"\x00" * 60)  # 无效 wav 头：import 只查扩展名和大小，duration 探测失败为 None
+    frag, err = al.import_file(wav)
+    assert err is None and frag is not None, err
+    assert frag["ext"] == ".wav" and frag["duration"] is None
+    assert os.path.isfile(al.fragment_path(frag["id"]))
+    assert al.rename(frag["id"], "  新名字 ") == (True, "")
+    assert al.fragments()[0]["name"] == "新名字"
+    assert al.rename("不存在", "x") == (False, "音频片段不存在")
+    assert al.set_slot("press", frag["id"]) is True
+    assert al.set_slot("release", "") is True
+    assert al.set_slot("feed", None) is True
+    assert al.set_slot("bogus", frag["id"]) is False
+    assert al.set_slot("coin", "不存在的片段") is False
+    gp = al.group_paths()
+    assert gp["press"] and os.path.isfile(gp["press"])
+    assert gp["release"] == "" and gp["feed"] is None and gp["reply"] is None
+    assert al.delete(frag["id"]) == (True, "")
+    assert al.group_slots()["custom"]["press"] == ""  # 被引用的槽位同步置 ""
+    assert al.group_paths()["press"] == ""
+    assert al.delete(frag["id"]) == (False, "音频片段不存在")
+    mp3 = os.path.join(tmp, "t.mp3")
+    with open(mp3, "wb") as f:
+        f.write(b"ID3" + b"\x00" * 50)
+    f2, e2 = al.import_file(mp3, "歌")
+    assert e2 is None and f2["ext"] == ".mp3" and f2["duration"] is None
+    bigm = os.path.join(tmp, "big.mp3")
+    with open(bigm, "wb") as f:
+        f.write(b"\x00" * (20 * 1024 * 1024 + 1))
+    fb, eb = al.import_file(bigm)
+    assert fb is None and eb
+    r4, e4 = al.import_file(os.path.join(tmp, "不存在.wav"), None)  # 不存在 → 文件不存在
+    assert r4 is None and e4 == "文件不存在"
+
+    print("=== 冒烟 3：持久化重载 ===")
+    rl2 = RoleLibrary(tmp)
+    al2 = AudioLibrary(tmp)
+    assert rl2.active_id() == ""
+    assert [f["ext"] for f in al2.fragments()] == [".mp3"]
+    assert al2.group_slots()["custom"]["press"] == ""
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("RESOURCES SMOKE OK")

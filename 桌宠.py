@@ -14,13 +14,22 @@ import json
 import math
 import random
 import threading
+import time
+import base64
+import shutil
+import ctypes
+import re
+from ctypes import wintypes
+
+import requests
+import psutil
 
 from PySide6.QtCore import (
     Qt, QTimer, QPoint, QPointF, QRectF, QVariantAnimation, QEasingCurve, QObject, Signal,
 )
 from PySide6.QtGui import (
     QPixmap, QTransform, QFont, QColor, QPainter, QCursor, QPolygonF,
-    QFontMetrics, QPen, QPainterPath, QIcon,
+    QFontMetrics, QPen, QPainterPath, QIcon, QActionGroup,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMenu, QGraphicsView, QGraphicsScene,
@@ -28,21 +37,17 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
 )
 
-import requests
-import psutil
 import pet_anim
 import pet_fx
 import pet_mood
 import pet_audio
-import time
-import base64
-import shutil
-import ctypes
-from ctypes import wintypes
+import pet_resources
+import pet_book
+import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -114,7 +119,40 @@ DEFAULT_CONFIG = {
     "wander": False,
     "sound": True,
     "badge": False,
+    "role": "",          # 自定义角色 id（"" = 默认角色）
+    "sound_group": "default",  # "default" | "custom"（自定义音效组）
+    "bubble_style": {"bg": "#ffffff", "fg": "#203170", "border": "#203170", "font_size": 10, "radius": 16},
+    "lines_extra": {"sajiao": [], "greedy": [], "happy": [], "idle": []},
+    "budget": 0.0,       # 今日预算提醒（<=0 关闭）
+    "balance_alert": 0.0,  # 余额预警阈值（<=0 关闭）
 }
+
+# 气泡样式（配置驱动；apply_bubble_style 更新，Bubble.paintEvent 读取）
+BUBBLE_STYLE = dict(DEFAULT_CONFIG["bubble_style"])
+
+# 右键菜单美化：深色圆角主题（app 级 QSS，托盘菜单同主题）
+MENU_QSS = """
+QMenu {
+    background-color: rgba(26, 30, 48, 0.97);
+    color: #e8ecff;
+    border: 1px solid #3b4370;
+    border-radius: 10px;
+    padding: 6px;
+}
+QMenu::item {
+    padding: 7px 28px 7px 14px;
+    border-radius: 7px;
+}
+QMenu::item:selected { background-color: #39426e; }
+QMenu::item:disabled { color: #6b7399; }
+QMenu::separator { height: 1px; background: #333a5e; margin: 5px 12px; }
+QMenu::indicator { width: 14px; height: 14px; }
+QMenu::section {
+    color: #ffd65a;
+    padding: 6px 14px 2px 14px;
+    font-weight: bold;
+}
+"""
 
 
 def _to_bool(v):
@@ -130,20 +168,29 @@ _redact_key = None
 
 
 def set_redact_key(key):
-    """由 PetWindow 在 key 载入 / 修改 / 清除后同步，避免 _log_error 每次重读并解密 config。"""
+    """由 PetWindow 在 key 载入 / 修改 / 清除后同步，避免 _redact 每次重读并解密 config。"""
     global _redact_key
     _redact_key = str(key or "")
 
 
-def _log_error(msg):
+def _redact(msg):
+    """日志脱敏：API Key（缓存优先，未同步时兜底读一次配置）与 sk-/Bearer 形态。"""
     try:
-        import re
         key = _redact_key
         if key is None:
             key = load_config().get("api_key", "")  # 尚未同步时兜底读取一次
         if key:
             msg = msg.replace(key, "***APIKEY***")
-        msg = re.sub(r"(sk-[A-Za-z0-9_-]{6,})", "sk-***", msg)
+    except Exception:
+        pass
+    msg = re.sub(r"(sk-[A-Za-z0-9_-]{6,})", "sk-***", msg)
+    msg = re.sub(r"(Bearer\s+)[A-Za-z0-9._-]+", r"\1***", msg)
+    return msg
+
+
+def _log_error(msg):
+    try:
+        msg = _redact(msg)
         path = os.path.join(DATA_DIR, "error.log")
         try:
             if os.path.getsize(path) > 512 * 1024:  # 512KB 轮转，防无限累积
@@ -182,6 +229,46 @@ def load_config():
     cfg["city"] = str(cfg.get("city", "北京") or "北京")
     cfg["sound"] = _to_bool(cfg.get("sound", True))
     cfg["badge"] = _to_bool(cfg.get("badge", False))
+    # ---- v1.3 新增配置归一化 ----
+    cfg["role"] = str(cfg.get("role", "") or "")
+    cfg["sound_group"] = "custom" if cfg.get("sound_group") == "custom" else "default"
+    try:
+        bs = cfg.get("bubble_style")
+        if not isinstance(bs, dict):
+            bs = {}
+        bs = {
+            "bg": str(bs.get("bg", "") or "#ffffff"),
+            "fg": str(bs.get("fg", "") or "#203170"),
+            "border": str(bs.get("border", "") or "#203170"),
+            "font_size": int(bs.get("font_size", 10) or 10),
+            "radius": int(bs.get("radius", 16) or 16),
+        }
+        for k in ("bg", "fg", "border"):
+            if not QColor(bs[k]).isValid():
+                bs[k] = DEFAULT_CONFIG["bubble_style"][k]
+        bs["font_size"] = max(8, min(18, bs["font_size"]))
+        bs["radius"] = max(0, min(30, bs["radius"]))
+        cfg["bubble_style"] = bs
+    except Exception:
+        cfg["bubble_style"] = dict(DEFAULT_CONFIG["bubble_style"])
+    for k in ("budget", "balance_alert"):
+        try:
+            cfg[k] = round(max(0.0, float(cfg.get(k, 0.0) or 0.0)), 2)
+        except (TypeError, ValueError):
+            cfg[k] = 0.0
+    le = cfg.get("lines_extra")
+    norm_le = {}
+    if isinstance(le, dict):
+        for k in ("sajiao", "greedy", "happy", "idle"):
+            v = le.get(k)
+            if isinstance(v, list):
+                norm_le[k] = [str(x).strip()[:60] for x in v if str(x).strip()][:20]
+            else:
+                norm_le[k] = []
+    else:
+        for k in ("sajiao", "greedy", "happy", "idle"):
+            norm_le[k] = []
+    cfg["lines_extra"] = norm_le
     return cfg
 
 
@@ -392,29 +479,10 @@ class Signals(QObject):
 signals = Signals()
 
 
-# ---------------- 今日已用记账 ----------------
+# ---------------- 记账 ----------------
+# v1.3 起账本由 pet_book.Book 管理（ledger.json / ledger_archive.json）。
+# USAGE_PATH 仅为旧版 usage.json 的清理/迁移入口，不再写入。
 USAGE_PATH = os.path.join(DATA_DIR, "usage.json")
-
-
-def load_usage():
-    try:
-        with open(USAGE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {"date": "", "usage": 0.0, "last_balance": None}
-
-
-def save_usage(usage):
-    try:
-        tmp = USAGE_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(usage, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, USAGE_PATH)
-    except Exception as e:
-        _log_error("save_usage failed: %r" % (e,))
 
 
 # ---------------- 食物：图标 / 托盘 / 飞行 ----------------
@@ -595,7 +663,7 @@ class Badge(QWidget):
         self._line1 = line1
         self._line2 = line2
         fm = QFontMetrics(QFont("Microsoft YaHei", 9, QFont.Weight.Bold))
-        w = max(100, fm.horizontalAdvance(line1 if len(line1) >= len(line2) else line2) + 36)
+        w = max(100, max(fm.horizontalAdvance(line1), fm.horizontalAdvance(line2)) + 36)
         self.resize(w, 46)
         self.update()
 
@@ -635,7 +703,11 @@ class Bubble(QWidget):
 
     def show_text(self, text, anchor_global):
         self._text = text
-        fm = QFontMetrics(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+        try:
+            font_size = max(8, min(18, int(BUBBLE_STYLE.get("font_size", 10) or 10)))
+        except Exception:
+            font_size = 10
+        fm = QFontMetrics(QFont("Microsoft YaHei", font_size, QFont.Weight.Bold))
         r = fm.boundingRect(0, 0, 190, 400, Qt.TextFlag.TextWordWrap, text)
         w = max(88, min(236, r.width() + 60))
         h = max(52, r.height() + 46)
@@ -657,21 +729,39 @@ class Bubble(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
+        try:
+            border = QColor(BUBBLE_STYLE.get("border", "#203170"))
+            bg = QColor(BUBBLE_STYLE.get("bg", "#ffffff"))
+            fg = QColor(BUBBLE_STYLE.get("fg", "#203170"))
+            if not border.isValid():
+                border = QColor("#203170")
+            if not bg.isValid():
+                bg = QColor("#ffffff")
+            if not fg.isValid():
+                fg = QColor("#203170")
+            font_size = max(8, min(18, int(BUBBLE_STYLE.get("font_size", 10) or 10)))
+            radius = max(0, min(30, int(BUBBLE_STYLE.get("radius", 16) or 16)))
+        except Exception:
+            border = QColor("#203170")
+            bg = QColor("#ffffff")
+            fg = QColor("#203170")
+            font_size = 10
+            radius = 16
         body = QRectF(4, 4, w - 8, h - 26)
         cx = w / 2
         tail = QPolygonF([QPointF(cx - 12, h - 28), QPointF(cx + 12, h - 28), QPointF(cx, h - 3)])
         path = QPainterPath()
-        path.addEllipse(body)
+        path.addRoundedRect(body, radius, radius)
         path.addPolygon(tail)
-        p.setPen(QPen(QColor("#203170"), 3))
-        p.setBrush(QColor("#ffffff"))
+        p.setPen(QPen(border, 3))
+        p.setBrush(bg)
         p.drawPath(path)
-        p.setPen(QPen(QColor("#203170"), 2))
+        p.setPen(QPen(border, 2))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(QRectF(body.right() - 30, h - 22, 14, 10))
         p.drawEllipse(QRectF(body.right() - 13, h - 13, 7, 5))
-        p.setPen(QColor("#203170"))
-        p.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+        p.setPen(fg)
+        p.setFont(QFont("Microsoft YaHei", font_size, QFont.Weight.Bold))
         p.drawText(body.adjusted(14, 8, -14, -8), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self._text)
 
     def mousePressEvent(self, event):
@@ -695,6 +785,19 @@ class PetWindow(QWidget):
         set_redact_key(self.cfg.get("api_key", ""))
         if self.cfg.pop("_resave", False):
             save_config(self.cfg)
+        # ---- v1.3：角色库 / 音频库 / 记账账本 ----
+        self.role_lib = pet_resources.RoleLibrary(DATA_DIR)
+        self.audio_lib = pet_resources.AudioLibrary(DATA_DIR)
+        self.role_lib.set_active(self.cfg.get("role", ""))  # roles.json 与 config 同步
+        try:
+            self.book = pet_book.Book(DATA_DIR)
+        except Exception as e:
+            _log_error("book init failed: %r" % (e,))
+            self.book = None
+        self._usage = self.book.today_usage() if self.book is not None else 0.0
+        self._preview_player = None  # mp3 试听兜底播放器（惰性构建）
+        self.lines_pools = {}
+        self._refresh_lines()
         self.bubble = Bubble()
         self.badge = Badge()
         self.food_tray = FoodTray()
@@ -711,7 +814,6 @@ class PetWindow(QWidget):
         self._fetching_balance = False
         self._shown_balance = None
         self._balance_anim = None
-        self._usage = 0.0
         self._currency = "CNY"
         self._manual_pending = False
         self._pending_manual = False  # 在途自动刷新结束后需补发的手动查询
@@ -795,11 +897,12 @@ class PetWindow(QWidget):
             _log_error("fx frames petpet incomplete: %d/10" % len(self._fx_petpet))
         self._fx_money = []  # 86 帧较大：首次撒钱时才加载（约 6.7MB）
         self._fx_money_dir = os.path.join(assets_dir, "fx")
-        self.has_frames = bool(self._idle_frames)
-        if self._idle_frames:
+        # 自定义角色没有帧动画素材：退化为静态图（压扁/Q弹/翻转等程序变换不受影响）
+        self.has_frames = bool(self._idle_frames) and not self._custom_role
+        if self.has_frames:
             self.anim.add_set("idle", self._idle_frames)
-        if self._eat_frames:
-            self.anim.add_set("eat", self._eat_frames)
+            if self._eat_frames:
+                self.anim.add_set("eat", self._eat_frames)
         self.anim.frame_changed.connect(self._on_frame_changed)
         self.state_pix = {"normal": {}, "full": {}}
         for form in ("normal", "full"):
@@ -828,6 +931,7 @@ class PetWindow(QWidget):
 
         # ---- 阶段3：音频（参考项目 WAV + 合成回退）----
         pet_audio.init(os.path.join(resource_dir("assets"), "sounds"))
+        self._apply_sound_group()  # v1.3：自定义音效组
 
         self.scale = 1.0
         self.squash_x = 1.0
@@ -905,15 +1009,19 @@ class PetWindow(QWidget):
         self.tray = QSystemTrayIcon(self)
         self.tray.setIcon(QIcon(self.sprites["normal"]["front"]))
         tray_menu = QMenu()
-        show_act = tray_menu.addAction("显示桌宠")
+        show_act = tray_menu.addAction("🐟 显示桌宠")
         show_act.triggered.connect(self._show_pet)
         tray_menu.addSeparator()
-        quit_act = tray_menu.addAction("退出")
+        quit_act = tray_menu.addAction("⏹ 退出")
         quit_act.triggered.connect(self._quit)
         self.tray.setContextMenu(tray_menu)
         self.tray.setToolTip("大肥鱼桌宠 · 喜欢的，就咬住不放~")
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
+
+        # v1.3：有 Key 且开了 AI 对话（未开挂件）时，启动后补一次余额观测刷新账本基线
+        if self.cfg.get("api_key") and self.cfg.get("ai_enabled") and not self.cfg.get("badge"):
+            QTimer.singleShot(2500, lambda: self._refresh_balance(manual=False))
 
     # ---------- 角色加载 ----------
     def _load_img(self, names):
@@ -943,14 +1051,66 @@ class PetWindow(QWidget):
         return pix
 
     def _build_sprites(self):
-        normal_side = self._load_img(["character.png", "assets/character.png"]) or self._fallback_pix()
-        normal_front = self._load_img(["character_front.png", "assets/character_front.png"]) or normal_side
-        full_side = self._load_img(["character_full.png", "assets/character_full.png"]) or normal_side
-        full_front = self._load_img(["character_full_front.png", "assets/character_full_front.png"]) or full_side
+        role_pix = self._role_pix()
+        if role_pix is not None:
+            self._custom_role = True
+            normal_side = normal_front = full_side = full_front = role_pix
+        else:
+            self._custom_role = False
+            normal_side = self._load_img(["character.png", "assets/character.png"]) or self._fallback_pix()
+            normal_front = self._load_img(["character_front.png", "assets/character_front.png"]) or normal_side
+            full_side = self._load_img(["character_full.png", "assets/character_full.png"]) or normal_side
+            full_front = self._load_img(["character_full_front.png", "assets/character_full_front.png"]) or full_side
         self.sprites = {
             "normal": {"side": normal_side, "front": normal_front},
             "full": {"side": full_side, "front": full_front},
         }
+
+    def _role_pix(self):
+        """自定义角色图：config 激活且文件存在则返回 QPixmap，否则 None（回退默认角色）。"""
+        rid = self.cfg.get("role", "")
+        if not rid:
+            return None
+        try:
+            if self.role_lib.active_id() != rid:
+                return None
+            path = self.role_lib.active_path()
+            if not path or not os.path.isfile(path):
+                return None
+            pix = QPixmap(path)
+            return pix if not pix.isNull() else None
+        except Exception:
+            return None
+
+    def apply_role(self, role_id):
+        """切换角色（""=默认角色）：持久化并立即重载贴图，无需重启。"""
+        rid = str(role_id or "")
+        self.cfg["role"] = rid
+        save_config(self.cfg)
+        self.role_lib.set_active(rid)
+        self._reload_sprites()
+
+    def _reload_sprites(self):
+        """重建角色贴图 / 窗口尺寸 / 动画能力（角色切换与恢复默认共用）。"""
+        self._build_sprites()
+        self.base_w = self.sprites["normal"]["side"].width()
+        self.base_h = self.sprites["normal"]["side"].height()
+        self.has_frames = bool(self._idle_frames) and not self._custom_role
+        self.anim.add_set("idle", self._idle_frames if self.has_frames else [])
+        self.anim.add_set("eat", self._eat_frames if self.has_frames else [])
+        if self.busy and self.anim_mode == "eat":
+            self.busy = False  # S1：吃帧被角色切换打断，_eat_done 不会再回调，显式释放
+        self.anim.stop()
+        self.anim_mode = ""  # 强制 _play_idle 按新角色重绘当前形态
+        self._using_front = False
+        self.set_scale(self.scale)  # 按新角色尺寸重算窗口
+        self._play_idle()
+        try:
+            self.tray.setIcon(QIcon(self.sprites["normal"]["front"]))
+        except Exception:
+            pass
+        if self.emote_item.isVisible() and getattr(self, "_last_emote_kind", None):
+            self._show_emote(self._last_emote_kind)  # 头顶表情随新窗口尺寸重排
 
     # ---------- 阶段1：帧动画与状态 ----------
     def _on_frame_changed(self, _idx):
@@ -997,6 +1157,8 @@ class PetWindow(QWidget):
     FULL_STATE_ALIAS = {"hiss": "angry", "drool": "laugh", "surprised": "puzzled"}
 
     def _state_pix(self, state):
+        if self._custom_role:
+            return None  # 自定义角色无表情图：保持当前贴图，避免整只替换成内置鱼
         pix = self.state_pix.get(self.form, {}).get(state)
         if pix is None and self.form == "full":
             alias = self.FULL_STATE_ALIAS.get(state)
@@ -1007,6 +1169,8 @@ class PetWindow(QWidget):
         return pix
 
     def _show_state(self, state, duration_ms=STATE_DURATION_MS):
+        if self._custom_role:
+            return  # 自定义角色：情绪只走气泡/头顶表情，不换贴图（M3）
         pix = self._state_pix(state)
         if pix is None:
             _log_error("state image missing: %s" % state)
@@ -1215,6 +1379,7 @@ class PetWindow(QWidget):
         y = max(0, pad_top - pix.height() - 4)
         self.emote_item.setPos(x, y)
         self.emote_item.show()
+        self._last_emote_kind = kind  # 角色热切换时据此重排表情
         anim = QVariantAnimation(self)
         anim.setDuration(1500)
         anim.setStartValue(0.0)
@@ -1293,7 +1458,8 @@ class PetWindow(QWidget):
         self.bubble.show_text(text, gp)
 
     def _cycle_line(self):
-        pool = LINES_SAJIAO + LINES_GREEDY + LINES_SCARED + LINES_HAPPY + LINES_IDLE
+        pool = (self.lines_pools["sajiao"] + self.lines_pools["greedy"] + LINES_SCARED
+                + self.lines_pools["happy"] + self.lines_pools["idle"] + LINES_PETTING)
         self.show_bubble(random.choice(pool))
 
     # ---------- 余额挂件 ----------
@@ -1595,10 +1761,10 @@ class PetWindow(QWidget):
         self._digest_timer.setSingleShot(True)
         self._digest_timer.timeout.connect(self._digest)
         self._digest_timer.start(12000)
-        if self._eat_frames and not was_full:
+        if self.has_frames and not was_full:
             # 常态 → 吃饱：错峰 120ms 启动吃帧；busy 在 _eat_done 释放
             QTimer.singleShot(120, self, self._play_eat)  # 带 context：窗口销毁自动取消
-        elif self._eat_frames:
+        elif self.has_frames:
             # 已在吃饱形态：不重播吃帧（吃帧是常态形象，会顶掉吃饱形象），
             # 以吃饱版开心大笑表达「又吃到了」，并立即释放 busy
             def _full_refeed():
@@ -1798,6 +1964,9 @@ class PetWindow(QWidget):
         self._manual_pending = False
         with self._history_lock:
             self._chat_history.clear()  # 聊天记忆一并清空（与 _ai_worker 追加互斥）
+        if self.book is not None:
+            self.book.reset_balance_baseline()  # 只清余额基准，手动记账保留
+        self._usage = self.book.today_usage() if self.book is not None else 0.0
         for p in (USAGE_PATH, os.path.join(DATA_DIR, "error.log"),
                   CONFIG_PATH + ".tmp", USAGE_PATH + ".tmp"):
             try:
@@ -1805,7 +1974,7 @@ class PetWindow(QWidget):
                     os.remove(p)
             except Exception:
                 pass
-        self.show_bubble("API Key 已清空，记账和日志也都擦干净啦~")
+        self.show_bubble("API Key 已清空，余额基准和日志擦干净啦（手动记账保留）~")
 
     PRAISE_KEYWORDS = ("夸", "棒", "可爱", "漂亮", "好看", "喜欢", "厉害", "乖", "萌", "聪明")
 
@@ -1905,16 +2074,21 @@ class PetWindow(QWidget):
         self._refresh_balance(manual=True)
 
     def _update_usage_ledger(self, total):
-        today = time.strftime("%Y-%m-%d")
-        u = load_usage()
-        if u.get("date") != today:
-            u = {"date": today, "usage": 0.0, "last_balance": None}
-        last = u.get("last_balance")
-        if last is not None and total < last:
-            u["usage"] = float(u.get("usage", 0.0) or 0.0) + (last - total)
-        u["last_balance"] = total
-        save_usage(u)
-        return float(u.get("usage", 0.0) or 0.0)
+        """余额差记账（v1.3 起由 pet_book.Book 承担）：跨天归档 + 今日累计 + 预算/余额预警。"""
+        if self.book is None:
+            return 0.0
+        try:
+            self.book.observe_balance(total)
+            usage = self.book.today_usage()
+            alerts = self.book.check_alerts(total, self.cfg.get("budget", 0.0), self.cfg.get("balance_alert", 0.0))
+            for msg in alerts:
+                self.show_bubble(msg)
+                if self.cfg.get("sound", True):
+                    play_sound("reply")
+            return usage
+        except Exception as e:
+            _log_error("update_usage_ledger failed: %r" % (e,))
+            return 0.0
 
     def _balance_worker(self, key):
         try:
@@ -1949,7 +2123,7 @@ class PetWindow(QWidget):
         r = random.random()
         if r < 0.35:
             self._show_emote("zzz")
-            self.show_bubble(random.choice(LINES_IDLE + LINES_GREEDY))
+            self.show_bubble(random.choice(self.lines_pools["idle"] + self.lines_pools["greedy"]))
         elif r < 0.65:
             self._do_jump()
 
@@ -2058,87 +2232,133 @@ class PetWindow(QWidget):
             self._save_scale_timer.timeout.connect(lambda: save_config(self.cfg))
         self._save_scale_timer.start(400)
 
-    # ---------- 右键菜单 ----------
+    # ---------- 右键菜单（v1.3 美化：分区标题 + emoji 图标 + 信息行） ----------
     def _open_menu(self, gp):
         menu = QMenu(self)
 
-        size_menu = menu.addMenu("调整大小")
+        # 顶部信息行：余额 / 今日已用（仅展示，不可点）
+        if self._shown_balance is not None:
+            info_text = "💰 余额 %s %.2f · 今日已用 %.2f" % (self._currency, self._shown_balance, self._usage or 0.0)
+        else:
+            info_text = "📒 今日已用 %.2f" % (self._usage or 0.0)
+        menu.addAction(info_text).setEnabled(False)
+
+        menu.addSection("外观")
+        size_menu = menu.addMenu("🔍 调整大小")
         for pct in (50, 75, 100, 125, 150, 200):
             act = size_menu.addAction("%d%%" % pct)
             act.triggered.connect(lambda checked=False, p=pct: self._set_scale_pct(p))
-        menu.addSeparator()
-
-        self._top_act = menu.addAction("窗口置顶")
+        self._top_act = menu.addAction("📌 窗口置顶")
         self._top_act.setCheckable(True)
         self._top_act.setChecked(self.cfg.get("always_on_top", True))
         self._top_act.toggled.connect(self._set_always_on_top)
-
-        sound_act = menu.addAction("音效")
+        sound_act = menu.addAction("🔊 音效")
         sound_act.setCheckable(True)
         sound_act.setChecked(self.cfg.get("sound", True))
         sound_act.toggled.connect(self._set_sound)
-
-        self._follow_act = menu.addAction("跟随鼠标")
+        self._follow_act = menu.addAction("🖱️ 跟随鼠标")
         self._follow_act.setCheckable(True)
         self._follow_act.setChecked(self.cfg.get("follow_mouse", False))
         self._follow_act.toggled.connect(self._set_follow_mouse)
-
-        self._wander_act = menu.addAction("散步")
+        self._wander_act = menu.addAction("🚶 散步")
         self._wander_act.setCheckable(True)
         self._wander_act.setChecked(self.cfg.get("wander", False))
         self._wander_act.toggled.connect(self._set_wander)
-        menu.addSeparator()
+        bubble_style_act = menu.addAction("🎨 气泡样式…")
+        bubble_style_act.triggered.connect(self._open_bubble_style)
 
-        food_menu = menu.addMenu("喂食")
+        menu.addSection("角色与资源")
+        role_menu = menu.addMenu("🐟 角色")
+        role_group = QActionGroup(menu)
+        role_group.setExclusive(True)  # 单选互斥：勾选状态不残留
+        role_def = role_menu.addAction("默认角色")
+        role_def.setCheckable(True)
+        role_def.setChecked(not self.cfg.get("role"))
+        role_def.triggered.connect(lambda checked=False: self.apply_role(""))
+        role_group.addAction(role_def)
+        for r in self.role_lib.list_roles():
+            act = role_menu.addAction("🖼️ " + str(r.get("name", r.get("id", ""))))
+            act.setCheckable(True)
+            act.setChecked(self.cfg.get("role") == r.get("id"))
+            act.triggered.connect(lambda checked=False, rid=r.get("id"): self.apply_role(rid))
+            role_group.addAction(act)
+        role_menu.addSeparator()
+        role_import_act = role_menu.addAction("导入角色…")
+        role_import_act.triggered.connect(lambda: self._open_resource_manager(0))
+        lines_act = menu.addAction("💬 自定义台词…")
+        lines_act.triggered.connect(self._open_lines)
+        snd_menu = menu.addMenu("🎵 音效设置")
+        grp_group = QActionGroup(menu)
+        grp_group.setExclusive(True)  # 单选互斥：勾选状态不残留
+        grp_def = snd_menu.addAction("默认音效")
+        grp_def.setCheckable(True)
+        grp_def.setChecked(self.cfg.get("sound_group") != "custom")
+        grp_def.triggered.connect(lambda checked=False: self._set_sound_group("default"))
+        grp_group.addAction(grp_def)
+        grp_cus = snd_menu.addAction("自定义音效组")
+        grp_cus.setCheckable(True)
+        grp_cus.setChecked(self.cfg.get("sound_group") == "custom")
+        grp_cus.triggered.connect(lambda checked=False: self._set_sound_group("custom"))
+        grp_group.addAction(grp_cus)
+        snd_menu.addSeparator()
+        snd_manage_act = snd_menu.addAction("管理音频片段…")
+        snd_manage_act.triggered.connect(lambda: self._open_resource_manager(1))
+        res_act = menu.addAction("📦 资源管理…")
+        res_act.triggered.connect(lambda: self._open_resource_manager(0))
+
+        menu.addSection("互动")
+        food_menu = menu.addMenu("🍖 喂食")
         for food in ("小鱼干", "蛋糕", "钻石"):
             act = food_menu.addAction(food)
             act.triggered.connect(lambda checked=False, f=food: self.feed(f))
-        tray_act = menu.addAction("食物托盘")
+        tray_act = menu.addAction("🍱 食物托盘")
         tray_act.setCheckable(True)
         tray_act.setChecked(self.food_tray.isVisible())
         tray_act.toggled.connect(self._set_food_tray)
-        form_menu = menu.addMenu("形态")
+        form_menu = menu.addMenu("🐡 形态")
         form_normal = form_menu.addAction("常态")
         form_normal.triggered.connect(lambda checked=False: self._set_form("normal"))
         form_full = form_menu.addAction("吃饱")
         form_full.triggered.connect(lambda checked=False: self._set_form("full"))
-        menu.addSeparator()
 
-        self._ai_act = menu.addAction("AI对话")
+        menu.addSection("AI 与记账")
+        self._ai_act = menu.addAction("🤖 AI对话")
         self._ai_act.setCheckable(True)
         self._ai_act.setChecked(self.cfg.get("ai_enabled", False))
         self._ai_act.toggled.connect(self._set_ai_enabled)
-
-        talk_act = menu.addAction("和它说话")
+        talk_act = menu.addAction("💭 和它说话")
         talk_act.triggered.connect(self._ask_talk)
-
-        praise_act = menu.addAction("夸夸她")
+        praise_act = menu.addAction("❤️ 夸夸她")
         praise_act.triggered.connect(lambda checked=False: self.mood.blush())
-
-        key_act = menu.addAction("设置DeepSeek API Key")
+        key_act = menu.addAction("🔑 设置DeepSeek API Key")
         key_act.triggered.connect(self._set_api_key)
-
-        clear_key_act = menu.addAction("清除DeepSeek API Key")
+        clear_key_act = menu.addAction("🧹 清除DeepSeek API Key")
         clear_key_act.triggered.connect(self._clear_api_key)
-
-        badge_act = menu.addAction("余额挂件")
+        badge_act = menu.addAction("📊 余额挂件")
         badge_act.setCheckable(True)
         badge_act.setChecked(self.cfg.get("badge", False))
         badge_act.toggled.connect(self._set_badge)
-
-        balance_act = menu.addAction("查询余额")
+        balance_act = menu.addAction("💰 查询余额")
         balance_act.triggered.connect(self._fetch_balance)
-        menu.addSeparator()
+        ledger_act = menu.addAction("📒 账本…")
+        ledger_act.triggered.connect(self._open_ledger)
+        manual_act = menu.addAction("✏️ 记一笔…")
+        manual_act.triggered.connect(self._add_manual_record)
+        budget_act = menu.addAction("💸 今日预算…")
+        budget_act.triggered.connect(self._set_budget)
+        bal_alert_act = menu.addAction("🚨 余额预警…")
+        bal_alert_act.triggered.connect(self._set_balance_alert)
 
-        weather_act = menu.addAction("今日天气")
+        menu.addSection("小工具")
+        weather_act = menu.addAction("☀️ 今日天气")
         weather_act.triggered.connect(self._fetch_weather)
-        cpu_act = menu.addAction("系统状态")
+        cpu_act = menu.addAction("🖥️ 系统状态")
         cpu_act.triggered.connect(self._show_system_status)
-        menu.addSeparator()
 
-        about_act = menu.addAction("关于")
+        menu.addSection("其他")
+        about_act = menu.addAction("ℹ️ 关于")
         about_act.triggered.connect(self._about)
-        quit_act = menu.addAction("退出")
+        quit_act = menu.addAction("⏹ 退出")
         quit_act.triggered.connect(self._quit)
 
         menu.exec(gp)
@@ -2160,6 +2380,179 @@ class PetWindow(QWidget):
         self.cfg["sound"] = bool(on)
         save_config(self.cfg)
 
+    # ---------- v1.3：音效组 / 试听 / 气泡样式 / 台词 / 记账 / 资源对话框 ----------
+    def _set_sound_group(self, name):
+        self.cfg["sound_group"] = "custom" if name == "custom" else "default"
+        save_config(self.cfg)
+        self._apply_sound_group()
+
+    def apply_sound_group(self, group=None, as_custom=True):
+        """面板改槽位 / 菜单切组后调用：group=已解析槽位 dict 或 None（用库内当前组）；
+        as_custom=True 时自动把配置切到自定义组并落盘，保证改完立刻生效。"""
+        try:
+            if as_custom:
+                self.cfg["sound_group"] = "custom"
+                save_config(self.cfg)
+            if self.cfg.get("sound_group") == "custom":
+                pet_audio.set_custom_group(self.audio_lib.group_paths() if group is None else group)
+            else:
+                pet_audio.clear_custom_group()
+        except Exception as e:
+            _log_error("apply_sound_group failed: %r" % (e,))
+
+    def _apply_sound_group(self):
+        """启动 / 菜单切组时按配置把音效组同步进 pet_audio（不改变配置）。"""
+        self.apply_sound_group(None, as_custom=False)
+
+    def preview_audio(self, path):
+        """试听：wav 走 winsound 主链路；mp3 等降级 QMediaPlayer。返回是否发出。"""
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            if pet_audio.preview_file(path):
+                return True
+            from PySide6.QtCore import QUrl
+            from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+            if self._preview_player is None:
+                self._preview_player = QMediaPlayer(self)
+                self._preview_out = QAudioOutput(self)
+                self._preview_player.setAudioOutput(self._preview_out)
+            self._preview_player.setSource(QUrl.fromLocalFile(path))
+            self._preview_player.play()
+            return True
+        except Exception:
+            return False
+
+    def apply_bubble_style(self, style):
+        if not isinstance(style, dict):
+            return
+        st = dict(BUBBLE_STYLE)
+        for k in ("bg", "fg", "border"):
+            v = style.get(k)
+            if isinstance(v, str) and QColor(v).isValid():
+                st[k] = v
+        for k in ("font_size", "radius"):
+            try:
+                v = int(style.get(k))
+                st[k] = max(8 if k == "font_size" else 0, min(18 if k == "font_size" else 30, v))
+            except (TypeError, ValueError):
+                pass
+        self.cfg["bubble_style"] = st
+        save_config(self.cfg)
+        BUBBLE_STYLE.update(st)
+        self.bubble.update()
+
+    def save_lines(self, pool, lines):
+        """保存自定义台词：pool ∈ sajiao/greedy/happy/idle。"""
+        pool = pool if pool in ("sajiao", "greedy", "happy", "idle") else "idle"
+        clean = []
+        for x in (lines or []):
+            s = str(x).strip()
+            if s:
+                clean.append(s[:60])
+        clean = clean[:20]
+        le = dict(self.cfg.get("lines_extra") or {})
+        le[pool] = clean
+        self.cfg["lines_extra"] = le
+        save_config(self.cfg)
+        self._refresh_lines()
+        self.show_bubble("台词库更新啦~")
+
+    def _refresh_lines(self):
+        """内置台词 + 用户自定义台词合并（戳气泡随机抽取用）。"""
+        base = {"sajiao": LINES_SAJIAO, "greedy": LINES_GREEDY, "happy": LINES_HAPPY, "idle": LINES_IDLE}
+        self.lines_pools = {k: list(v) for k, v in base.items()}
+        le = self.cfg.get("lines_extra") or {}
+        if isinstance(le, dict):
+            for k, v in le.items():
+                if k in self.lines_pools and isinstance(v, list):
+                    self.lines_pools[k] = self.lines_pools[k] + [x for x in v if x]
+
+    def on_ledger_changed(self):
+        """账本变化（记一笔 / 余额差）后刷新挂件今日已用。"""
+        if self.book is not None:
+            self._usage = self.book.today_usage()
+            self._update_badge()
+
+    def _open_resource_manager(self, tab=0):
+        try:
+            dlg = pet_dialogs.ResourceManagerDialog(self, tab)
+            pet_dialogs.modal(dlg)
+        except Exception as e:
+            _log_error("resource_manager failed: %r" % (e,))
+            self.show_bubble("资源管理窗口打不开……")
+
+    def _open_ledger(self):
+        try:
+            dlg = pet_dialogs.LedgerDialog(self)
+            pet_dialogs.modal(dlg)
+        except Exception as e:
+            _log_error("ledger dialog failed: %r" % (e,))
+
+    def _open_bubble_style(self):
+        try:
+            dlg = pet_dialogs.BubbleStyleDialog(self)
+            pet_dialogs.modal(dlg)
+        except Exception as e:
+            _log_error("bubble_style dialog failed: %r" % (e,))
+
+    def _open_lines(self):
+        try:
+            dlg = pet_dialogs.LinesDialog(self)
+            pet_dialogs.modal(dlg)
+        except Exception as e:
+            _log_error("lines dialog failed: %r" % (e,))
+
+    def _add_manual_record(self):
+        if self.book is None:
+            return
+        try:
+            dlg = pet_dialogs.AmountNoteDialog(self)
+            pet_dialogs.modal(dlg)
+            if dlg.result() == QDialog.DialogCode.Accepted:
+                amount, note = dlg.values()
+                if amount and amount > 0:
+                    self.book.add_manual(amount, note)
+                    self.on_ledger_changed()
+                    self.show_bubble("记好啦：%.2f 元" % amount)
+        except Exception as e:
+            _log_error("add_manual_record failed: %r" % (e,))
+
+    def _ask_amount(self, title, label, cur):
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setLabelText(label)
+        dlg.setInputMode(QInputDialog.InputMode.DoubleInput)
+        dlg.setDoubleRange(0.0, 99999.0)
+        dlg.setDoubleDecimals(2)
+        dlg.setDoubleValue(cur)
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.setFocus()
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return round(max(0.0, dlg.doubleValue()), 2)
+        return None
+
+    def _set_budget(self):
+        cur = self.cfg.get("budget", 0.0) or 0.0
+        val = self._ask_amount("今日预算", "今日已用超过多少元时提醒？\n（0 = 关闭提醒）", cur)
+        if val is None:
+            return
+        self.cfg["budget"] = val
+        save_config(self.cfg)
+        self.show_bubble("预算 %.2f 元%s" % (val, "" if val > 0 else "（提醒已关闭）"))
+
+    def _set_balance_alert(self):
+        cur = self.cfg.get("balance_alert", 0.0) or 0.0
+        val = self._ask_amount("余额预警", "余额低于多少元时提醒？\n（0 = 关闭提醒）", cur)
+        if val is None:
+            return
+        self.cfg["balance_alert"] = val
+        save_config(self.cfg)
+        self.show_bubble("余额预警 %.2f 元%s" % (val, "" if val > 0 else "（提醒已关闭）"))
+
     def _apply_flags(self):
         flags = (
             Qt.WindowType.FramelessWindowHint
@@ -2177,6 +2570,10 @@ class PetWindow(QWidget):
         box.setWindowTitle("关于")
         box.setText("%s v%s\nPySide6 桌宠 · MIT License\n喜欢的，就咬住不放~" % (APP_NAME, VERSION))
         box.setWindowFlags(box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        box.show()
+        box.raise_()
+        box.activateWindow()
+        box.setFocus()
         box.exec()
 
     def _quit(self):
@@ -2209,7 +2606,16 @@ class PetWindow(QWidget):
                         a.deleteLater()
                     except RuntimeError:
                         pass
-            for p in (CONFIG_PATH + ".tmp", USAGE_PATH + ".tmp"):
+            try:
+                if self._preview_player is not None:
+                    self._preview_player.stop()
+            except Exception:
+                pass
+            for p in (CONFIG_PATH + ".tmp", USAGE_PATH + ".tmp",
+                      os.path.join(DATA_DIR, "ledger.json.tmp"),
+                      os.path.join(DATA_DIR, "ledger_archive.json.tmp"),
+                      os.path.join(DATA_DIR, "roles.json.tmp"),
+                      os.path.join(DATA_DIR, "audio.json.tmp")):
                 try:
                     if os.path.exists(p):
                         os.remove(p)
@@ -2222,14 +2628,9 @@ class PetWindow(QWidget):
 
 def _excepthook(exc_type, exc_value, tb):
     import traceback
-    import re
     try:
         msg = "".join(traceback.format_exception(exc_type, exc_value, tb))
-        key = load_config().get("api_key", "")
-        if key:
-            msg = msg.replace(key, "***APIKEY***")
-        msg = re.sub(r"(sk-[A-Za-z0-9_-]{6,})", "sk-***", msg)
-        msg = re.sub(r"(Bearer\s+)[A-Za-z0-9._-]+", r"\1***", msg)
+        msg = _redact(msg)
         with open(os.path.join(DATA_DIR, "error.log"), "a", encoding="utf-8") as f:
             f.write(msg)
     except Exception:
@@ -2352,6 +2753,7 @@ def main():
     )
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setStyleSheet(MENU_QSS)  # v1.3：右键菜单美化（托盘菜单同主题）
     app.setQuitOnLastWindowClosed(False)
     _cleanup_stale_mei()
     pet = PetWindow()

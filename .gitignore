@@ -7,6 +7,17 @@ memory.log
 error.log
 error.log.old
 .write_probe
+# v1.3 记账账本 / 角色 / 音频库（运行时数据）
+ledger.json
+ledger.json.tmp
+ledger_archive.json
+ledger_archive.json.tmp
+roles/
+roles.json
+roles.json.tmp
+audio/
+audio.json
+audio.json.tmp
 
 # Python
 __pycache__/

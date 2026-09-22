@@ -108,8 +108,8 @@ class Mood(QObject):
         self._food_timer.timeout.connect(self._withhold)
 
         # ---- 调皮事件（选型 A：外部周期定时器驱动 tick()）----
-        # 首次 tick() 立即触发一次（作为首个随机间隔的起点），
-        # 之后每次触发后重新随机 45~90 秒的下一次间隔。
+        # 主程序启动时先 prime_mischief() 把首次触发推迟到随机 45~90 秒后；
+        # 之后每次 tick() 到点发射，再重新随机 45~90 秒的下一次间隔。
         self._next_mischief = 0.0
 
     def prime_mischief(self):
