@@ -25,7 +25,7 @@ Transparent frameless window, always-on-top, draggable, feedable, chatty — per
 - 🐳 **v1.3 customization & bookkeeping (inspired by the dsh-whale-widget plugin)**:
   - 🖼️ **Character import**: right-click → "🐟 角色" to import png/jpg/bmp/webp with auto background-removal / trim / scale; **choose single-form (one image) or dual-form (normal + full images)**; switch/delete/restore anytime
   - 🎞️ **Animated characters (v1.3.2)**: pick multiple images as a frame sequence, or auto-extract frames from a **video / GIF** (video: 3~20 sampled frames, GIF: 3~24); every frame gets the same auto-processing; idle loops the animation, feeding switches to the full form
-  - Custom characters keep squish/edge/follow effects; emotions show via bubble & head emote
+  - Custom characters get **procedural expression art** (blush/anger/sleep marks composited onto your image, v1.3.3) plus bubble & head emote; squish/edge/follow effects kept
   - 🔊 **Sound import + custom sound groups**: import wav/mp3 clips with preview; each of the 5 events (poke/release/feed/AI reply/coin) can use any clip or stay silent
   - 📦 **Resource manager**: one window for characters and audio clips (preview/audition/set-active/delete)
   - 📒 **Bookkeeping**: balance-diff auto-ledger (daily archive) + manual entries; ledger window with today / 7 days / all, search and CSV export; daily budget & balance alerts (once per day)
@@ -53,6 +53,12 @@ python 桌宠.py
 - Poke 3 times in a row for the full emotion chain; praise her to make her blush
 - Full form digests back to normal after ~12 seconds
 
+## 🛠️ Platform & data notes
+
+- **Windows only** (winsound audio, DPAPI key encryption and tray icon are Windows-specific; no macOS/Linux build yet)
+- Weather uses the free [open-meteo](https://open-meteo.com/) API, default city Beijing; right-click → "📍 天气城市…" to change and save
+- Runtime data lives next to the app (falls back to %APPDATA%\大肥鱼桌宠 when read-only)
+
 ## 🧠 AI Chat & Bookkeeping (optional)
 
 1. Right-click → "设置DeepSeek API Key" and paste your key (sk-...)
@@ -69,7 +75,7 @@ python 桌宠.py
   - **Single form**: pick one image; normal/full forms share it
   - **Dual form**: also pick a "full" image; feeding switches between the two (you choose the mode)
   - **Animated**: pick multiple images as an ordered frame sequence, or auto-extract frames from a video / GIF (video 3~20, GIF 3~24 frames)
-  - Squish/edge/follow effects kept; emotions via bubble & emote
+  - Emotions = procedural expression art + bubble + head emote; squish/edge/follow effects kept
 - **Sounds**: right-click → "🎵 音效设置" → "管理音频片段…" to import wav/mp3 and audition; assign a clip (or silence) per event in the custom group
 - **Bubble**: right-click → "🎨 气泡样式…" to tweak background/text/border colors, font size and corner radius
 - **Lines**: right-click → "💬 自定义台词…" to append your own lines to four pools

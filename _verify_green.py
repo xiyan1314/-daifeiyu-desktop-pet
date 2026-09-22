@@ -42,7 +42,7 @@ main.DATA_DIR = _tmp
 main.CONFIG_PATH = os.path.join(_tmp, "config.json")
 main.USAGE_PATH = os.path.join(_tmp, "usage.json")
 
-check("green version", main.VERSION == "1.3.2", main.VERSION)
+check("green version", main.VERSION == "1.3.3", main.VERSION)
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -134,6 +134,8 @@ if os.path.isfile(_vid):
     check("video extract in green", _raws is not None and len(_raws) >= 2,
           "n=%s err=%r" % (len(_raws) if _raws else 0, _errv))
     shutil.rmtree(_rd, ignore_errors=True)
+else:
+    check("video extract in green", False, "missing _verify_assets/sample.mp4")
 
 pet._quit()
 shutil.rmtree(_tmp, ignore_errors=True)

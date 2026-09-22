@@ -2,7 +2,7 @@
 """v1.3 无头冒烟验证（QT_QPA_PLATFORM=offscreen，无人工交互）。
 
 覆盖：角色导入/切换、音效组、记账账本、气泡样式、自定义台词、
-新菜单构建、5 个新对话框、托盘/退出路径。运行时数据全部落到临时目录，
+新菜单构建、6 个对话框、托盘/退出路径。运行时数据全部落到临时目录，
 不污染真实 DATA_DIR；退出时清理。用法：python _verify_v13.py
 """
 import os
@@ -147,6 +147,18 @@ def main_flow():
         pet.apply_role(dual["id"])
         check("dual sprites differ",
               pet.sprites["full"]["side"].cacheKey() != pet.sprites["normal"]["side"].cacheKey())
+        check("dual state full built", pet.state_pix["full"].get("blush") is not None
+              and pet.state_pix["normal"].get("blush") is not None)
+        # 中-3：状态展示中切形态 → 立即换新形态同表情；结束后落 full side
+        pet._show_state("angry", 1000)
+        pet._set_form("full")
+        check("dual state switch form",
+              pet.item.pixmap().cacheKey() == pet.state_pix["full"]["angry"].cacheKey())
+        pet._state_timer.stop()
+        pet._state_done()
+        check("dual state done falls full side",
+              pet.item.pixmap().cacheKey() == pet.sprites["full"]["side"].cacheKey())
+        pet._set_form("normal")
         pet._set_form("full")
         check("dual form shows full pix",
               pet.item.pixmap().cacheKey() == pet.sprites["full"]["side"].cacheKey())
@@ -179,6 +191,23 @@ def main_flow():
         pet.apply_role(single["id"])
         check("single sprites equal",
               pet.sprites["full"]["side"].cacheKey() == pet.sprites["normal"]["side"].cacheKey())
+        # v1.3.3：自定义角色程序化表情图（不再只有气泡+头顶表情）
+        st = pet._state_pix("blush")
+        check("custom state pix built", st is not None and st.width() > 0)
+        if st is not None:
+            pet._show_state("blush", 200)
+            check("custom state shown",
+                  pet.item.pixmap().cacheKey() == st.cacheKey()
+                  and pet.item.pixmap().cacheKey() != pet.sprites["normal"]["side"].cacheKey())
+            pet._state_timer.stop()
+            pet._state_done()  # S1 回归：表情结束必须恢复待机贴图
+            check("custom state restored",
+                  pet.item.pixmap().cacheKey() == pet.sprites["normal"]["front"].cacheKey())
+            # 睡眠/唤醒恢复（S1 同源回归）
+            pet._show_sleep()
+            pet._wake()
+            check("custom sleep restored",
+                  pet.item.pixmap().cacheKey() == pet.sprites["normal"]["front"].cacheKey())
         pet.apply_role("")
 
     # ---- 2c. 多帧素材 / 视频抽帧（v1.3.2）----
@@ -201,6 +230,16 @@ def main_flow():
         check("frames role animates", pet._custom_role and pet.has_frames
               and pet.anim._sets.get("idle") is not None
               and len(pet.anim._sets["idle"]) == 3)
+        # 中-4：帧动画角色 × 程序化表情组合（状态结束/唤醒后恢复帧循环）
+        pet._show_state("cry", 100)
+        check("frames role state shown", pet.anim_mode == "state"
+              and pet.item.pixmap().cacheKey() == pet.state_pix["normal"]["cry"].cacheKey())
+        pet._state_timer.stop()
+        pet._state_done()
+        check("frames role idle restored", pet.anim_mode == "idle" and pet.anim._timer.isActive())
+        pet._show_sleep()
+        pet._wake()
+        check("frames role sleep restored", pet.anim_mode == "idle" and pet.anim._timer.isActive())
         pet.feed("小鱼干")
         t0 = time.time()
         while pet.busy and time.time() - t0 < 3:
@@ -212,6 +251,42 @@ def main_flow():
         okfd, _errfd = pet.role_lib.delete(frole["id"])
         check("frames delete files", okfd and all(not os.path.exists(p) for p in fpaths))
         pet.apply_role("")
+        # 高-2 回归：文件存在但无法解码 → 回退默认角色（不能静默消失）
+        corrupt = os.path.join(_tmp, "roles", "corrupt.png")
+        os.makedirs(os.path.dirname(corrupt), exist_ok=True)
+        with open(corrupt, "wb") as fh:
+            fh.write(b"not a png at all")
+        # 直接塞索引（绕过 import_file 的内容校验）
+        pet.role_lib._data["roles"].append({
+            "id": "corrupt1", "name": "坏角色", "file": "corrupt.png",
+            "form": "single", "file_full": "", "frames": [], "added": "",
+        })
+        pet.role_lib._save()
+        pet.role_lib.set_active("corrupt1")
+        pet.cfg["role"] = "corrupt1"
+        pet.apply_role("corrupt1")
+        check("corrupt role falls back default", not pet._custom_role
+              and pet.sprites["normal"]["side"].width() > 20)
+        pet.apply_role("")
+        pet.role_lib.delete("corrupt1")
+        # 中-1 回归：旧版超大角色加载时一次性补偿 scale（窗口不骤缩）
+        big_src = os.path.join(_tmp, "big_role.png")
+        make_test_png(big_src, 800, 800)
+        bigrole, _errb = pet.role_lib.import_file(big_src, "超大旧角色")  # 旧版入口：不处理直接拷贝
+        if bigrole:
+            pet.cfg["scale"] = 1.0
+            pet.cfg["scale_compensated_role"] = ""
+            pet.apply_role(bigrole["id"])
+            check("big role capped", pet.sprites["normal"]["side"].width() <= 512)
+            check("big role scale compensated", pet.cfg.get("scale", 1.0) > 1.0,
+                  "scale=%.2f" % pet.cfg.get("scale", 1.0))
+            # 二次切换不重复补偿
+            s_before = pet.cfg.get("scale", 1.0)
+            pet.apply_role("")
+            pet.apply_role(bigrole["id"])
+            check("big role no re-compensate", abs(pet.cfg.get("scale", 1.0) - s_before) < 0.01)
+            pet.apply_role("")
+            pet.role_lib.delete(bigrole["id"])
         # 帧数边界：1 帧 / 25 帧拒绝
         rmin, emin = pet.role_lib.import_processed(frame_pngs[0], None, "边界", frames_src=[frame_pngs[0]])
         check("frames min2 rejected", rmin is None and "至少需要 2 帧" in (emin or ""), "err=%r" % (emin,))
@@ -406,6 +481,48 @@ def main_flow():
         check("menu resource item", any("资源管理" in t for t in texts))
         check("menu role item", any("角色" in t for t in texts))
         check("menu has size slider", any(isinstance(a, main.QWidgetAction) for a in captured._captured))
+        check("menu city item", any("天气城市" in t for t in texts))
+        # 中-2：_set_city 对话框全路径（stub QInputDialog）
+        real_qid = main.QInputDialog
+        fake = {"result": main.QDialog.DialogCode.Accepted, "val": ""}
+        class _FakeInput:
+            def __init__(self, parent=None):
+                pass
+            def setWindowTitle(self, t): pass
+            def setLabelText(self, t): pass
+            def setTextValue(self, t): self._val = t
+            def setWindowFlags(self, f): pass
+            def windowFlags(self): return 0
+            def show(self): pass
+            def raise_(self): pass
+            def activateWindow(self): pass
+            def setFocus(self): pass
+            def exec(self): return fake["result"]
+            def textValue(self): return fake["val"]
+        main.QInputDialog = _FakeInput
+        bubbles = []
+        real_show_bubble = pet.show_bubble
+        pet.show_bubble = lambda t: bubbles.append(t)
+        try:
+            pet.cfg["city"] = "北京"
+            fake["result"] = main.QDialog.DialogCode.Accepted
+            fake["val"] = "上海"
+            pet._set_city()
+            check("city dialog accept", pet.cfg["city"] == "上海"
+                  and main.load_config().get("city") == "上海")
+            fake["val"] = ""
+            pet._set_city()
+            check("city dialog empty", pet.cfg["city"] == "上海"
+                  and any("不能为空" in b for b in bubbles))
+            fake["result"] = main.QDialog.DialogCode.Rejected
+            fake["val"] = "东京"
+            pet._set_city()
+            check("city dialog reject", pet.cfg["city"] == "上海")
+        finally:
+            main.QInputDialog = real_qid
+            pet.show_bubble = real_show_bubble
+        pet.cfg["city"] = "北京"
+        main.save_config(pet.cfg)
     else:
         check("menu captured", False, "no menu object captured")
 

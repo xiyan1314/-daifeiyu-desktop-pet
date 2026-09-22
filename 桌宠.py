@@ -47,7 +47,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -125,6 +125,7 @@ DEFAULT_CONFIG = {
     "lines_extra": {"sajiao": [], "greedy": [], "happy": [], "idle": []},
     "budget": 0.0,       # 今日预算提醒（<=0 关闭）
     "balance_alert": 0.0,  # 余额预警阈值（<=0 关闭）
+    "scale_compensated_role": "",  # 旧版超大角色素材的 scale 一次性补偿标记（文件名）
 }
 
 # 气泡样式（配置驱动；apply_bubble_style 更新，Bubble.paintEvent 读取）
@@ -234,6 +235,7 @@ def load_config():
     cfg["badge"] = _to_bool(cfg.get("badge", False))
     # ---- v1.3 新增配置归一化 ----
     cfg["role"] = str(cfg.get("role", "") or "")
+    cfg["scale_compensated_role"] = str(cfg.get("scale_compensated_role", "") or "")
     cfg["sound_group"] = "custom" if cfg.get("sound_group") == "custom" else "default"
     try:
         bs = cfg.get("bubble_style")
@@ -466,6 +468,103 @@ SYSTEM_PROMPT = (
     "回答必须中文、俏皮贱萌、不超过%d个字。"
     "喜欢说：喜欢的，就咬住不放~"
 ) % MAX_REPLY_LEN
+
+
+# ---------------- 程序化表情绘制（头顶 emote 与自定义角色状态图共用） ----------------
+def _emote_mark(kind, size):
+    """绘制表情符号：64px 画布绘制后缩放到 size。返回 QPixmap。"""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    if kind == "heart":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ff4d6d"))
+        p.drawEllipse(16, 14, 16, 16)
+        p.drawEllipse(32, 14, 16, 16)
+        p.drawPolygon(QPolygonF([QPointF(16, 24), QPointF(48, 24), QPointF(32, 52)]))
+    elif kind == "sparkle":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ffd23f"))
+        p.drawPolygon(QPolygonF([
+            QPointF(32, 4), QPointF(38, 26), QPointF(60, 32), QPointF(38, 38),
+            QPointF(32, 60), QPointF(26, 38), QPointF(4, 32), QPointF(26, 26),
+        ]))
+    elif kind in ("sweat", "drool"):
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#6ec6ff"))
+        p.drawEllipse(18, 38, 28, 24)
+        p.drawPolygon(QPolygonF([QPointF(18, 46), QPointF(46, 46), QPointF(32, 14)]))
+    elif kind == "tear":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#6ec6ff"))
+        p.drawEllipse(12, 38, 18, 20)
+        p.drawEllipse(34, 38, 18, 20)
+        p.drawPolygon(QPolygonF([QPointF(12, 44), QPointF(30, 44), QPointF(21, 18)]))
+        p.drawPolygon(QPolygonF([QPointF(34, 44), QPointF(52, 44), QPointF(43, 18)]))
+    elif kind == "anger":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ff4d4d"))
+        p.drawRoundedRect(14, 28, 36, 10, 5, 5)
+        p.drawRoundedRect(28, 14, 10, 36, 5, 5)
+    elif kind == "exclaim":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ffd23f"))
+        p.drawRoundedRect(26, 6, 14, 34, 7, 7)
+        p.drawEllipse(24, 46, 16, 16)
+    elif kind == "question":
+        p.setPen(QColor("#7fb2ff"))
+        p.setFont(QFont("Microsoft YaHei", 40, QFont.Weight.Bold))
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "?")
+    elif kind == "zzz":
+        p.setPen(QColor("#9aa7b8"))
+        p.setFont(QFont("Microsoft YaHei", 28, QFont.Weight.Bold))
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "z")
+    elif kind == "note":
+        p.setPen(QColor("#b58cff"))
+        p.setFont(QFont("Microsoft YaHei", 36, QFont.Weight.Bold))
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "♪")
+    p.end()
+    if size != 64:
+        pm = pm.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    return pm
+
+
+# 自定义角色状态图：状态名 → 叠加的表情标记（blush 用双颊腮红）
+_STATE_MARK_MAP = {
+    "sleep": None, "puzzled": "question", "angry": "anger", "hiss": "anger",
+    "cry": "tear", "laugh": "note", "smug": "sparkle",
+    "surprised": "exclaim", "drool": "drool", "blush": "blush",
+}
+
+
+def _make_custom_state_pix(base, state):
+    """在自定义角色底图上叠加程序化表情，生成状态图（无独立表情素材的替代）。
+
+    blush 画粉色双颊；其余状态在顶部居中叠加对应表情标记。
+    """
+    if base is None or base.isNull():
+        return QPixmap()  # 防御：调用链保证非空，此处仅兜底
+    mark = _STATE_MARK_MAP.get(state)
+    if mark is None:
+        return QPixmap(base)  # 无标记状态（sleep）：直接复制底图，不做空绘
+    pix = QPixmap(base)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    w, h = pix.width(), pix.height()
+    s = max(w, h) / 256.0
+    if mark == "blush":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 110, 140, 165))
+        r = max(6, int(20 * s))
+        p.drawEllipse(int(w * 0.26 - r), int(h * 0.50 - r), 2 * r, 2 * r)
+        p.drawEllipse(int(w * 0.66 - r), int(h * 0.50 - r), 2 * r, 2 * r)
+    else:
+        size = min(max(24, int(46 * s)), max(16, int(w * 0.6)))  # 极小图防标记溢出
+        m = _emote_mark(mark, size)
+        p.drawPixmap((w - m.width()) // 2, 6, m)
+    p.end()
+    return pix
 
 
 # ---------------- 跨线程信号 ----------------
@@ -903,12 +1002,7 @@ class PetWindow(QWidget):
         self._fx_money_dir = os.path.join(assets_dir, "fx")
         self._wire_anim_sets()
         self.anim.frame_changed.connect(self._on_frame_changed)
-        self.state_pix = {"normal": {}, "full": {}}
-        for form in ("normal", "full"):
-            for s in ("sleep", "puzzled", "hiss", "cry", "blush", "laugh", "smug", "surprised", "angry", "drool"):
-                pix = self._load_img(["assets/%s_%s.png" % (form[0], s)])
-                if pix is not None:
-                    self.state_pix[form][s] = pix
+        self._build_state_pix()
         self.anim_mode = "idle"
         self._sleeping = False
         self._last_activity = time.monotonic()
@@ -1067,6 +1161,29 @@ class PetWindow(QWidget):
             "full": {"side": full_side, "front": full_front},
         }
 
+    def _cap_role_pix(self, pix, path=None):
+        """旧版超大角色素材加载时归一化到 512（与导入管线一致）。
+
+        防状态图生成时的内存峰值（v1.3.0 旧角色可能 2048px+，10 状态 × 2 形态
+        每张全尺寸副本可达数百 MB）。为防升级后桌宠窗口突然缩小，对超大素材
+        一次性按比例补偿 cfg scale 并落盘（标记键防重复补偿）。
+        """
+        if pix is None or pix.isNull():
+            return pix
+        w, h = pix.width(), pix.height()
+        if max(w, h) <= 512:
+            return pix
+        try:
+            if path and self.cfg.get("scale_compensated_role") != os.path.basename(path):
+                factor = min(max(w, h) / 512.0, 4.0 / max(self.cfg.get("scale", 1.0), 0.2))
+                self.cfg["scale"] = min(4.0, round(self.cfg.get("scale", 1.0) * factor, 2))
+                self.cfg["scale_compensated_role"] = os.path.basename(path)
+                save_config(self.cfg)
+        except Exception:
+            pass
+        return pix.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio,
+                          Qt.TransformationMode.SmoothTransformation)
+
     def _role_pix(self):
         """自定义角色图：config 激活且文件存在则返回 QPixmap，否则 None（回退默认角色）。"""
         rid = self.cfg.get("role", "")
@@ -1078,8 +1195,8 @@ class PetWindow(QWidget):
             path = self.role_lib.active_path()
             if not path or not os.path.isfile(path):
                 return None
-            pix = QPixmap(path)
-            return pix if not pix.isNull() else None
+            # 文件存在但解码失败（损坏/占位文件）：必须回退默认角色而非返回 null
+            return self._cap_role_pix(QPixmap(path), path) or None
         except Exception:
             return None
 
@@ -1095,8 +1212,7 @@ class PetWindow(QWidget):
             path = self.role_lib.path_for_full(rid)  # rid="" 时 get("") 返回 None → 回退 base
             if not path or not os.path.isfile(path):
                 return base
-            pix = QPixmap(path)
-            return pix if not pix.isNull() else base
+            return self._cap_role_pix(QPixmap(path), path) or base
         except Exception:
             return base
 
@@ -1112,7 +1228,7 @@ class PetWindow(QWidget):
                 pix = QPixmap(p)
                 if pix.isNull():
                     return []  # 坏帧：整体回退静态
-                frames.append(pix)
+                frames.append(self._cap_role_pix(pix, p))  # 与静态底图同一尺寸口径
             return frames
         except Exception:
             return []
@@ -1142,6 +1258,7 @@ class PetWindow(QWidget):
     def _reload_sprites(self):
         """重建角色贴图 / 窗口尺寸 / 动画能力（角色切换与恢复默认共用）。"""
         self._build_sprites()
+        self._build_state_pix()  # 自定义角色：程序化表情图随底图重建
         # 双形态时两套图尺寸可能不同：窗口按较大者定，避免吃饱形态溢出/不居中
         self.base_w = max(self.sprites["normal"]["side"].width(), self.sprites["full"]["side"].width())
         self.base_h = max(self.sprites["normal"]["side"].height(), self.sprites["full"]["side"].height())
@@ -1187,7 +1304,11 @@ class PetWindow(QWidget):
             if self.anim_mode != "idle":
                 self.anim.stop()
                 self.anim_mode = "idle"
-            if not self._using_front:
+                # S1：从表情/睡眠返回待机必须强制恢复 front（_using_front 可能仍为 True，
+                # 仅当非待机转入时才换贴图，否则表情图会永久滞留）
+                self.item.setPixmap(self.sprites[self.form]["front"])
+                self._using_front = True
+            elif not self._using_front:
                 self.item.setPixmap(self.sprites[self.form]["front"])
                 self._using_front = True
         self._apply_transform()
@@ -1204,9 +1325,29 @@ class PetWindow(QWidget):
     # 吃饱形态缺图（用户素材只有 7 张吃饱版状态图）时用同形态近义图兜底，避免显示瘦图
     FULL_STATE_ALIAS = {"hiss": "angry", "drool": "laugh", "surprised": "puzzled"}
 
-    def _state_pix(self, state):
+    def _build_state_pix(self):
+        """构建状态图：默认角色加载内置表情素材；自定义角色生成程序化表情图。"""
+        names = tuple(_STATE_MARK_MAP)  # 状态名单一来源，避免双处维护
         if self._custom_role:
-            return None  # 自定义角色无表情图：保持当前贴图，避免整只替换成内置鱼
+            base = self.sprites["normal"]["side"]
+            full = self.sprites["full"]["side"]
+            normal_states = {s: _make_custom_state_pix(base, s) for s in names}
+            if full.cacheKey() == base.cacheKey():
+                self.state_pix = {"normal": normal_states, "full": normal_states}  # 单形态：共用
+            else:
+                self.state_pix = {
+                    "normal": normal_states,
+                    "full": {s: _make_custom_state_pix(full, s) for s in names},
+                }
+            return
+        self.state_pix = {"normal": {}, "full": {}}
+        for form in ("normal", "full"):
+            for s in names:
+                pix = self._load_img(["assets/%s_%s.png" % (form[0], s)])
+                if pix is not None:
+                    self.state_pix[form][s] = pix
+
+    def _state_pix(self, state):
         pix = self.state_pix.get(self.form, {}).get(state)
         if pix is None and self.form == "full":
             alias = self.FULL_STATE_ALIAS.get(state)
@@ -1217,8 +1358,6 @@ class PetWindow(QWidget):
         return pix
 
     def _show_state(self, state, duration_ms=STATE_DURATION_MS):
-        if self._custom_role:
-            return  # 自定义角色：情绪只走气泡/头顶表情，不换贴图（M3）
         pix = self._state_pix(state)
         if pix is None:
             _log_error("state image missing: %s" % state)
@@ -1294,60 +1433,7 @@ class PetWindow(QWidget):
         key = (kind, size)
         if key in self._emote_cache:
             return self._emote_cache[key]
-        pm = QPixmap(64, 64)
-        pm.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if kind == "heart":
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#ff4d6d"))
-            p.drawEllipse(16, 14, 16, 16)
-            p.drawEllipse(32, 14, 16, 16)
-            p.drawPolygon(QPolygonF([QPointF(16, 24), QPointF(48, 24), QPointF(32, 52)]))
-        elif kind == "sparkle":
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#ffd23f"))
-            p.drawPolygon(QPolygonF([
-                QPointF(32, 4), QPointF(38, 26), QPointF(60, 32), QPointF(38, 38),
-                QPointF(32, 60), QPointF(26, 38), QPointF(4, 32), QPointF(26, 26),
-            ]))
-        elif kind in ("sweat", "drool"):
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#6ec6ff"))
-            p.drawEllipse(18, 38, 28, 24)
-            p.drawPolygon(QPolygonF([QPointF(18, 46), QPointF(46, 46), QPointF(32, 14)]))
-        elif kind == "tear":
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#6ec6ff"))
-            p.drawEllipse(12, 38, 18, 20)
-            p.drawEllipse(34, 38, 18, 20)
-            p.drawPolygon(QPolygonF([QPointF(12, 44), QPointF(30, 44), QPointF(21, 18)]))
-            p.drawPolygon(QPolygonF([QPointF(34, 44), QPointF(52, 44), QPointF(43, 18)]))
-        elif kind == "anger":
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#ff4d4d"))
-            p.drawRoundedRect(14, 28, 36, 10, 5, 5)
-            p.drawRoundedRect(28, 14, 10, 36, 5, 5)
-        elif kind == "exclaim":
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#ffd23f"))
-            p.drawRoundedRect(26, 6, 14, 34, 7, 7)
-            p.drawEllipse(24, 46, 16, 16)
-        elif kind == "question":
-            p.setPen(QColor("#7fb2ff"))
-            p.setFont(QFont("Microsoft YaHei", 40, QFont.Weight.Bold))
-            p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "?")
-        elif kind == "zzz":
-            p.setPen(QColor("#9aa7b8"))
-            p.setFont(QFont("Microsoft YaHei", 28, QFont.Weight.Bold))
-            p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "z")
-        elif kind == "note":
-            p.setPen(QColor("#b58cff"))
-            p.setFont(QFont("Microsoft YaHei", 36, QFont.Weight.Bold))
-            p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "♪")
-        p.end()
-        if size != 64:
-            pm = pm.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        pm = _emote_mark(kind, size)
         if len(self._emote_cache) > 80:
             self._emote_cache.clear()  # 缩放连续变化会产生大量尺寸，上限防无界增长
         self._emote_cache[key] = pm
@@ -1869,7 +1955,7 @@ class PetWindow(QWidget):
             self._apply_transform()
 
     def _walk_tick(self):
-        if not self.has_frames and self._using_front:
+        if not self.has_frames and self._using_front and self.anim_mode not in ("state", "sleep"):
             self.item.setPixmap(self.sprites[self.form]["side"])
             self._using_front = False
         target = None
@@ -1926,6 +2012,26 @@ class PetWindow(QWidget):
             self.show_bubble("系统状态读不到啦……")
 
     # ---------- 天气 ----------
+    def _set_city(self):
+        """设置天气城市（open-meteo 免费接口，默认北京）。"""
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("天气城市")
+        dlg.setLabelText("输入天气城市名（如 北京 / 上海 / 东京）：")
+        dlg.setTextValue(self.cfg.get("city", "北京"))
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.setFocus()
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            city = dlg.textValue().strip()[:20]
+            if not city:
+                self.show_bubble("城市名不能为空哦~")
+                return
+            self.cfg["city"] = city
+            save_config(self.cfg)
+            self.show_bubble("天气城市改成「%s」啦~" % city)
+
     def _fetch_weather(self):
         if self._weather_inflight:
             self.show_bubble("已经在查天气啦~")
@@ -2409,6 +2515,8 @@ class PetWindow(QWidget):
         praise_act.triggered.connect(lambda checked=False: self.mood.blush())
         weather_act = menu.addAction("☀️ 今日天气")
         weather_act.triggered.connect(self._fetch_weather)
+        city_act = menu.addAction("📍 天气城市…")
+        city_act.triggered.connect(self._set_city)
         cpu_act = menu.addAction("🖥️ 系统状态")
         cpu_act.triggered.connect(self._show_system_status)
         about_act = menu.addAction("ℹ️ 关于")
