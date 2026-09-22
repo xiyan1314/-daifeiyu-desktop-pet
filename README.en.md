@@ -23,7 +23,9 @@ Transparent frameless window, always-on-top, draggable, feedable, chatty — per
 - 😴 **Idle life**: falls asleep after 60s, occasional mischievous grins, blushes when praised
 - 📌 Single instance, tray icon, follow mouse / wander, wheel resize, edge snapping
 - 🐳 **v1.3 customization & bookkeeping (inspired by the dsh-whale-widget plugin)**:
-  - 🖼️ **Character import**: right-click → "🐟 角色" to import png/jpg/bmp/webp with auto background-removal / trim / scale; **choose single-form (one image) or dual-form (normal + full images)**; switch/delete/restore anytime (custom characters are static — emotions show via bubble & head emote)
+  - 🖼️ **Character import**: right-click → "🐟 角色" to import png/jpg/bmp/webp with auto background-removal / trim / scale; **choose single-form (one image) or dual-form (normal + full images)**; switch/delete/restore anytime
+  - 🎞️ **Animated characters (v1.3.2)**: pick multiple images as a frame sequence, or auto-extract frames from a **video / GIF** (video: 3~20 sampled frames, GIF: 3~24); every frame gets the same auto-processing; idle loops the animation, feeding switches to the full form
+  - Custom characters keep squish/edge/follow effects; emotions show via bubble & head emote
   - 🔊 **Sound import + custom sound groups**: import wav/mp3 clips with preview; each of the 5 events (poke/release/feed/AI reply/coin) can use any clip or stay silent
   - 📦 **Resource manager**: one window for characters and audio clips (preview/audition/set-active/delete)
   - 📒 **Bookkeeping**: balance-diff auto-ledger (daily archive) + manual entries; ledger window with today / 7 days / all, search and CSV export; daily budget & balance alerts (once per day)
@@ -66,7 +68,8 @@ python 桌宠.py
 - **Character**: right-click → "🐟 角色" → "导入角色…" — material is auto-processed (background removed when opaque, transparent margins trimmed, oversized images scaled; png/jpg/bmp/webp supported):
   - **Single form**: pick one image; normal/full forms share it
   - **Dual form**: also pick a "full" image; feeding switches between the two (you choose the mode)
-  - Custom characters are static: squish/edge/follow effects kept; emotions via bubble & emote
+  - **Animated**: pick multiple images as an ordered frame sequence, or auto-extract frames from a video / GIF (video 3~20, GIF 3~24 frames)
+  - Squish/edge/follow effects kept; emotions via bubble & emote
 - **Sounds**: right-click → "🎵 音效设置" → "管理音频片段…" to import wav/mp3 and audition; assign a clip (or silence) per event in the custom group
 - **Bubble**: right-click → "🎨 气泡样式…" to tweak background/text/border colors, font size and corner radius
 - **Lines**: right-click → "💬 自定义台词…" to append your own lines to four pools

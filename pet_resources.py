@@ -10,15 +10,16 @@
 对外接口：
 - class RoleLibrary(data_dir)
     目录 data_dir/roles/，索引 data_dir/roles.json（{"roles":[...], "active":id}）。
-    list_roles() -> [{"id","name","file","form","file_full","added"}...]  # 默认角色不在列表
+    list_roles() -> [{"id","name","file","form","file_full","frames","added"}...]  # 默认角色不在列表
     active_id() -> str                                     # "" = 默认角色
     set_active(role_id) -> bool                            # "" 回默认
     active_path() -> str|None                              # 当前角色 png 绝对路径；默认角色 None
     path_for(role_id) -> str|None                          # 任意角色 png 绝对路径（面板预览用）
     path_for_full(role_id) -> str|None                     # 吃饱形态 png；单形态返回 None
     import_file(src, name=None) -> (role|None, err|None)   # 旧版单图导入（v1.3.0 兼容，单形态）
-    import_processed(base_src, full_src=None, name=None)   # 单/双形态导入（面板新入口）
-                                                           #   full_src=None → form="single"
+    import_processed(base_src, full_src=None, name=None,  # 单/双形态导入（面板新入口）
+                      frames_src=None)                      #   full_src=None → form="single"；
+                                                           #   frames_src=2~24 帧 → 帧动画角色
     delete(role_id) -> (bool, str)                         # 删全部素材文件+索引；active 则重置 ""
     get(role_id) -> dict|None
 - class AudioLibrary(data_dir)
@@ -135,12 +136,17 @@ class RoleLibrary:
             file_full = str(r.get("file_full") or "")
             # form 归一化：只有带 file_full 的 dual 才算双形态，其余一律 single
             form = "dual" if (str(r.get("form") or "") == "dual" and file_full) else "single"
+            frames = r.get("frames")
+            if not isinstance(frames, list):
+                frames = []
+            frames = [str(x) for x in frames if str(x).lower().endswith(".png")][:60]
             clean.append({
                 "id": rid,
                 "name": str(r.get("name") or "") or "未命名",
                 "file": fname,
                 "form": form,
                 "file_full": file_full,
+                "frames": frames,
                 "added": str(r.get("added") or ""),
             })
         active = str(data.get("active") or "")
@@ -162,11 +168,13 @@ class RoleLibrary:
         return p
 
     def _role_paths(self, role):
-        """角色全部素材文件绝对路径（base + 可选「吃饱」变体）。"""
+        """角色全部素材文件绝对路径（base + 可选「吃饱」变体 + 动画帧）。"""
         out = [self._path(role)]
         f = role.get("file_full")
         if f:
             out.append(f if os.path.isabs(f) else os.path.join(self._dir, f))
+        for fn in role.get("frames") or []:
+            out.append(fn if os.path.isabs(fn) else os.path.join(self._dir, fn))
         return out
 
     @staticmethod
@@ -181,7 +189,8 @@ class RoleLibrary:
 
     # ---------- 对外 ----------
     def list_roles(self):
-        """返回全部自定义角色 [{"id","name","file","form","file_full","added"}...]；
+        """返回全部自定义角色
+        [{"id","name","file","form","file_full","frames","added"}...]；
         默认角色不在列表。"""
         return [dict(r) for r in self._data["roles"]]
 
@@ -229,6 +238,23 @@ class RoleLibrary:
             return f if os.path.isfile(f) else None
         except Exception:
             return None
+
+    def frames_for(self, role_id):
+        """角色动画帧 png 绝对路径列表（都存在才返回）；无帧动画返回 []。"""
+        r = self.get(str(role_id or ""))
+        if r is None:
+            return []
+        out = []
+        for fn in r.get("frames") or []:
+            p = fn if os.path.isabs(fn) else os.path.join(self._dir, fn)
+            try:
+                if os.path.isfile(p):
+                    out.append(p)
+                else:
+                    return []  # 帧文件缺失：整体视为无帧动画（回退静态）
+            except Exception:
+                return []
+        return out
 
     def import_file(self, src, name=None):
         """旧版导入（v1.3.0 兼容）：只复制一张图，无「吃饱」变体（单形态）。
@@ -285,11 +311,13 @@ class RoleLibrary:
         except Exception as e:
             return None, "导入失败：%s" % e
 
-    def import_processed(self, base_src, full_src=None, name=None):
+    def import_processed(self, base_src, full_src=None, name=None, frames_src=None):
         """导入已自动处理的角色素材（面板新入口）。
 
         full_src=None → 单形态：只复制 base（record form="single"，无 file_full）。
         full_src 给路径 → 双形态：base + 吃饱变体都复制（form="dual"，file/file_full）。
+        frames_src 给 2~24 张已处理帧 → 帧动画角色：帧存为 <id>_f%02d.png，
+        base 必须是首帧（"file" 指向 _f00），"frames" 记录全部帧文件名。
         成功返回 (role, None)，失败 (None, err)；任何失败都会清理半成品文件。
         """
         try:
@@ -305,6 +333,21 @@ class RoleLibrary:
                         return None, "%s素材超过 10MB" % label
                 except Exception:
                     return None, "无法读取文件大小"
+            if frames_src is not None:
+                if not isinstance(frames_src, list) or len(frames_src) < 2:
+                    return None, "帧动画至少需要 2 帧"
+                if len(frames_src) > 24:
+                    return None, "帧动画最多 24 帧"
+                for i, src in enumerate(frames_src):
+                    if not isinstance(src, str) or not os.path.isfile(src):
+                        return None, "第 %d 帧素材不存在" % (i + 1)
+                    if os.path.splitext(src)[1].lower() != ".png":
+                        return None, "第 %d 帧素材必须是 png" % (i + 1)
+                    try:
+                        if os.path.getsize(src) > self.MAX_BYTES:
+                            return None, "第 %d 帧素材超过 10MB" % (i + 1)
+                    except Exception:
+                        return None, "无法读取文件大小"
             if name is None or not str(name).strip():
                 name = "未命名"  # base_src 是临时文件，不能用其文件名当角色名
             name = str(name).strip()[:40] or "未命名"
@@ -315,12 +358,20 @@ class RoleLibrary:
             rid = _new_id()
             dst_base = os.path.join(self._dir, rid + ".png")
             dst_full = os.path.join(self._dir, rid + "_full.png") if full_src else None
+            dst_frames = []
             try:
-                shutil.copyfile(base_src, dst_base)
+                if frames_src:
+                    for i, src in enumerate(frames_src):
+                        dst_frames.append(os.path.join(self._dir, "%s_f%02d.png" % (rid, i)))
+                        shutil.copyfile(src, dst_frames[-1])
+                    # 帧动画角色：base 即首帧（复制首帧到 <id>.png，保持静态预览/回退一致）
+                    shutil.copyfile(frames_src[0], dst_base)
+                else:
+                    shutil.copyfile(base_src, dst_base)
                 if dst_full is not None:
                     shutil.copyfile(full_src, dst_full)
             except Exception:
-                self._cleanup_files(dst_base, dst_full)
+                self._cleanup_files(dst_base, dst_full, *dst_frames)
                 return None, "复制文件失败"
             role = {
                 "id": rid,
@@ -331,10 +382,12 @@ class RoleLibrary:
             }
             if full_src:
                 role["file_full"] = rid + "_full.png"
+            if frames_src:
+                role["frames"] = ["%s_f%02d.png" % (rid, i) for i in range(len(frames_src))]
             self._data["roles"].append(role)
             err = self._save()
             if err:
-                self._cleanup_files(dst_base, dst_full)
+                self._cleanup_files(dst_base, dst_full, *dst_frames)
                 self._data["roles"].pop()
                 return None, err
             return role, None

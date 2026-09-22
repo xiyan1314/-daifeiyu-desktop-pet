@@ -47,7 +47,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -901,12 +901,7 @@ class PetWindow(QWidget):
             _log_error("fx frames petpet incomplete: %d/10" % len(self._fx_petpet))
         self._fx_money = []  # 86 帧较大：首次撒钱时才加载（约 6.7MB）
         self._fx_money_dir = os.path.join(assets_dir, "fx")
-        # 自定义角色没有帧动画素材：退化为静态图（压扁/Q弹/翻转等程序变换不受影响）
-        self.has_frames = bool(self._idle_frames) and not self._custom_role
-        if self.has_frames:
-            self.anim.add_set("idle", self._idle_frames)
-            if self._eat_frames:
-                self.anim.add_set("eat", self._eat_frames)
+        self._wire_anim_sets()
         self.anim.frame_changed.connect(self._on_frame_changed)
         self.state_pix = {"normal": {}, "full": {}}
         for form in ("normal", "full"):
@@ -1105,6 +1100,37 @@ class PetWindow(QWidget):
         except Exception:
             return base
 
+    def _role_frames(self):
+        """自定义角色的动画帧 [QPixmap]；无帧动画角色返回 []。"""
+        rid = self.cfg.get("role", "")
+        if not rid:
+            return []
+        try:
+            paths = self.role_lib.frames_for(rid)
+            frames = []
+            for p in paths:
+                pix = QPixmap(p)
+                if pix.isNull():
+                    return []  # 坏帧：整体回退静态
+                frames.append(pix)
+            return frames
+        except Exception:
+            return []
+
+    def _wire_anim_sets(self):
+        """把当前角色对应的帧集注册进 FrameAnim（init 与角色切换共用）。
+
+        自定义角色有帧素材 → idle 集用角色帧；默认角色用内置 idle 帧。
+        eat 集仅默认角色注册（自定义角色吃帧走 squash 路径）。
+        """
+        role_frames = self._role_frames() if self._custom_role else []
+        self.has_frames = bool(role_frames) or (bool(self._idle_frames) and not self._custom_role)
+        if self.has_frames:
+            self.anim.add_set("idle", role_frames if role_frames else self._idle_frames)
+        else:
+            self.anim.add_set("idle", [])
+        self.anim.add_set("eat", self._eat_frames if (self.has_frames and not self._custom_role) else [])
+
     def apply_role(self, role_id):
         """切换角色（""=默认角色）：持久化并立即重载贴图，无需重启。"""
         rid = str(role_id or "")
@@ -1119,9 +1145,7 @@ class PetWindow(QWidget):
         # 双形态时两套图尺寸可能不同：窗口按较大者定，避免吃饱形态溢出/不居中
         self.base_w = max(self.sprites["normal"]["side"].width(), self.sprites["full"]["side"].width())
         self.base_h = max(self.sprites["normal"]["side"].height(), self.sprites["full"]["side"].height())
-        self.has_frames = bool(self._idle_frames) and not self._custom_role
-        self.anim.add_set("idle", self._idle_frames if self.has_frames else [])
-        self.anim.add_set("eat", self._eat_frames if self.has_frames else [])
+        self._wire_anim_sets()
         if self.busy and self.anim_mode == "eat":
             self.busy = False  # S1：吃帧被角色切换打断，_eat_done 不会再回调，显式释放
         self.anim.stop()

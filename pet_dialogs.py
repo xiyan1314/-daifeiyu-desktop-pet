@@ -15,7 +15,8 @@
   后 exec（应对 Windows 前台锁，参考主程序 _set_api_key）。
 - class RolePanel(QWidget)：角色列表 + 预览 + 导入 / 设为当前 / 删除 / 恢复默认。
 - class RoleImportDialog(QDialog)：角色导入向导——单形态（一张图）/
-  双形态（常态+吃饱两张图）由用户选择，素材自动处理（去背景/裁剪/缩放）。
+  双形态（常态+吃饱两张图）由用户选择，素材自动处理（去背景/裁剪/缩放）；
+  支持多帧动画素材（多选图片 = 帧序列、视频/GIF 自动抽帧，统一画布处理）。
 - class SoundPanel(QWidget)：音频片段列表（试听 / 导入 / 重命名 / 删除）+
   自定义音效组 5 行槽位（默认 / 静音 / 片段）。
 - class ResourceManagerDialog(QDialog)：QTabWidget 两页签（角色 / 音效），
@@ -58,9 +59,10 @@ import tempfile
 import time
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -325,7 +327,6 @@ def _remove_background(img):
     for y in range(1, h - 1):
         dq.append((0, y))
         dq.append((w - 1, y))
-    from PySide6.QtWidgets import QApplication
     processed = 0
     while dq:
         x, y = dq.popleft()
@@ -378,7 +379,6 @@ def _content_bbox(img):
         return None
     bpl = img.bytesPerLine()
     minx, miny, maxx, maxy = w, h, -1, -1
-    from PySide6.QtWidgets import QApplication
     for y in range(h):
         row = y * bpl
         if y % 256 == 0:
@@ -398,20 +398,22 @@ def _content_bbox(img):
     return (minx, miny, maxx - minx + 1, maxy - miny + 1)
 
 
-def _prepare_role_png(src, out_path):
-    """导入素材自动处理：无透明通道→去背景；裁剪透明边距；>512px 等比缩小。
+def _load_prepared(src, max_px=None):
+    """加载素材并做通用预处理：预缩放 → 无透明通道自动去背景。
 
-    成功返回 (True, notes)；失败返回 (False, err)。notes 为中文说明列表。
+    max_px=None 用全局 _IMG_MAX_PROCESS_PX（2048）；帧动画可传 1024 控制峰值。
+    返回 (img, notes) 或 (None, None)。notes 为这一阶段的说明列表。
     """
     img = QImage(src)
     if img.isNull():
-        return False, "无法加载该图片"
+        return None, None
     # 必须先查原图的 alpha（convertToFormat 成 ARGB32 后 hasAlphaChannel 恒为 True）
     had_alpha = img.hasAlphaChannel()
     img = img.convertToFormat(QImage.Format.Format_ARGB32)
     notes = []
-    if max(img.width(), img.height()) > _IMG_MAX_PROCESS_PX:
-        img = img.scaled(_IMG_MAX_PROCESS_PX, _IMG_MAX_PROCESS_PX,
+    cap = int(max_px) if max_px else _IMG_MAX_PROCESS_PX
+    if max(img.width(), img.height()) > cap:
+        img = img.scaled(cap, cap,
                          Qt.AspectRatioMode.KeepAspectRatio,
                          Qt.TransformationMode.SmoothTransformation)
         notes.append("超大图已预缩放")
@@ -422,6 +424,17 @@ def _prepare_role_png(src, out_path):
         else:
             img = removed
             notes.append("已自动去背景")
+    return img, notes
+
+
+def _prepare_role_png(src, out_path):
+    """导入素材自动处理：无透明通道→去背景；裁剪透明边距；>512px 等比缩小。
+
+    成功返回 (True, notes)；失败返回 (False, err)。notes 为中文说明列表。
+    """
+    img, notes = _load_prepared(src)
+    if img is None:
+        return False, "无法加载该图片"
     bbox = _content_bbox(img)
     if bbox is None:
         return False, "图片没有可见内容"
@@ -441,17 +454,209 @@ def _prepare_role_png(src, out_path):
     return True, notes
 
 
+def _prepare_role_frames(srcs, out_dir, same_size=True):
+    """批量处理帧素材到统一画布（帧动画导入用）。
+
+    same_size=True（视频/GIF 抽帧，原始尺寸一致）：先算全部帧的内容**并集 bbox**，
+    所有帧裁到同一矩形（保留主体平移的动画信息），再统一等比缩放（长边 ≤512）。
+    same_size=False（多选图片，尺寸可能不一）：逐帧独立处理（去背景/裁剪/缩放），
+    最后把每帧内容居中放进最大帧尺寸的透明画布（尺寸一致、防帧间跳动）。
+    返回 (out_paths, notes) 或 (None, err)。
+    """
+    imgs = []
+    for i, s in enumerate(srcs):
+        img, _load_notes = _load_prepared(s, max_px=1024)  # 帧序列峰值控制（输出 ≤512）
+        if img is None:
+            return None, "第 %d 帧无法加载" % (i + 1)
+        imgs.append(img)
+        QApplication.processEvents()  # 多帧连续处理：周期呼吸
+    if same_size:
+        # 并集 bbox：所有帧裁到同一矩形，保留帧间平移
+        union = None
+        for img in imgs:
+            b = _content_bbox(img)
+            if b is None:
+                return None, "存在空白帧"
+            if union is None:
+                union = (b[0], b[1], b[0] + b[2], b[1] + b[3])
+            else:
+                union = (min(union[0], b[0]), min(union[1], b[1]),
+                         max(union[2], b[0] + b[2]), max(union[3], b[1] + b[3]))
+        ux, uy, ux2, uy2 = union
+        uw, uh = ux2 - ux, uy2 - uy
+        scale = min(1.0, _IMG_TARGET_MAX_PX / float(max(uw, uh)))
+        cw, ch = max(1, int(round(uw * scale))), max(1, int(round(uh * scale)))
+        outs = []
+        for i, img in enumerate(imgs):
+            crop = img.copy(ux, uy, uw, uh)
+            if scale < 1.0:
+                crop = crop.scaled(cw, ch, Qt.AspectRatioMode.IgnoreAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+            out = os.path.join(out_dir, "frame_f%02d.png" % i)
+            if not crop.save(out, "PNG"):
+                return None, "保存第 %d 帧失败" % (i + 1)
+            outs.append(out)
+        notes = ["统一画布 %dx%d（并集裁剪，保留平移）" % (cw, ch)]
+        if scale < 1.0:
+            notes.append("已等比缩放（最长边 ≤%dpx）" % _IMG_TARGET_MAX_PX)
+        return outs, notes
+    # 多选图片：逐帧独立处理 → 居中放进统一画布
+    processed = []
+    for i, img in enumerate(imgs):
+        b = _content_bbox(img)
+        if b is None:
+            return None, "第 %d 帧没有可见内容" % (i + 1)
+        x, y, w, h = b
+        crop = img.copy(x, y, w, h)
+        if max(w, h) > _IMG_TARGET_MAX_PX:
+            crop = crop.scaled(_IMG_TARGET_MAX_PX, _IMG_TARGET_MAX_PX,
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+        processed.append(crop)
+    max_w = max(p.width() for p in processed)
+    max_h = max(p.height() for p in processed)
+    outs = []
+    for i, p in enumerate(processed):
+        canvas = QImage(max_w, max_h, QImage.Format.Format_ARGB32)
+        canvas.fill(0)
+        painter = QPainter(canvas)
+        painter.drawImage((max_w - p.width()) // 2, (max_h - p.height()) // 2, p)
+        painter.end()
+        out = os.path.join(out_dir, "frame_f%02d.png" % i)
+        if not canvas.save(out, "PNG"):
+            return None, "保存第 %d 帧失败" % (i + 1)
+        outs.append(out)
+    notes = ["统一画布 %dx%d（逐帧居中）" % (max_w, max_h)]
+    return outs, notes
+
+
 def _qt_parent(pet):
     """pet 必须是 Qt 窗口才能作父对象；否则用 None（缺省不崩）。"""
     return pet if isinstance(pet, QWidget) else None
+
+
+# ---------------- 视频 / GIF 抽帧 ----------------
+
+
+def _extract_video_frames(src, out_dir):
+    """从视频（mp4/webm/mov/avi 等）或 GIF 均匀抽帧（视频 3~20 帧、GIF 3~24 帧）。
+
+    视频走 QtMultimedia（QMediaPlayer + QVideoSink，绿色版自带 ffmpeg 后端），
+    GIF 走 QMovie。返回 (原始帧 png 路径列表, err)；失败返回 (None, err)。
+    捕获时即缩到 ≤1024（控制 4K 大视频的内存峰值），后续统一走
+    _prepare_role_frames（并集画布 + 统一缩放，保留主体平移）。
+    """
+    ext = os.path.splitext(str(src))[1].lower()
+    raws = []
+
+    def _cap(img):
+        if img is None or img.isNull():
+            return
+        if max(img.width(), img.height()) > 1024:
+            img = img.scaled(1024, 1024, Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        raws.append(img)
+
+    try:
+        if ext == ".gif":
+            from PySide6.QtGui import QMovie
+            movie = QMovie(src)
+            if not movie.isValid():
+                movie.stop()
+                return None, "GIF 无法读取"
+            movie.setCacheMode(QMovie.CacheMode.CacheNone)  # 帧不驻留缓存：控制大 GIF 内存峰值
+            n = movie.frameCount()
+            if n <= 1:
+                movie.stop()
+                return None, "GIF 只有 %d 帧，帧动画至少需要 2 帧" % n
+            if n > 120:
+                movie.stop()
+                return None, "GIF 帧数太多（%d 帧），建议改用视频或减少帧数" % n
+            take = min(24, n)
+            idxs = [int(round(i * (n - 1) / float(take - 1))) for i in range(take)]
+            for i in idxs:
+                movie.jumpToFrame(i)
+                t0 = time.time()
+                while movie.currentFrameNumber() != i and time.time() - t0 < 2:
+                    QApplication.processEvents()
+                    time.sleep(0.005)
+                if movie.currentFrameNumber() != i:
+                    continue  # 超时未到目标帧：跳过，避免误取旧帧造成重复
+                _cap(movie.currentPixmap().toImage())
+            movie.stop()
+        else:
+            from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
+            player = QMediaPlayer()
+            sink = QVideoSink()
+            player.setVideoSink(sink)
+            player.setSource(QUrl.fromLocalFile(os.path.abspath(src)))
+            t0 = time.time()
+            while player.duration() <= 0 and time.time() - t0 < 5:
+                QApplication.processEvents()
+                time.sleep(0.01)
+            dur = player.duration()
+            if dur <= 0:
+                player.stop()
+                return None, "无法读取视频时长（格式不支持？可改用多选图片）"
+            if not player.hasVideo():
+                player.stop()
+                return None, "该文件没有视频画面（纯音频？）"
+            take = max(3, min(20, int(dur / 400)))  # 每约 0.4s 一帧
+            got = []
+
+            def _on_frame(frame):
+                if frame.isValid() and not got:
+                    got.append(frame.toImage())
+
+            sink.videoFrameChanged.connect(_on_frame)
+            # S1：Qt6 ffmpeg 后端只在播放/暂停态向 sink 投帧——先 play() 拿首帧再 pause()
+            # 大文件/高分辨率解码慢：首帧超时随文件大小放宽（无 GPU 软解 HEVC 场景）
+            first_cap = 10 if os.path.getsize(src) > 50 * 1024 * 1024 else 5
+            player.play()
+            t0 = time.time()
+            while not got and time.time() - t0 < first_cap:
+                QApplication.processEvents()
+                time.sleep(0.005)
+            player.pause()
+            if not got:
+                sink.videoFrameChanged.disconnect(_on_frame)
+                player.stop()
+                return None, "无法从视频读取画面"
+            _cap(got[0])  # 首帧（t=0 位置）
+            for i in range(1, take):
+                t = int(dur * i / float(take))
+                del got[:]
+                player.setPosition(t)  # 暂停态下 seek 仍会投递目标帧
+                t1 = time.time()
+                while not got and time.time() - t1 < 3:
+                    QApplication.processEvents()
+                    time.sleep(0.005)
+                if got:
+                    _cap(got[0])
+            sink.videoFrameChanged.disconnect(_on_frame)
+            player.stop()
+            player.deleteLater()
+    except Exception as e:
+        return None, "抽帧失败：%s" % e
+    if len(raws) < 2:
+        return None, "只抽到 %d 帧，帧动画至少需要 2 帧（可改用多选图片）" % len(raws)
+    paths = []
+    for i, img in enumerate(raws):
+        p = os.path.join(out_dir, "raw_f%02d.png" % i)
+        if not img.save(p, "PNG"):
+            return None, "保存抽帧结果失败"
+        paths.append(p)
+    return paths, None
 
 
 # ---------------- 角色导入向导 ----------------
 class RoleImportDialog(QDialog):
     """导入角色向导：单形态（一张图）/ 双形态（常态+吃饱两张图）由用户自选。
 
-    点「导入」时对每张素材自动处理（去背景/裁剪/缩放，见 _prepare_role_png），
-    处理结果经 result_data() 交给 RolePanel 落库；临时文件在 closeEvent 清理。
+    素材支持静态图与多帧动画（多选图片 / 视频-GIF 抽帧）；
+    点「导入」时自动处理（去背景/裁剪/缩放，静态走 _prepare_role_png、
+    帧动画走 _prepare_role_frames 统一画布），结果经 result_data() 交
+    RolePanel 落库；临时文件在 closeEvent 清理。
     """
 
     MAX_BYTES = 10 * 1024 * 1024
@@ -486,7 +691,11 @@ class RoleImportDialog(QDialog):
 
         self._base_edit = QLineEdit()
         self._base_edit.setReadOnly(True)
-        self._base_edit.setPlaceholderText("常态图（必选）")
+        self._base_edit.setPlaceholderText("常态图（静态素材）")
+        self._frames_raw = []   # 原始帧 png 路径（多选图片 / 视频抽帧）
+        self._frames_video = False  # 帧是否来自同源视频/GIF（并集画布）
+        self._name_hint = ""    # 素材源文件名（名字回退用，避免 raw_f00 当角色名）
+        self._rawdir = None     # 抽帧临时目录
         self._full_edit = QLineEdit()
         self._full_edit.setReadOnly(True)
         self._full_edit.setPlaceholderText("吃饱图（双形态必选）")
@@ -497,6 +706,20 @@ class RoleImportDialog(QDialog):
         b_btn.clicked.connect(lambda: self._pick(self._base_edit, self._prev_base, "常态图"))
         b_row.addWidget(b_btn)
         root.addLayout(b_row)
+        # 多帧素材（v1.3.2）：多选图片 = 帧序列；视频/GIF 自动抽帧
+        fr_row = QHBoxLayout()
+        fr_row.addWidget(QLabel("多帧动画"))
+        m_btn = QPushButton("选多张图片…")
+        m_btn.clicked.connect(self._pick_multi)
+        v_btn = QPushButton("视频/GIF 抽帧…")
+        v_btn.clicked.connect(self._pick_video)
+        fr_row.addWidget(m_btn)
+        fr_row.addWidget(v_btn)
+        fr_row.addStretch(1)
+        root.addLayout(fr_row)
+        self._frames_status = QLabel("静态素材：也可选多张图片或视频/GIF 做帧动画")
+        self._frames_status.setWordWrap(True)
+        root.addWidget(self._frames_status)
         f_row = QHBoxLayout()
         f_row.addWidget(QLabel("吃饱图"))
         f_row.addWidget(self._full_edit, 1)
@@ -505,6 +728,7 @@ class RoleImportDialog(QDialog):
         f_row.addWidget(f_btn)
         root.addLayout(f_row)
         self._full_ctl = (self._full_edit, f_btn)
+        self._mat_btns = (b_btn, m_btn, v_btn, f_btn)  # 素材选择按钮：处理期间统一禁用防重入
 
         prev_row = QHBoxLayout()
         base_lay, self._prev_base = self._make_preview("常态")
@@ -555,88 +779,203 @@ class RoleImportDialog(QDialog):
         for w in self._full_ctl:
             w.setEnabled(dual)
 
+    def _set_busy(self, on, text="处理中…"):
+        """处理期间统一禁/启用导入、取消与全部素材选择按钮（防重入嵌套抽帧）。"""
+        self._ok.setEnabled(not on)
+        self._cancel.setEnabled(not on)
+        self._ok.setText(text if on else "导入")
+        for b in self._mat_btns:
+            b.setEnabled(not on)
+
+    def _validate_image(self, src, title):
+        """素材校验：存在/大小/可加载。返回 (pix, err)。"""
+        try:
+            if os.path.getsize(src) > self.MAX_BYTES:
+                return None, "文件超过 10MB，无法导入"
+            pix = QPixmap(src)
+            if pix.isNull():
+                return None, "无法加载该图片"
+        except Exception:
+            return None, "读取图片失败"
+        return pix, None
+
+    def _set_static(self, src):
+        """选择单张静态图：校验并更新编辑框/预览/命名；清除旧帧选择（M1）。"""
+        pix, err = self._validate_image(src, "常态图")
+        if pix is None:
+            _warn(self, "常态图", err)
+            return False
+        self._base_edit.setText(src)
+        self._frames_raw = []  # 换单图必须清掉旧帧，否则导入仍走旧帧（M1）
+        self._frames_video = False
+        self._name_hint = os.path.splitext(os.path.basename(src))[0]
+        self._frames_status.setText("静态素材：也可选多张图片或视频/GIF 做帧动画")
+        self._prev_base.setText("")
+        self._prev_base.setPixmap(pix.scaled(
+            240, 170, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        if not self._name_edit.text().strip():
+            self._name_edit.setText(os.path.splitext(os.path.basename(src))[0])
+        return True
+
     def _pick(self, edit, preview, title):
         src, _f = QFileDialog.getOpenFileName(
             self, "选择" + title, "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
         if not src:
             return
-        try:
-            if os.path.getsize(src) > self.MAX_BYTES:
-                _warn(self, title, "文件超过 10MB，无法导入")
-                return
-            pix = QPixmap(src)
-            if pix.isNull():
-                _warn(self, title, "无法加载该图片")
-                return
-        except Exception:
-            _warn(self, title, "读取图片失败")
+        if title == "常态图":
+            self._set_static(src)
+            return
+        pix, err = self._validate_image(src, title)
+        if pix is None:
+            _warn(self, title, err)
             return
         edit.setText(src)
         preview.setText("")
         preview.setPixmap(pix.scaled(240, 170, Qt.AspectRatioMode.KeepAspectRatio,
                                      Qt.TransformationMode.SmoothTransformation))
-        if title == "常态图" and not self._name_edit.text().strip():
-            self._name_edit.setText(os.path.splitext(os.path.basename(src))[0])
+
+    def _set_frames(self, raws, note, name_hint=None, video=False):
+        """设置帧序列：清空静态图，展示首帧预览与帧数状态。
+
+        video=True 表示同源帧（视频/GIF 抽帧）→ 导入走并集画布保留平移。
+        """
+        self._frames_raw = list(raws)
+        self._frames_video = bool(video)
+        self._name_hint = name_hint or os.path.splitext(os.path.basename(raws[0]))[0]
+        self._base_edit.clear()
+        self._frames_status.setText(note)
+        first = QPixmap(raws[0])
+        self._prev_base.setText("")
+        self._prev_base.setPixmap(first.scaled(
+            240, 170, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        if not self._name_edit.text().strip():
+            self._name_edit.setText(name_hint or os.path.splitext(os.path.basename(raws[0]))[0])
+
+    def _pick_multi(self):
+        files, _f = QFileDialog.getOpenFileNames(
+            self, "选择多张图片（按文件名排序作为帧序）", "",
+            "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if len(files) <= 1:
+            if files:
+                self._set_static(files[0])  # 单文件：与 _pick 同套校验（L9）
+            return
+        if len(files) > 24:
+            _warn(self, "多帧动画", "最多 24 帧，当前选了 %d 张" % len(files))
+            return
+        files = sorted(files)
+        self._set_frames(files, "已选 %d 帧（多选图片，按文件名排序）" % len(files),
+                         name_hint=os.path.splitext(os.path.basename(files[0]))[0])
+
+    def _pick_video(self):
+        src, _f = QFileDialog.getOpenFileName(
+            self, "选择视频/GIF 抽帧", "",
+            "视频 (*.mp4 *.webm *.mov *.avi *.mkv *.m4v *.wmv);;GIF (*.gif)")
+        if not src:
+            return
+        try:
+            if os.path.getsize(src) > 200 * 1024 * 1024:
+                _warn(self, "抽帧", "文件超过 200MB，太大啦")
+                return
+        except Exception:
+            pass
+        self._set_busy(True, text="抽帧中…")
+        self._frames_status.setText("正在抽帧……")
+        QApplication.processEvents()
+        raws, err = None, None
+        try:
+            if self._rawdir is None:
+                self._rawdir = tempfile.mkdtemp(prefix="role_raw_")
+            raws, err = _extract_video_frames(src, self._rawdir)
+        except Exception as e:
+            err = "抽帧失败：%s" % e
+        finally:
+            self._set_busy(False)
+        if err:
+            _warn(self, "抽帧", err)
+            return
+        self._set_frames(raws, "已抽 %d 帧（视频/GIF 均匀采样，导入时统一自动处理）" % len(raws),
+                         name_hint=os.path.splitext(os.path.basename(src))[0], video=True)
 
     def _do_import(self):
-        base_src = self._base_edit.text().strip()
-        if not base_src or not os.path.isfile(base_src):
-            _warn(self, "导入角色", "请先选择常态图")
-            return
         dual = self._dual.isChecked()
         full_src = self._full_edit.text().strip() if dual else ""
         if dual and (not full_src or not os.path.isfile(full_src)):
             _warn(self, "导入角色", "双形态需要提供「吃饱图」")
             return
-        # 大图去背景/裁剪要几秒：禁按钮（含取消，防处理中途关闭导致临时目录泄漏）
-        self._ok.setEnabled(False)
-        self._ok.setText("处理中…")
-        self._cancel.setEnabled(False)
+        base_src = self._base_edit.text().strip()
+        if not self._frames_raw and (not base_src or not os.path.isfile(base_src)):
+            _warn(self, "导入角色", "请先选择常态图或多帧素材")
+            return
+        # 大图去背景/裁剪要几秒：禁全部按钮（含素材选择，防重入/嵌套抽帧）
+        self._set_busy(True)
         self._notes.setText("正在自动处理素材（去背景 / 裁剪 / 缩放）……")
-        from PySide6.QtWidgets import QApplication
         QApplication.processEvents()
         try:
             self._tmpdir = tempfile.mkdtemp(prefix="role_prep_")
-            base_out = os.path.join(self._tmpdir, "role_base.png")
-            ok1, notes1 = _prepare_role_png(base_src, base_out)
-            if not ok1:
-                self._cleanup()
-                _warn(self, "导入角色", "常态图处理失败：%s" % notes1)
-                return
-            notes = ["常态图：%s" % ("、".join(notes1) if notes1 else "无需处理")]
+            frames_out = []
+            if self._frames_raw:
+                # 帧动画：统一画布处理（并集裁剪/逐帧居中），首帧即常态图
+                frames_out, notesf = _prepare_role_frames(
+                    self._frames_raw, self._tmpdir, same_size=bool(self._frames_video))
+                if frames_out is None:
+                    self._cleanup_tmp()  # 保留原始抽帧：失败后可重试（L3）
+                    _warn(self, "导入角色", "帧处理失败：%s" % notesf)
+                    return
+                base_out = frames_out[0]
+                notes = ["帧动画 %d 帧：%s" % (len(frames_out), "、".join(notesf))]
+            else:
+                base_out = os.path.join(self._tmpdir, "role_base.png")
+                ok1, notes1 = _prepare_role_png(base_src, base_out)
+                if not ok1:
+                    self._cleanup_tmp()
+                    _warn(self, "导入角色", "常态图处理失败：%s" % notes1)
+                    return
+                notes = ["常态图：%s" % ("、".join(notes1) if notes1 else "无需处理")]
             full_out = None
             if dual:
                 full_out = os.path.join(self._tmpdir, "role_full.png")
                 ok2, notes2 = _prepare_role_png(full_src, full_out)
                 if not ok2:
-                    self._cleanup()
+                    self._cleanup_tmp()
                     _warn(self, "导入角色", "吃饱图处理失败：%s" % notes2)
                     return
                 notes.append("吃饱图：%s" % ("、".join(notes2) if notes2 else "无需处理"))
             self._result = {
                 "name": self._name_edit.text().strip()
-                        or os.path.splitext(os.path.basename(base_src))[0],
+                        or getattr(self, "_name_hint", "") or "未命名",
                 "base": base_out,
                 "full": full_out,
+                "frames": frames_out or [],
                 "notes": notes,
             }
             self.accept()
+        except Exception as e:
+            self._cleanup_tmp()
+            _warn(self, "导入角色", "处理失败：%s" % e)
         finally:
-            self._ok.setEnabled(True)
-            self._ok.setText("导入")
-            self._cancel.setEnabled(True)
+            self._set_busy(False)
 
-    def _cleanup(self):
+    def _cleanup_tmp(self):
+        """只清理本次导入的处理临时目录（保留原始抽帧供失败重试）。"""
         if self._tmpdir:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
             self._tmpdir = None
 
+    def _cleanup(self):
+        self._cleanup_tmp()
+        if self._rawdir:
+            shutil.rmtree(self._rawdir, ignore_errors=True)
+            self._rawdir = None
+
     def closeEvent(self, event):
+        if not self._ok.isEnabled():
+            event.ignore()  # 处理中：忽略关闭，防止清理正在写入的临时目录
+            return
         self._cleanup()
         super().closeEvent(event)
 
     def result_data(self):
-        """accepted 后取处理结果：{"name","base","full","notes"} 或 None。"""
+        """accepted 后取处理结果：{"name","base","full","frames","notes"} 或 None。"""
         return self._result
 
 
@@ -730,7 +1069,9 @@ class RolePanel(QWidget):
                 except Exception:
                     pass
             mark = " [当前]" if role["id"] == active else ""
-            form_text = "双形态" if (role.get("file_full") or role.get("form") == "dual") else "单形态"
+            form_text = ("双形态" if (role.get("file_full") or role.get("form") == "dual") else "单形态")
+            if role.get("frames"):
+                form_text += "+%d帧" % len(role["frames"])
             it = QListWidgetItem("%s  %s  %s  %s%s" % (role["name"], size_text, form_text, role.get("added", ""), mark))
             it.setData(Qt.ItemDataRole.UserRole, role["id"])
             self._list.addItem(it)
@@ -807,15 +1148,20 @@ class RolePanel(QWidget):
             data = dlg.result_data()
             if not data:
                 return
-            role, err = self._lib.import_processed(data["base"], data["full"], data["name"])
+            role, err = self._lib.import_processed(data["base"], data["full"], data["name"],
+                                                   frames_src=data.get("frames") or None)
             if role is None:
                 _warn(self._parent_widget(), "导入角色", err or "导入失败")
                 return
             _call(self._pet, "apply_role", role["id"])  # 导入即切换为新角色
             self._refresh()
-            tip = ("双形态角色：喂食后会在常态/吃饱之间切换形象。"
-                   if data["full"] else "单形态角色：两形态显示同一张图；"
-                   "想升级双形态，请重新导入并选择「双形态」。")
+            if data.get("frames"):
+                tip = ("帧动画角色：待机时循环播放 %d 帧；喂食后显示吃饱形态。"
+                       % len(data["frames"]))
+            else:
+                tip = ("双形态角色：喂食后会在常态/吃饱之间切换形象。"
+                       if data["full"] else "单形态角色：两形态显示同一张图；"
+                       "想升级双形态，请重新导入并选择「双形态」。")
             _info(self._parent_widget(), "导入角色",
                   "导入成功！\n\n· %s\n\n%s" % ("\n· ".join(data["notes"]), tip))
         finally:

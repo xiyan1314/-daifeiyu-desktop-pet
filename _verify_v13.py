@@ -13,6 +13,12 @@ import time
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")  # 中文 Windows 默认 GBK：print 带 ¥ 会崩
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# env 变量对 stdio 无效（启动时已定死编码）：直接 reconfigure
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
@@ -174,6 +180,130 @@ def main_flow():
         check("single sprites equal",
               pet.sprites["full"]["side"].cacheKey() == pet.sprites["normal"]["side"].cacheKey())
         pet.apply_role("")
+
+    # ---- 2c. 多帧素材 / 视频抽帧（v1.3.2）----
+    frame_pngs = []
+    for i in range(3):
+        fp_src = os.path.join(_tmp, "fr%d.png" % i)
+        make_test_png(fp_src, 128 + i * 8, 128 + i * 8)
+        fp_out = os.path.join(_tmp, "fr%d_proc.png" % i)
+        okfp, _n = pet_dialogs._prepare_role_png(fp_src, fp_out)
+        check("frame prep %d" % i, okfp)
+        frame_pngs.append(fp_out)
+    frole, errf = pet.role_lib.import_processed(frame_pngs[0], None, "帧动画测试", frames_src=frame_pngs)
+    check("import frames", frole is not None and errf is None, "err=%r" % (errf,))
+    if frole:
+        check("frames recorded", len(frole.get("frames", [])) == 3
+              and len(pet.role_lib.frames_for(frole["id"])) == 3)
+        lib3 = main.pet_resources.RoleLibrary(_tmp)
+        check("reload keeps frames", len(lib3.frames_for(frole["id"])) == 3)
+        pet.apply_role(frole["id"])
+        check("frames role animates", pet._custom_role and pet.has_frames
+              and pet.anim._sets.get("idle") is not None
+              and len(pet.anim._sets["idle"]) == 3)
+        pet.feed("小鱼干")
+        t0 = time.time()
+        while pet.busy and time.time() - t0 < 3:
+            app.processEvents()
+            time.sleep(0.02)
+        check("frames feed ok", pet.form == "full")
+        pet._set_form("normal")
+        fpaths = list(pet.role_lib.frames_for(frole["id"]))
+        okfd, _errfd = pet.role_lib.delete(frole["id"])
+        check("frames delete files", okfd and all(not os.path.exists(p) for p in fpaths))
+        pet.apply_role("")
+        # 帧数边界：1 帧 / 25 帧拒绝
+        rmin, emin = pet.role_lib.import_processed(frame_pngs[0], None, "边界", frames_src=[frame_pngs[0]])
+        check("frames min2 rejected", rmin is None and "至少需要 2 帧" in (emin or ""), "err=%r" % (emin,))
+        rmax, emax = pet.role_lib.import_processed(frame_pngs[0], None, "边界2", frames_src=[frame_pngs[0]] * 25)
+        check("frames max24 rejected", rmax is None and "最多 24 帧" in (emax or ""), "err=%r" % (emax,))
+    # 抽帧错误路径：单帧 GIF / 假视频
+    from PySide6.QtGui import QImageWriter
+    gif1 = os.path.join(_tmp, "one.gif")
+    img1 = QImage(64, 64, QImage.Format.Format_ARGB32)
+    img1.fill(0)
+    w = QImageWriter(gif1, b"gif")
+    w.write(img1)
+    rawdir = tempfile.mkdtemp(prefix="role_raw_")
+    raws, errg = pet_dialogs._extract_video_frames(gif1, rawdir)
+    # offscreen 下 QImageWriter 写的 GIF 可能被 QMovie 判为无效：只断言拒绝路径
+    check("gif rejected", raws is None and bool(errg), "err=%r" % (errg,))
+    fake = os.path.join(_tmp, "fake.mp4")
+    with open(fake, "wb") as fh:
+        fh.write(b"not a video")
+    raws2, errv = pet_dialogs._extract_video_frames(fake, rawdir)
+    check("fake video rejected", raws2 is None, "err=%r" % (errv,))
+    shutil.rmtree(rawdir, ignore_errors=True)
+    # 正向抽帧（真实素材；S1 回归）：视频与多帧 GIF 都要能抽出 ≥2 帧
+    vid = os.path.join(HERE, "_verify_assets", "sample.mp4")
+    gif3 = os.path.join(HERE, "_verify_assets", "sample.gif")
+    if os.path.isfile(vid):
+        rd2 = tempfile.mkdtemp(prefix="role_raw2_")
+        raws3, errv2 = pet_dialogs._extract_video_frames(vid, rd2)
+        check("video extract positive", raws3 is not None and len(raws3) >= 2
+              and all(os.path.isfile(p) for p in raws3),
+              "n=%s err=%r" % (len(raws3) if raws3 else 0, errv2))
+        shutil.rmtree(rd2, ignore_errors=True)
+    else:
+        check("video extract positive", False, "missing _verify_assets/sample.mp4")
+    if os.path.isfile(gif3):
+        rd3 = tempfile.mkdtemp(prefix="role_raw3_")
+        raws4, errg2 = pet_dialogs._extract_video_frames(gif3, rd3)
+        check("gif extract positive", raws4 is not None and len(raws4) >= 2
+              and all(os.path.isfile(p) for p in raws4),
+              "n=%s err=%r" % (len(raws4) if raws4 else 0, errg2))
+        shutil.rmtree(rd3, ignore_errors=True)
+    else:
+        check("gif extract positive", False, "missing _verify_assets/sample.gif")
+    # 统一画布：同源帧（平移保留）与多图帧（居中画布）输出尺寸一致
+    if os.path.isfile(vid):
+        rd4 = tempfile.mkdtemp(prefix="role_prep4_")
+        raws5, _e = pet_dialogs._extract_video_frames(vid, rd4)
+        if raws5:
+            outs, notesu = pet_dialogs._prepare_role_frames(raws5, rd4, same_size=True)
+            check("union canvas uniform", outs is not None and len(outs) == len(raws5),
+                  "notes=%r" % (notesu,))
+            if outs:
+                from PySide6.QtGui import QImage as _QI
+                dims = {( _QI(p).width(), _QI(p).height()) for p in outs}
+                check("union canvas same dims", len(dims) == 1, "dims=%r" % (dims,))
+        shutil.rmtree(rd4, ignore_errors=True)
+        # 向导接线（高-1 回归）：_pick_video → frames_video=True → _do_import 传 same_size=True
+        from PySide6.QtWidgets import QFileDialog
+        real_gofn = QFileDialog.getOpenFileName
+        real_prep = pet_dialogs._prepare_role_frames
+        real_warn = pet_dialogs._warn
+        calls = []
+        def _rec(srcs, out_dir, same_size=True):
+            calls.append(bool(same_size))
+            return real_prep(srcs, out_dir, same_size)
+        pet_dialogs._prepare_role_frames = _rec
+        pet_dialogs._warn = lambda *a, **k: None
+        QFileDialog.getOpenFileName = lambda *a, **k: (vid, "")
+        try:
+            wdlg = pet_dialogs.RoleImportDialog(pet)
+            wdlg._pick_video()
+            check("wizard video flag", wdlg._frames_video is True)
+            wdlg._do_import()
+            dataw = wdlg.result_data()
+            check("wizard union path", bool(calls) and calls[-1] is True, "calls=%r" % (calls,))
+            check("wizard frames result", dataw is not None and len(dataw.get("frames", [])) >= 2)
+            wdlg.close()
+        except Exception as e:
+            check("wizard video flow", False, repr(e))
+        finally:
+            QFileDialog.getOpenFileName = real_gofn
+            pet_dialogs._prepare_role_frames = real_prep
+            pet_dialogs._warn = real_warn
+    # 多图路径：不同尺寸两帧 → 输出同尺寸（居中画布）
+    rd6 = tempfile.mkdtemp(prefix="role_prep6_")
+    outs_m, notes_m = pet_dialogs._prepare_role_frames([out1, out2], rd6, same_size=False)
+    check("multi canvas uniform", outs_m is not None and len(outs_m) == 2, "err=%r" % (notes_m,))
+    if outs_m:
+        from PySide6.QtGui import QImage as _QI2
+        dims_m = {(_QI2(p).width(), _QI2(p).height()) for p in outs_m}
+        check("multi canvas same dims", len(dims_m) == 1, "dims=%r" % (dims_m,))
+    shutil.rmtree(rd6, ignore_errors=True)
 
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
