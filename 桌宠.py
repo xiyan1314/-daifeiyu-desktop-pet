@@ -47,7 +47,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -1036,7 +1036,7 @@ class PetWindow(QWidget):
         self.flip = 1  # 1 = 朝左，-1 = 朝右
         self.busy = False
         self.walk_phase = 0
-        self._walk_interval = 60
+        self._walk_interval = 80  # 跟随/散步 tick 间隔（v1.4.1 放缓，更好点住）
         self._wander_target = None
         self._tween_anim = None
         self._fly_timer = None
@@ -1977,7 +1977,7 @@ class PetWindow(QWidget):
         self.cfg["follow_mouse"] = bool(on)
         if on:
             self.cfg["wander"] = False
-            self._walk_interval = 60
+            self._walk_interval = 80
             if self._wander_act:
                 self._wander_act.setChecked(False)
         save_config(self.cfg)
@@ -2029,9 +2029,10 @@ class PetWindow(QWidget):
         dy = target.y() - cur.y()
         if abs(dx) < 3 and abs(dy) < 3:
             return
-        # 缓动：每 tick 走剩余距离的 35%（至少 2px），远处快、近处慢，接近「追过去」
-        step_x = max(2, int(abs(dx) * 0.35))
-        step_y = max(2, int(abs(dy) * 0.35))
+        # 缓动（v1.4.1 降速）：每 tick 走剩余距离 15%、上限 14px——
+        # 远处快近处慢，但不再瞬移到鼠标/目标上，用户能追上点住它
+        step_x = min(14, max(1, int(abs(dx) * 0.15)))
+        step_y = min(14, max(1, int(abs(dy) * 0.15)))
         nx = cur.x() + (min(step_x, abs(dx)) if dx > 0 else -min(step_x, abs(dx)))
         ny = cur.y() + (min(step_y, abs(dy)) if dy > 0 else -min(step_y, abs(dy)))
         self.move(nx, ny)
