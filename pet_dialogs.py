@@ -14,8 +14,8 @@
 - modal(dlg)：加 WindowStaysOnTopHint + show/raise_/activateWindow/setFocus
   后 exec（应对 Windows 前台锁，参考主程序 _set_api_key）。
 - class RolePanel(QWidget)：角色列表 + 预览 + 导入 / 设为当前 / 删除 / 恢复默认。
-- class RoleImportDialog(QDialog)：角色导入向导——单形态（一张图）/
-  双形态（常态+吃饱两张图）由用户选择，素材自动处理（去背景/裁剪/缩放）；
+- class RoleImportDialog(QDialog)：角色导入向导——1~8 个形态自由增删、
+  每个形态独立命名选图；素材自动处理（去背景/裁剪/缩放）；
   支持多帧动画素材（多选图片 = 帧序列、视频/GIF 自动抽帧，统一画布处理）。
 - class SoundPanel(QWidget)：音频片段列表（试听 / 导入 / 重命名 / 删除）+
   自定义音效组 5 行槽位（默认 / 静音 / 片段）。
@@ -42,9 +42,9 @@
 
 实现要点：
 - 不 import 桌宠.py（避免循环依赖）；顶层 import PySide6 没问题。
-- 所有对话框统一 DIALOG_QSS 深色主题；角色导入支持单 / 双形态：
-  单形态一张图、双形态常态 + 吃饱两张图，素材导入时自动处理
-  （无透明通道自动去背景、裁剪透明边距、超大图等比缩小）。
+- 所有对话框统一 DIALOG_QSS 深色主题；角色导入支持多形态（1~8 个，
+  名字自定义），素材导入时自动处理（无透明通道自动去背景、裁剪透明边距、
+  超大图等比缩小）。
 - 金额统一 "%.2f" 显示，表格金额列右对齐。
 
 Python 3.8+ 兼容。
@@ -651,7 +651,7 @@ def _extract_video_frames(src, out_dir):
 
 # ---------------- 角色导入向导 ----------------
 class RoleImportDialog(QDialog):
-    """导入角色向导：单形态（一张图）/ 双形态（常态+吃饱两张图）由用户自选。
+    """导入角色向导：1~8 个形态自由增删、每个形态独立命名选图（喂食循环切换）。
 
     素材支持静态图与多帧动画（多选图片 / 视频-GIF 抽帧）；
     点「导入」时自动处理（去背景/裁剪/缩放，静态走 _prepare_role_png、
@@ -678,34 +678,22 @@ class RoleImportDialog(QDialog):
         name_row.addWidget(self._name_edit, 1)
         root.addLayout(name_row)
 
-        mode_row = QHBoxLayout()
-        self._single = QRadioButton("单形态（只有一张图）")
-        self._dual = QRadioButton("双形态（常态 + 吃饱 两张图）")
-        self._single.setChecked(True)
-        self._single.toggled.connect(self._on_mode)
-        self._dual.toggled.connect(self._on_mode)
-        mode_row.addWidget(self._single)
-        mode_row.addWidget(self._dual)
-        mode_row.addStretch(1)
-        root.addLayout(mode_row)
-
-        self._base_edit = QLineEdit()
-        self._base_edit.setReadOnly(True)
-        self._base_edit.setPlaceholderText("常态图（静态素材）")
         self._frames_raw = []   # 原始帧 png 路径（多选图片 / 视频抽帧）
         self._frames_video = False  # 帧是否来自同源视频/GIF（并集画布）
         self._name_hint = ""    # 素材源文件名（名字回退用，避免 raw_f00 当角色名）
         self._rawdir = None     # 抽帧临时目录
-        self._full_edit = QLineEdit()
-        self._full_edit.setReadOnly(True)
-        self._full_edit.setPlaceholderText("吃饱图（双形态必选）")
-        b_row = QHBoxLayout()
-        b_row.addWidget(QLabel("常态图"))
-        b_row.addWidget(self._base_edit, 1)
-        b_btn = QPushButton("浏览…")
-        b_btn.clicked.connect(lambda: self._pick(self._base_edit, self._prev_base, "常态图"))
-        b_row.addWidget(b_btn)
-        root.addLayout(b_row)
+        # 形态列表（v1.4 多形态：1~8 个、名字自定义，喂食依次切换、12 秒后回第一形态）
+        forms_head = QHBoxLayout()
+        forms_head.addWidget(QLabel("形态（可改名；喂食依次切换，12 秒后回第一形态）"))
+        self._add_form_btn = QPushButton("＋ 添加形态")
+        self._add_form_btn.clicked.connect(self._add_form)
+        forms_head.addStretch(1)
+        forms_head.addWidget(self._add_form_btn)
+        root.addLayout(forms_head)
+        self._form_rows = []   # [{"name": str, "src": str}]，名字在导入时从控件读取
+        self._forms_box = QVBoxLayout()
+        root.addLayout(self._forms_box)
+        self._add_form("常态")
         # 多帧素材（v1.3.2）：多选图片 = 帧序列；视频/GIF 自动抽帧
         fr_row = QHBoxLayout()
         fr_row.addWidget(QLabel("多帧动画"))
@@ -720,19 +708,11 @@ class RoleImportDialog(QDialog):
         self._frames_status = QLabel("静态素材：也可选多张图片或视频/GIF 做帧动画")
         self._frames_status.setWordWrap(True)
         root.addWidget(self._frames_status)
-        f_row = QHBoxLayout()
-        f_row.addWidget(QLabel("吃饱图"))
-        f_row.addWidget(self._full_edit, 1)
-        f_btn = QPushButton("浏览…")
-        f_btn.clicked.connect(lambda: self._pick(self._full_edit, self._prev_full, "吃饱图"))
-        f_row.addWidget(f_btn)
-        root.addLayout(f_row)
-        self._full_ctl = (self._full_edit, f_btn)
-        self._mat_btns = (b_btn, m_btn, v_btn, f_btn)  # 素材选择按钮：处理期间统一禁用防重入
+        self._mat_btns = (m_btn, v_btn, self._add_form_btn)  # 素材选择按钮：处理期间统一禁用防重入
 
         prev_row = QHBoxLayout()
-        base_lay, self._prev_base = self._make_preview("常态")
-        full_lay, self._prev_full = self._make_preview("吃饱（双形态）")
+        base_lay, self._prev_base = self._make_preview("形态 1（待机/动画）")
+        full_lay, self._prev_full = self._make_preview("形态 2（若有）")
         prev_row.addLayout(base_lay)
         prev_row.addLayout(full_lay)
         root.addLayout(prev_row)
@@ -751,8 +731,6 @@ class RoleImportDialog(QDialog):
         btns.addWidget(self._ok)
         btns.addWidget(self._cancel)
         root.addLayout(btns)
-
-        self._on_mode()
 
     @staticmethod
     def _make_preview(title):
@@ -774,10 +752,75 @@ class RoleImportDialog(QDialog):
         lay.addWidget(prev, 0, Qt.AlignmentFlag.AlignCenter)
         return lay, prev
 
-    def _on_mode(self):
-        dual = self._dual.isChecked()
-        for w in self._full_ctl:
-            w.setEnabled(dual)
+    def _form_views(self):
+        """按 _form_rows 重建形态行（≤8 行，重建成本可忽略）。"""
+        for i in reversed(range(self._forms_box.count())):
+            w = self._forms_box.itemAt(i).widget()
+            if w is not None:
+                w.deleteLater()
+        for i, fr in enumerate(self._form_rows):
+            row_w = QWidget()
+            lay = QHBoxLayout(row_w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            name_edit = QLineEdit(fr["name"])
+            name_edit.setFixedWidth(90)
+            name_edit.setMaxLength(12)  # 与库侧截断一致，超长不再静默丢失
+            name_edit.setPlaceholderText("形态%d" % (i + 1))
+            file_edit = QLineEdit(fr.get("src", ""))
+            file_edit.setReadOnly(True)
+            file_edit.setPlaceholderText("第 %d 形态图（必选）" % (i + 1))
+            pick = QPushButton("浏览…")
+            pick.clicked.connect(lambda _c=False, fi=i: self._pick_form(fi))
+            rem = QPushButton("✕")
+            rem.setFixedWidth(28)
+            rem.clicked.connect(lambda _c=False, fi=i: self._del_form(fi))
+            lay.addWidget(name_edit)
+            lay.addWidget(file_edit, 1)
+            lay.addWidget(pick)
+            lay.addWidget(rem)
+            self._forms_box.addWidget(row_w)
+            fr["name_edit"] = name_edit
+            fr["file_edit"] = file_edit
+
+    def _add_form(self, name=""):
+        if len(self._form_rows) >= 8:
+            _warn(self, "形态", "最多 8 个形态")
+            return
+        self._form_rows.append({"name": name or "形态%d" % (len(self._form_rows) + 1), "src": ""})
+        self._form_views()
+
+    def _del_form(self, i):
+        if len(self._form_rows) <= 1:
+            _warn(self, "形态", "至少保留 1 个形态")
+            return
+        self._form_rows.pop(i)
+        self._form_views()
+
+    def _pick_form(self, i):
+        src, _f = QFileDialog.getOpenFileName(
+            self, "选择第 %d 形态图" % (i + 1), "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not src:
+            return
+        if i == 0:
+            self._apply_static_form(src)  # 形态 0 与静态图同源：清帧 + 命名回退
+            return
+        pix, err = self._validate_image(src, "形态图")
+        if pix is None:
+            _warn(self, "形态图", err)
+            return
+        self._form_rows[i]["src"] = src
+        self._form_views()
+        # 预览：形态 0 → 左框；形态 1 → 右框；其余不重复预览
+        if i == 0:
+            self._prev_base.setText("")
+            self._prev_base.setPixmap(pix.scaled(240, 170, Qt.AspectRatioMode.KeepAspectRatio,
+                                                 Qt.TransformationMode.SmoothTransformation))
+        elif i == 1:
+            self._prev_full.setText("")
+            self._prev_full.setPixmap(pix.scaled(240, 170, Qt.AspectRatioMode.KeepAspectRatio,
+                                                 Qt.TransformationMode.SmoothTransformation))
+        if not self._name_edit.text().strip() and i == 0:
+            self._name_edit.setText(os.path.splitext(os.path.basename(src))[0])
 
     def _set_busy(self, on, text="处理中…"):
         """处理期间统一禁/启用导入、取消与全部素材选择按钮（防重入嵌套抽帧）。"""
@@ -799,13 +842,16 @@ class RoleImportDialog(QDialog):
             return None, "读取图片失败"
         return pix, None
 
-    def _set_static(self, src):
-        """选择单张静态图：校验并更新编辑框/预览/命名；清除旧帧选择（M1）。"""
-        pix, err = self._validate_image(src, "常态图")
+    def _apply_static_form(self, src):
+        """校验并写入形态 0 + 预览 + 清帧选择（形态行选择与多选单文件共用）。"""
+        pix, err = self._validate_image(src, "形态图")
         if pix is None:
-            _warn(self, "常态图", err)
+            _warn(self, "形态图", err)
             return False
-        self._base_edit.setText(src)
+        if not self._form_rows:
+            self._add_form("常态")
+        self._form_rows[0]["src"] = src
+        self._form_views()
         self._frames_raw = []  # 换单图必须清掉旧帧，否则导入仍走旧帧（M1）
         self._frames_video = False
         self._name_hint = os.path.splitext(os.path.basename(src))[0]
@@ -817,23 +863,6 @@ class RoleImportDialog(QDialog):
             self._name_edit.setText(os.path.splitext(os.path.basename(src))[0])
         return True
 
-    def _pick(self, edit, preview, title):
-        src, _f = QFileDialog.getOpenFileName(
-            self, "选择" + title, "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
-        if not src:
-            return
-        if title == "常态图":
-            self._set_static(src)
-            return
-        pix, err = self._validate_image(src, title)
-        if pix is None:
-            _warn(self, title, err)
-            return
-        edit.setText(src)
-        preview.setText("")
-        preview.setPixmap(pix.scaled(240, 170, Qt.AspectRatioMode.KeepAspectRatio,
-                                     Qt.TransformationMode.SmoothTransformation))
-
     def _set_frames(self, raws, note, name_hint=None, video=False):
         """设置帧序列：清空静态图，展示首帧预览与帧数状态。
 
@@ -842,7 +871,6 @@ class RoleImportDialog(QDialog):
         self._frames_raw = list(raws)
         self._frames_video = bool(video)
         self._name_hint = name_hint or os.path.splitext(os.path.basename(raws[0]))[0]
-        self._base_edit.clear()
         self._frames_status.setText(note)
         first = QPixmap(raws[0])
         self._prev_base.setText("")
@@ -857,7 +885,7 @@ class RoleImportDialog(QDialog):
             "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
         if len(files) <= 1:
             if files:
-                self._set_static(files[0])  # 单文件：与 _pick 同套校验（L9）
+                self._apply_static_form(files[0])  # 单文件：同套校验（L9）
             return
         if len(files) > 24:
             _warn(self, "多帧动画", "最多 24 帧，当前选了 %d 张" % len(files))
@@ -897,14 +925,19 @@ class RoleImportDialog(QDialog):
                          name_hint=os.path.splitext(os.path.basename(src))[0], video=True)
 
     def _do_import(self):
-        dual = self._dual.isChecked()
-        full_src = self._full_edit.text().strip() if dual else ""
-        if dual and (not full_src or not os.path.isfile(full_src)):
-            _warn(self, "导入角色", "双形态需要提供「吃饱图」")
-            return
-        base_src = self._base_edit.text().strip()
-        if not self._frames_raw and (not base_src or not os.path.isfile(base_src)):
-            _warn(self, "导入角色", "请先选择常态图或多帧素材")
+        # 收集形态（名字从控件实时读）
+        forms = []
+        for i, fr in enumerate(self._form_rows):
+            nm = (fr.get("name_edit") and fr["name_edit"].text().strip()) or ("形态%d" % (i + 1))
+            src = fr.get("src", "")
+            if i == 0 and self._frames_raw:
+                src = ""  # 帧动画角色：形态 0 用首帧，不要求选图
+            elif not src or not os.path.isfile(src):
+                _warn(self, "导入角色", "第 %d 形态还没选图" % (i + 1))
+                return
+            forms.append((nm, src))
+        if not forms:
+            _warn(self, "导入角色", "请先添加形态并选图")
             return
         # 大图去背景/裁剪要几秒：禁全部按钮（含素材选择，防重入/嵌套抽帧）
         self._set_busy(True)
@@ -914,7 +947,7 @@ class RoleImportDialog(QDialog):
             self._tmpdir = tempfile.mkdtemp(prefix="role_prep_")
             frames_out = []
             if self._frames_raw:
-                # 帧动画：统一画布处理（并集裁剪/逐帧居中），首帧即常态图
+                # 帧动画：统一画布处理（并集裁剪/逐帧居中），首帧即形态 0
                 frames_out, notesf = _prepare_role_frames(
                     self._frames_raw, self._tmpdir, same_size=bool(self._frames_video))
                 if frames_out is None:
@@ -923,29 +956,32 @@ class RoleImportDialog(QDialog):
                     return
                 base_out = frames_out[0]
                 notes = ["帧动画 %d 帧：%s" % (len(frames_out), "、".join(notesf))]
+                forms_out = [(forms[0][0], base_out)]
             else:
                 base_out = os.path.join(self._tmpdir, "role_base.png")
-                ok1, notes1 = _prepare_role_png(base_src, base_out)
+                ok1, notes1 = _prepare_role_png(forms[0][1], base_out)
                 if not ok1:
                     self._cleanup_tmp()
-                    _warn(self, "导入角色", "常态图处理失败：%s" % notes1)
+                    _warn(self, "导入角色", "第 1 形态处理失败：%s" % notes1)
                     return
-                notes = ["常态图：%s" % ("、".join(notes1) if notes1 else "无需处理")]
-            full_out = None
-            if dual:
-                full_out = os.path.join(self._tmpdir, "role_full.png")
-                ok2, notes2 = _prepare_role_png(full_src, full_out)
-                if not ok2:
+                notes = ["第 1 形态：%s" % ("、".join(notes1) if notes1 else "无需处理")]
+                forms_out = [(forms[0][0], base_out)]
+            # 其余形态逐个处理
+            for i, (nm, src) in enumerate(forms[1:], start=1):
+                fp = os.path.join(self._tmpdir, "form%d.png" % i)
+                okf, notesf = _prepare_role_png(src, fp)
+                if not okf:
                     self._cleanup_tmp()
-                    _warn(self, "导入角色", "吃饱图处理失败：%s" % notes2)
+                    _warn(self, "导入角色", "第 %d 形态处理失败：%s" % (i + 1, notesf))
                     return
-                notes.append("吃饱图：%s" % ("、".join(notes2) if notes2 else "无需处理"))
+                forms_out.append((nm, fp))
+                notes.append("第 %d 形态（%s）：%s" % (i + 1, nm, "、".join(notesf) if notesf else "无需处理"))
             self._result = {
                 "name": self._name_edit.text().strip()
                         or getattr(self, "_name_hint", "") or "未命名",
                 "base": base_out,
-                "full": full_out,
                 "frames": frames_out or [],
+                "forms": forms_out,
                 "notes": notes,
             }
             self.accept()
@@ -975,7 +1011,7 @@ class RoleImportDialog(QDialog):
         super().closeEvent(event)
 
     def result_data(self):
-        """accepted 后取处理结果：{"name","base","full","frames","notes"} 或 None。"""
+        """accepted 后取处理结果：{"name","base","frames","forms","notes"} 或 None。"""
         return self._result
 
 
@@ -1012,7 +1048,7 @@ class RolePanel(QWidget):
         root.addLayout(left, 1)
 
         right = QVBoxLayout()
-        cap1 = QLabel("常态")
+        cap1 = QLabel("形态 1")
         cap1.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right.addWidget(cap1)
         self._preview = QLabel("预览")
@@ -1022,7 +1058,7 @@ class RolePanel(QWidget):
             "background-color:#2e3560;border:1px solid #3d477f;"
             "border-radius:8px;color:#8f97c0;")
         right.addWidget(self._preview)
-        cap2 = QLabel("吃饱")
+        cap2 = QLabel("形态 2")
         cap2.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right.addWidget(cap2)
         self._preview_full = QLabel("预览")
@@ -1069,7 +1105,8 @@ class RolePanel(QWidget):
                 except Exception:
                     pass
             mark = " [当前]" if role["id"] == active else ""
-            form_text = ("双形态" if (role.get("file_full") or role.get("form") == "dual") else "单形态")
+            nf = len(role.get("forms") or [])
+            form_text = ("%d形态" % nf) if nf >= 2 else "单形态"
             if role.get("frames"):
                 form_text += "+%d帧" % len(role["frames"])
             it = QListWidgetItem("%s  %s  %s  %s%s" % (role["name"], size_text, form_text, role.get("added", ""), mark))
@@ -1120,25 +1157,34 @@ class RolePanel(QWidget):
                     self._preview_full.setPixmap(pf.scaled(
                         200, 200, Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation))
-                    self._meta.setText("%dx%d · 双形态" % (pix.width(), pix.height()))
+                    self._meta.setText(self._meta_text(rid, pix))
                 else:
                     self._preview_full.setPixmap(QPixmap())
-                    self._preview_full.setText("吃饱图无法预览")
-                    self._meta.setText("%dx%d · 双形态" % (pix.width(), pix.height()))
+                    self._preview_full.setText("形态 2 无法预览")
+                    self._meta.setText(self._meta_text(rid, pix))
             except Exception:
                 self._preview_full.setPixmap(QPixmap())
                 self._preview_full.setText("吃饱图无法预览")
         else:
             self._preview_full.setPixmap(QPixmap())
-            self._preview_full.setText("单形态：无吃饱图")
-            self._meta.setText("%dx%d · 单形态" % (pix.width(), pix.height()))
+            self._preview_full.setText("单形态：无第二形态")
+            self._meta.setText(self._meta_text(rid, pix))
 
     def _parent_widget(self):
         return self._pet if isinstance(self._pet, QWidget) else self
 
+    def _meta_text(self, rid, pix):
+        """预览元信息：尺寸 + 形态数（≥3 形态注明仅预览前 2 个）。"""
+        nf = len(self._lib.form_metas(rid)) if self._lib else 0
+        if nf <= 1:
+            return "%dx%d · 单形态" % (pix.width(), pix.height())
+        if nf == 2:
+            return "%dx%d · 双形态" % (pix.width(), pix.height())
+        return "%dx%d · %d形态（仅预览前 2 个）" % (pix.width(), pix.height(), nf)
+
     # ---------- 动作 ----------
     def _import(self):
-        """导入角色：弹出向导（单/双形态自选 + 素材自动处理）→ 落库 → 切换。"""
+        """导入角色：弹出向导（多形态自定 + 素材自动处理）→ 落库 → 切换。"""
         if self._lib is None:
             return
         dlg = RoleImportDialog(self._parent_widget())
@@ -1148,20 +1194,24 @@ class RolePanel(QWidget):
             data = dlg.result_data()
             if not data:
                 return
-            role, err = self._lib.import_processed(data["base"], data["full"], data["name"],
-                                                   frames_src=data.get("frames") or None)
+            forms_src = data.get("forms") or None
+            role, err = self._lib.import_processed(data["base"], None, data["name"],
+                                                   frames_src=data.get("frames") or None,
+                                                   forms_src=forms_src)
             if role is None:
                 _warn(self._parent_widget(), "导入角色", err or "导入失败")
                 return
             _call(self._pet, "apply_role", role["id"])  # 导入即切换为新角色
             self._refresh()
+            n_forms = len(forms_src or [])
             if data.get("frames"):
-                tip = ("帧动画角色：待机时循环播放 %d 帧；喂食后显示吃饱形态。"
-                       % len(data["frames"]))
+                tip = ("帧动画角色：待机循环播放 %d 帧；喂食在 %d 个形态间切换，12 秒后回第一形态。"
+                       % (len(data["frames"]), max(1, n_forms)))
+            elif n_forms >= 2:
+                tip = ("%d 形态角色：喂食依次切换形态，12 秒后回「%s」。"
+                       % (n_forms, forms_src[0][0]))
             else:
-                tip = ("双形态角色：喂食后会在常态/吃饱之间切换形象。"
-                       if data["full"] else "单形态角色：两形态显示同一张图；"
-                       "想升级双形态，请重新导入并选择「双形态」。")
+                tip = "单形态角色：喂食后仍是同一形象（可重新导入添加更多形态）。"
             _info(self._parent_widget(), "导入角色",
                   "导入成功！\n\n· %s\n\n%s" % ("\n· ".join(data["notes"]), tip))
         finally:
@@ -1282,7 +1332,8 @@ class SoundPanel(QWidget):
             cb.addItem("默认")
             cb.addItem("静音")
             for f in frags:
-                cb.addItem(f["name"])
+                label = f["name"] + ("（仅试听）" if str(f.get("ext", "")).lower() != ".wav" else "")
+                cb.addItem(label)
             val = slots.get(kind) if slots else None
             if val == "":
                 cb.setCurrentIndex(1)

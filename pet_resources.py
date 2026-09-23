@@ -90,9 +90,37 @@ def _write_json(path, data):
         return str(e)
 
 
+def _probe_png(path):
+    """stdlib PNG 校验：魔数 + IHDR 尺寸合理。返回 (ok, err)。"""
+    try:
+        with open(path, "rb") as f:
+            if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                return False, "不是有效的 PNG 文件"
+            head = f.read(25)  # IHDR 长度(4) + 类型(4) + 数据(13) + CRC(4)
+            if len(head) < 25 or head[4:8] != b"IHDR":
+                return False, "PNG 头损坏"
+            w = int.from_bytes(head[8:12], "big")
+            h = int.from_bytes(head[12:16], "big")
+            if w <= 0 or h <= 0 or w > 100000 or h > 100000:
+                return False, "PNG 尺寸非法"
+        return True, ""
+    except Exception as e:
+        return False, "无法读取：%s" % e
+
+
 def _new_id():
     """生成片段/角色 id：8 位十六进制 uuid 前缀 + 时间戳，保证文件名安全且唯一。"""
     return uuid.uuid4().hex[:8] + "_" + str(int(time.time()))
+
+
+def _probe_wav_ok(path):
+    """WAV 头校验：PCM 且参数合理。返回 bool。"""
+    try:
+        with wave.open(path, "rb") as wf:
+            nch, sw, fr, nf, ct, _ = wf.getparams()
+        return ct == "NONE" and 0 < nf <= 25_000_000 and fr > 0 and nch > 0 and sw in (1, 2, 4)
+    except Exception:
+        return False
 
 
 def _wav_duration(path):
@@ -140,12 +168,33 @@ class RoleLibrary:
             if not isinstance(frames, list):
                 frames = []
             frames = [str(x) for x in frames if str(x).lower().endswith(".png")][:60]
+            # forms 归一化（v1.4 多形态）：新结构直接采用；旧 file/file_full 自动转换
+            raw_forms = r.get("forms")
+            if isinstance(raw_forms, list) and raw_forms:
+                forms = []
+                for fm in raw_forms[:8]:
+                    if not isinstance(fm, dict):
+                        continue
+                    fn = str(fm.get("file") or "")
+                    if not fn.lower().endswith(".png"):
+                        continue
+                    forms.append({
+                        "name": str(fm.get("name") or "").strip()[:12] or "形态%d" % (len(forms) + 1),
+                        "file": fn,
+                    })
+                if not forms:
+                    forms = [{"name": "常态", "file": fname}]
+            else:
+                forms = [{"name": "常态", "file": fname}]
+                if file_full:
+                    forms.append({"name": "吃饱", "file": file_full})
             clean.append({
                 "id": rid,
                 "name": str(r.get("name") or "") or "未命名",
                 "file": fname,
                 "form": form,
                 "file_full": file_full,
+                "forms": forms,
                 "frames": frames,
                 "added": str(r.get("added") or ""),
             })
@@ -168,13 +217,19 @@ class RoleLibrary:
         return p
 
     def _role_paths(self, role):
-        """角色全部素材文件绝对路径（base + 可选「吃饱」变体 + 动画帧）。"""
-        out = [self._path(role)]
-        f = role.get("file_full")
-        if f:
-            out.append(f if os.path.isabs(f) else os.path.join(self._dir, f))
-        for fn in role.get("frames") or []:
-            out.append(fn if os.path.isabs(fn) else os.path.join(self._dir, fn))
+        """角色全部素材文件绝对路径（base + 各形态 + 动画帧，去重）。"""
+        seen = set()
+        out = []
+        for p in [self._path(role)] + [
+            (f if os.path.isabs(f) else os.path.join(self._dir, f))
+            for f in [m.get("file") for m in role.get("forms") or []]
+            + [role.get("file_full"), *[x for x in role.get("frames") or []]]
+            if f
+        ]:
+            ap = os.path.abspath(p)
+            if ap not in seen:
+                seen.add(ap)
+                out.append(p)
         return out
 
     @staticmethod
@@ -225,19 +280,47 @@ class RoleLibrary:
             return None
 
     def path_for_full(self, role_id):
-        """角色「吃饱」形态 png 绝对路径（存在才返回）；单形态返回 None（调用方回退 base）。"""
+        """角色第二形态 png 绝对路径（存在才返回）；单形态返回 None。
+
+        v1.4 多形态下等价于 forms[1]；旧 file_full 记录由 _load 转进 forms。
+        """
+        metas = self.form_metas(role_id)
+        if len(metas) >= 2:
+            f = metas[1].get("file") or ""
+            if not os.path.isabs(f):
+                f = os.path.join(self._dir, f)
+            try:
+                return f if os.path.isfile(f) else None
+            except Exception:
+                return None
+        return None
+
+    def form_metas(self, role_id):
+        """角色的形态列表 [{"name","file"}...]（v1.4 多形态）；旧角色由 _load 自动转换。"""
         r = self.get(str(role_id or ""))
         if r is None:
-            return None
-        f = r.get("file_full")
-        if not f:
-            return None
-        if not os.path.isabs(f):
-            f = os.path.join(self._dir, f)
-        try:
-            return f if os.path.isfile(f) else None
-        except Exception:
-            return None
+            return []
+        return [dict(f) for f in r.get("forms") or []]
+
+    def form_files(self, role_id):
+        """各形态素材绝对路径（存在才保留）；全部缺失返回 []。"""
+        return [p for p in self.form_paths(role_id) if p]
+
+    def form_paths(self, role_id):
+        """各形态素材绝对路径（与 form_metas 逐项对齐；缺失为 None）。
+
+        主程序据此装配 sprites，保证 form_keys 与 sprites 键集一致（M2）。"""
+        metas = self.form_metas(role_id)
+        out = []
+        for m in metas:
+            p = m.get("file") or ""
+            if not os.path.isabs(p):
+                p = os.path.join(self._dir, p)
+            try:
+                out.append(p if os.path.isfile(p) else None)
+            except Exception:
+                out.append(None)
+        return out
 
     def frames_for(self, role_id):
         """角色动画帧 png 绝对路径列表（都存在才返回）；无帧动画返回 []。"""
@@ -272,6 +355,9 @@ class RoleLibrary:
                     return None, "文件超过 10MB，无法导入"
             except Exception:
                 return None, "无法读取文件大小"
+            _ok_png, _err_png = _probe_png(src)
+            if not _ok_png:
+                return None, _err_png  # D1：旧版入口也校验 PNG 内容，坏图不入库
             if name is None or not str(name).strip():
                 name = os.path.splitext(os.path.basename(src))[0]
             name = str(name).strip()[:40] or "未命名"
@@ -311,13 +397,14 @@ class RoleLibrary:
         except Exception as e:
             return None, "导入失败：%s" % e
 
-    def import_processed(self, base_src, full_src=None, name=None, frames_src=None):
+    def import_processed(self, base_src, full_src=None, name=None, frames_src=None, forms_src=None):
         """导入已自动处理的角色素材（面板新入口）。
 
-        full_src=None → 单形态：只复制 base（record form="single"，无 file_full）。
-        full_src 给路径 → 双形态：base + 吃饱变体都复制（form="dual"，file/file_full）。
+        full_src 给路径 → 双形态（旧参数，等价 forms_src 两个形态）。
         frames_src 给 2~24 张已处理帧 → 帧动画角色：帧存为 <id>_f%02d.png，
         base 必须是首帧（"file" 指向 _f00），"frames" 记录全部帧文件名。
+        forms_src 给 [(名字, png路径), ...]（1~8 个，v1.4 多形态）→
+        形态文件存为 <id>_form%d.png，形态 0 即 base；记录 "forms"。
         成功返回 (role, None)，失败 (None, err)；任何失败都会清理半成品文件。
         """
         try:
@@ -348,6 +435,22 @@ class RoleLibrary:
                             return None, "第 %d 帧素材超过 10MB" % (i + 1)
                     except Exception:
                         return None, "无法读取文件大小"
+            if forms_src is not None:
+                if not isinstance(forms_src, list) or not (1 <= len(forms_src) <= 8):
+                    return None, "形态数量必须在 1~8 之间"
+                for i, fm in enumerate(forms_src):
+                    if not isinstance(fm, (list, tuple)) or len(fm) != 2:
+                        return None, "第 %d 个形态格式错误" % (i + 1)
+                    src = fm[1]
+                    if not isinstance(src, str) or not os.path.isfile(src):
+                        return None, "第 %d 个形态素材不存在" % (i + 1)
+                    if os.path.splitext(src)[1].lower() != ".png":
+                        return None, "第 %d 个形态素材必须是 png" % (i + 1)
+                    try:
+                        if os.path.getsize(src) > self.MAX_BYTES:
+                            return None, "第 %d 个形态素材超过 10MB" % (i + 1)
+                    except Exception:
+                        return None, "无法读取文件大小"
             if name is None or not str(name).strip():
                 name = "未命名"  # base_src 是临时文件，不能用其文件名当角色名
             name = str(name).strip()[:40] or "未命名"
@@ -359,6 +462,7 @@ class RoleLibrary:
             dst_base = os.path.join(self._dir, rid + ".png")
             dst_full = os.path.join(self._dir, rid + "_full.png") if full_src else None
             dst_frames = []
+            dst_forms = []
             try:
                 if frames_src:
                     for i, src in enumerate(frames_src):
@@ -370,24 +474,45 @@ class RoleLibrary:
                     shutil.copyfile(base_src, dst_base)
                 if dst_full is not None:
                     shutil.copyfile(full_src, dst_full)
+                if forms_src is not None:
+                    for i, (fm_name, fm_src) in enumerate(forms_src):
+                        if i == 0:
+                            dst_forms.append(dst_base)  # 形态 0 即 base
+                        else:
+                            d = os.path.join(self._dir, "%s_form%d.png" % (rid, i))
+                            shutil.copyfile(fm_src, d)
+                            dst_forms.append(d)
             except Exception:
-                self._cleanup_files(dst_base, dst_full, *dst_frames)
+                self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms)
                 return None, "复制文件失败"
             role = {
                 "id": rid,
                 "name": name,
                 "file": rid + ".png",
-                "form": "dual" if full_src else "single",
+                "form": ("multi" if (forms_src is not None and len(forms_src) >= 2)
+                         else ("dual" if full_src else "single")),
                 "added": time.strftime("%Y-%m-%d"),
             }
             if full_src:
                 role["file_full"] = rid + "_full.png"
             if frames_src:
                 role["frames"] = ["%s_f%02d.png" % (rid, i) for i in range(len(frames_src))]
+            if forms_src is not None:
+                role["forms"] = [
+                    {"name": (fm[0].strip()[:12] if isinstance(fm[0], str) else "")
+                             or "形态%d" % (i + 1),
+                     "file": os.path.basename(dst_forms[i])}
+                    for i, fm in enumerate(forms_src)
+                ]
+            else:
+                # 旧参数路径（full_src）也落 forms，避免重启前后结构不一致
+                role["forms"] = [{"name": "常态", "file": rid + ".png"}]
+                if full_src:
+                    role["forms"].append({"name": "吃饱", "file": rid + "_full.png"})
             self._data["roles"].append(role)
             err = self._save()
             if err:
-                self._cleanup_files(dst_base, dst_full, *dst_frames)
+                self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms)
                 self._data["roles"].pop()
                 return None, err
             return role, None
@@ -524,6 +649,15 @@ class AudioLibrary:
                     return None, "文件超过 20MB，无法导入"
             except Exception:
                 return None, "无法读取文件大小"
+            # D2：内容校验——损坏音频不入库（wav 走 wave 头校验；mp3 查 ID3/帧同步）
+            if ext == ".wav":
+                if _wav_duration(src) is None and _probe_wav_ok(src) is False:
+                    return None, "WAV 文件损坏或不是 PCM 格式"
+            else:
+                with open(src, "rb") as f:
+                    head = f.read(10)
+                if not (head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0)):
+                    return None, "MP3 文件损坏"
             if name is None or not str(name).strip():
                 name = os.path.splitext(os.path.basename(src))[0]
             name = str(name).strip()[:40] or "未命名"
@@ -652,9 +786,12 @@ if __name__ == "__main__":
     print("=== 冒烟 1：RoleLibrary 导入 / 切换 / 删除 ===")
     rl = RoleLibrary(tmp)
     assert rl.active_id() == "" and rl.active_path() is None and rl.list_roles() == []
+    import base64
     fake = os.path.join(tmp, "测试角色.png")
     with open(fake, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)  # 假 PNG（import 不校验内容）
+        # 1x1 透明 PNG（D1 起 import 校验 PNG 头/IHDR 尺寸）
+        f.write(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="))
     role, err = rl.import_file(fake)
     assert err is None and role is not None, err
     assert rl.list_roles()[0]["id"] and rl.list_roles()[0]["name"] == "测试角色"
@@ -688,11 +825,14 @@ if __name__ == "__main__":
     al = AudioLibrary(tmp)
     assert al.fragments() == [] and al.group_slots()["custom"]["press"] is None
     wav = os.path.join(tmp, "clip.wav")
-    with open(wav, "wb") as f:
-        f.write(b"\x00" * 60)  # 无效 wav 头：import 只查扩展名和大小，duration 探测失败为 None
+    with wave.open(wav, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(22050)
+        wf.writeframes(b"\x00\x00" * 100)  # 有效 PCM wav（D2 起 import 校验音频头）
     frag, err = al.import_file(wav)
     assert err is None and frag is not None, err
-    assert frag["ext"] == ".wav" and frag["duration"] is None
+    assert frag["ext"] == ".wav" and isinstance(frag["duration"], float)
     assert os.path.isfile(al.fragment_path(frag["id"]))
     assert al.rename(frag["id"], "  新名字 ") == (True, "")
     assert al.fragments()[0]["name"] == "新名字"

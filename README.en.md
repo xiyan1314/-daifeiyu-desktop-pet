@@ -22,8 +22,9 @@ Transparent frameless window, always-on-top, draggable, feedable, chatty — per
 - 💸 **Money rain**: successful balance check → coin sound + money GIF frames
 - 😴 **Idle life**: falls asleep after 60s, occasional mischievous grins, blushes when praised
 - 📌 Single instance, tray icon, follow mouse / wander, wheel resize, edge snapping
+- 🚀 **Auto-start on boot** (off by default, right-click → "⚙️ 设置…" to enable): HKCU Run key, greets you every morning
 - 🐳 **v1.3 customization & bookkeeping (inspired by the dsh-whale-widget plugin)**:
-  - 🖼️ **Character import**: right-click → "🐟 角色" to import png/jpg/bmp/webp with auto background-removal / trim / scale; **choose single-form (one image) or dual-form (normal + full images)**; switch/delete/restore anytime
+  - 🖼️ **Character import**: right-click → "🐟 角色" to import png/jpg/bmp/webp with auto background-removal / trim / scale; **1~8 custom forms with your own names and images** (feeding cycles through forms, back to the first after 12s); switch/delete/restore anytime
   - 🎞️ **Animated characters (v1.3.2)**: pick multiple images as a frame sequence, or auto-extract frames from a **video / GIF** (video: 3~20 sampled frames, GIF: 3~24); every frame gets the same auto-processing; idle loops the animation, feeding switches to the full form
   - Custom characters get **procedural expression art** (blush/anger/sleep marks composited onto your image, v1.3.3) plus bubble & head emote; squish/edge/follow effects kept
   - 🔊 **Sound import + custom sound groups**: import wav/mp3 clips with preview; each of the 5 events (poke/release/feed/AI reply/coin) can use any clip or stay silent

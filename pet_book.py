@@ -308,19 +308,28 @@ class Book:
 
     # ---------- 记账 ----------
     def observe_balance(self, total):
-        """余额差记账：total < last 时记一条 kind="api"；更新 last_balance=total。"""
+        """余额差记账：total < last 时记一条 kind="api"；更新 last_balance=total。
+
+        单次降幅异常大（>20% 且 >5 元）多半是平台调整（赠送过期/退款/活动），
+        不自动记为消费，只提醒用户并重置基准。返回提醒文案或 None。
+        """
         try:
             total = round(float(total), 2)
         except Exception:
-            return
+            return None
         self._ensure_today()
         last = self._ledger.get("last_balance")
+        note = None
         if last is not None and total < last:
             amount = round(last - total, 2)
             if amount > 0:
-                self._ledger["records"].append(_new_record(amount, "api", "API 余额差"))
+                if amount > max(5.0, last * 0.2):
+                    note = "余额一下少了 ¥%.2f（可能是平台调整，未计入消费）" % amount
+                else:
+                    self._ledger["records"].append(_new_record(amount, "api", "API 余额差"))
         self._ledger["last_balance"] = total
         self._save_all()
+        return note
 
     def add_manual(self, amount, note=""):
         """手动记账（kind="manual"）；amount 必须 > 0，否则静默忽略。"""
@@ -417,9 +426,11 @@ class Book:
         today = self._ledger["date"]
         changed = False
         if budget > 0:
-            used = self.today_usage()
+            # 预算口径：只统计 API 消费（手动记账是补记，不该触发消费预算）
+            used = sum(r["amount"] for r in self._ledger["records"] if r["kind"] == "api")
+            used = round(used, 2)
             if used > budget and self._ledger.get("alerted_budget") != today:
-                alerts.append("今日已用 ¥%.2f，超过预算 ¥%.2f 啦！" % (used, budget))
+                alerts.append("今日 API 消费 ¥%.2f，超过预算 ¥%.2f 啦！" % (used, budget))
                 self._ledger["alerted_budget"] = today
                 changed = True
         if balance_alert > 0 and total < balance_alert and self._ledger.get("alerted_balance") != today:
@@ -520,10 +531,11 @@ if __name__ == "__main__":
     s2 = b.search_records(today)
     assert len(s2) == 2
     assert abs(b.total_amount() - 6.5) < 1e-9 and b.total_count() == 2
-    alerts = b.check_alerts(98.5, 6.0, 99.0)  # 预算超 + 余额低于阈值
+    # 预算口径：仅 API 消费（api 1.5 + 手动 5.0 中只算 1.5）
+    alerts = b.check_alerts(98.5, 1.0, 99.0)  # API 消费 1.5 超预算 1.0 + 余额低于阈值
     assert len(alerts) == 2, alerts
-    assert "6.50" in alerts[0] and "98.50" in alerts[1]
-    assert b.check_alerts(98.5, 6.0, 99.0) == []  # 当天不重复
+    assert "1.50" in alerts[0] and "98.50" in alerts[1]
+    assert b.check_alerts(98.5, 1.0, 99.0) == []  # 当天不重复
     csv_path = os.path.join(tmp, "ledger.csv")
     ok, err = b.export_csv(csv_path)
     assert ok and err == "", err

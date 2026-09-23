@@ -104,9 +104,8 @@ def main_flow():
         check("role active id", pet.role_lib.active_id() == role["id"])
         check("custom role sprites", pet._custom_role and not pet.has_frames)
         check("window size > 0", pet.width() > 20 and pet.height() > 20)
-        # 旧版导入无吃饱变体：单形态（吃饱形态回退同一张图）
-        check("legacy role single form",
-              pet.sprites["full"]["side"].cacheKey() == pet.sprites["normal"]["side"].cacheKey())
+        # 旧版导入无吃饱变体：单形态（仅 f0 一个形态）
+        check("legacy role single form", pet.form_keys == ["f0"] and len(pet.sprites) == 1)
         pet.apply_role("")  # 恢复默认
         check("role restore default", not pet._custom_role and pet.has_frames)
 
@@ -146,23 +145,23 @@ def main_flow():
               and lib2.get(dual["id"]).get("form") == "dual")
         pet.apply_role(dual["id"])
         check("dual sprites differ",
-              pet.sprites["full"]["side"].cacheKey() != pet.sprites["normal"]["side"].cacheKey())
-        check("dual state full built", pet.state_pix["full"].get("blush") is not None
-              and pet.state_pix["normal"].get("blush") is not None)
-        # 中-3：状态展示中切形态 → 立即换新形态同表情；结束后落 full side
+              pet.sprites["f1"]["side"].cacheKey() != pet.sprites["f0"]["side"].cacheKey())
+        check("dual state full built", pet.state_pix["f1"].get("blush") is not None
+              and pet.state_pix["f0"].get("blush") is not None)
+        # 中-3：状态展示中切形态 → 立即换新形态同表情；结束后落第二形态
         pet._show_state("angry", 1000)
-        pet._set_form("full")
+        pet._set_form("f1")
         check("dual state switch form",
-              pet.item.pixmap().cacheKey() == pet.state_pix["full"]["angry"].cacheKey())
+              pet.item.pixmap().cacheKey() == pet.state_pix["f1"]["angry"].cacheKey())
         pet._state_timer.stop()
         pet._state_done()
-        check("dual state done falls full side",
-              pet.item.pixmap().cacheKey() == pet.sprites["full"]["side"].cacheKey())
-        pet._set_form("normal")
-        pet._set_form("full")
+        check("dual state done falls f1 side",
+              pet.item.pixmap().cacheKey() == pet.sprites["f1"]["side"].cacheKey())
+        pet._set_form("f0")
+        pet._set_form("f1")
         check("dual form shows full pix",
-              pet.item.pixmap().cacheKey() == pet.sprites["full"]["side"].cacheKey())
-        pet._set_form("normal")
+              pet.item.pixmap().cacheKey() == pet.sprites["f1"]["side"].cacheKey())
+        pet._set_form("f0")
         # H1 回归：喂食路径（squash 动画收尾）也必须落到吃饱图
         pet.apply_role(dual["id"])
         pet.feed("小鱼干")
@@ -170,9 +169,9 @@ def main_flow():
         while pet.busy and time.time() - t0 < 3:
             app.processEvents()
             time.sleep(0.02)
-        check("feed shows full pix (dual)", pet.form == "full"
-              and pet.item.pixmap().cacheKey() == pet.sprites["full"]["side"].cacheKey())
-        pet._set_form("normal")
+        check("feed shows f1 pix (dual)", pet.form == "f1"
+              and pet.item.pixmap().cacheKey() == pet.sprites["f1"]["side"].cacheKey())
+        pet._set_form("f0")
         # M4b：双形态删除——两张素材文件都删 + active 重置
         bpath = pet.role_lib.path_for(dual["id"])
         fpath = pet.role_lib.path_for_full(dual["id"])
@@ -189,8 +188,7 @@ def main_flow():
         check("single form recorded", single.get("form") == "single"
               and pet.role_lib.path_for_full(single["id"]) is None)
         pet.apply_role(single["id"])
-        check("single sprites equal",
-              pet.sprites["full"]["side"].cacheKey() == pet.sprites["normal"]["side"].cacheKey())
+        check("single sprites equal", pet.form_keys == ["f0"] and len(pet.sprites) == 1)
         # v1.3.3：自定义角色程序化表情图（不再只有气泡+头顶表情）
         st = pet._state_pix("blush")
         check("custom state pix built", st is not None and st.width() > 0)
@@ -198,16 +196,16 @@ def main_flow():
             pet._show_state("blush", 200)
             check("custom state shown",
                   pet.item.pixmap().cacheKey() == st.cacheKey()
-                  and pet.item.pixmap().cacheKey() != pet.sprites["normal"]["side"].cacheKey())
+                  and pet.item.pixmap().cacheKey() != pet.sprites["f0"]["side"].cacheKey())
             pet._state_timer.stop()
             pet._state_done()  # S1 回归：表情结束必须恢复待机贴图
             check("custom state restored",
-                  pet.item.pixmap().cacheKey() == pet.sprites["normal"]["front"].cacheKey())
+                  pet.item.pixmap().cacheKey() == pet.sprites["f0"]["front"].cacheKey())
             # 睡眠/唤醒恢复（S1 同源回归）
             pet._show_sleep()
             pet._wake()
             check("custom sleep restored",
-                  pet.item.pixmap().cacheKey() == pet.sprites["normal"]["front"].cacheKey())
+                  pet.item.pixmap().cacheKey() == pet.sprites["f0"]["front"].cacheKey())
         pet.apply_role("")
 
     # ---- 2c. 多帧素材 / 视频抽帧（v1.3.2）----
@@ -233,7 +231,7 @@ def main_flow():
         # 中-4：帧动画角色 × 程序化表情组合（状态结束/唤醒后恢复帧循环）
         pet._show_state("cry", 100)
         check("frames role state shown", pet.anim_mode == "state"
-              and pet.item.pixmap().cacheKey() == pet.state_pix["normal"]["cry"].cacheKey())
+              and pet.item.pixmap().cacheKey() == pet.state_pix["f0"]["cry"].cacheKey())
         pet._state_timer.stop()
         pet._state_done()
         check("frames role idle restored", pet.anim_mode == "idle" and pet.anim._timer.isActive())
@@ -245,8 +243,8 @@ def main_flow():
         while pet.busy and time.time() - t0 < 3:
             app.processEvents()
             time.sleep(0.02)
-        check("frames feed ok", pet.form == "full")
-        pet._set_form("normal")
+        check("frames feed ok", pet.form == "f0")  # 单形态帧角色：喂食循环回 f0
+        pet._set_form("f0")
         fpaths = list(pet.role_lib.frames_for(frole["id"]))
         okfd, _errfd = pet.role_lib.delete(frole["id"])
         check("frames delete files", okfd and all(not os.path.exists(p) for p in fpaths))
@@ -277,7 +275,7 @@ def main_flow():
             pet.cfg["scale"] = 1.0
             pet.cfg["scale_compensated_role"] = ""
             pet.apply_role(bigrole["id"])
-            check("big role capped", pet.sprites["normal"]["side"].width() <= 512)
+            check("big role capped", pet.sprites["f0"]["side"].width() <= 512)
             check("big role scale compensated", pet.cfg.get("scale", 1.0) > 1.0,
                   "scale=%.2f" % pet.cfg.get("scale", 1.0))
             # 二次切换不重复补偿
@@ -380,6 +378,99 @@ def main_flow():
         check("multi canvas same dims", len(dims_m) == 1, "dims=%r" % (dims_m,))
     shutil.rmtree(rd6, ignore_errors=True)
 
+    # ---- 2d. v1.4 多形态 + 开机自启 ----
+    f3 = []
+    for i in range(3):
+        src3 = os.path.join(_tmp, "form%d_src.png" % i)
+        make_test_png(src3, 150, 150)
+        outp = os.path.join(_tmp, "form%d_out.png" % i)
+        pet_dialogs._prepare_role_png(src3, outp)
+        f3.append(("幼体" if i == 0 else ("成体" if i == 1 else "究极体"), outp))
+    r3, e3 = pet.role_lib.import_processed(f3[0][1], None, "三形态", forms_src=f3)
+    check("import 3 forms", r3 is not None and e3 is None, "err=%r" % (e3,))
+    if r3:
+        check("3 forms recorded", len(r3.get("forms", [])) == 3)
+        pet.apply_role(r3["id"])
+        check("3 form keys", pet.form_keys == ["f0", "f1", "f2"])
+        for expect in ("f1", "f2", "f0"):
+            pet.feed("小鱼干")
+            t0 = time.time()
+            while pet.busy and time.time() - t0 < 3:
+                app.processEvents()
+                time.sleep(0.02)
+            check("feed cycle -> %s" % expect, pet.form == expect)
+            # bug 审查回归：贴图必须同步切到目标形态（变量断言不够）
+            check("feed pix -> %s" % expect,
+                  pet.item.pixmap().cacheKey() == pet.sprites[expect]["side"].cacheKey())
+        # 菜单 f1→f2 切换贴图断言
+        pet._set_form("f1")
+        pet._set_form("f2")
+        check("menu form switch pix",
+              pet.item.pixmap().cacheKey() == pet.sprites["f2"]["side"].cacheKey())
+        # 消化回第一形态
+        pet._set_form("f2")
+        pet._digest()
+        check("digest back to f0", pet.form == "f0")
+        # 删除无孤儿：全部形态文件清理
+        _form_files = [os.path.join(_tmp, "roles", m["file"]) for m in pet.role_lib.form_metas(r3["id"])]
+        pet.role_lib.delete(r3["id"])
+        check("3-form delete no orphans", all(not os.path.exists(p) for p in _form_files))
+        pet.apply_role("")
+    # bug 审查回归：形态文件缺失时启动不崩（file_full 孤儿场景）
+    two = []
+    for i in range(2):
+        ts = os.path.join(_tmp, "t%d.png" % i)
+        make_test_png(ts, 120, 120)
+        to = os.path.join(_tmp, "t%d_o.png" % i)
+        pet_dialogs._prepare_role_png(ts, to)
+        two.append(("形态%d" % (i + 1), to))
+    rt, et = pet.role_lib.import_processed(two[0][1], None, "缺文件测试", forms_src=two)
+    if rt:
+        f1_path = os.path.join(_tmp, "roles", pet.role_lib.form_metas(rt["id"])[1]["file"])
+        os.remove(f1_path)  # 模拟 file_full 孤儿
+        pet.apply_role(rt["id"])
+        check("missing form no crash", pet.form_keys == ["f0", "f1"]
+              and set(pet.sprites.keys()) == set(pet.form_keys))
+        pet.apply_role("")
+        pet.role_lib.delete(rt["id"])
+    # 自启失败回弹不递归（stub set_autostart 恒失败）
+    class _FakeAct:
+        def __init__(self):
+            self.checked = False
+            self.blocked = 0
+        def setChecked(self, v):
+            self.checked = v
+        def blockSignals(self, b):
+            self.blocked += 1
+    _real_setauto = main.set_autostart
+    _real_act = pet._autostart_act
+    _bubbles2 = []
+    _real_sb2 = pet.show_bubble
+    pet.show_bubble = lambda t: _bubbles2.append(t)
+    main.set_autostart = lambda on: (False, "模拟失败")
+    pet._autostart_act = _FakeAct()
+    pet._autostart_busy = False
+    try:
+        pet._set_autostart(True)
+        check("autostart fail no recursion", pet._autostart_act.checked is False
+              and any("失败" in b for b in _bubbles2))
+    finally:
+        main.set_autostart = _real_setauto
+        pet._autostart_act = _real_act
+        pet.show_bubble = _real_sb2
+
+    # 开机自启：保存原状 → 往返测试 → 恢复（不动用户真实设置）
+    _was_auto = main.is_autostart_enabled()
+    try:
+        main.set_autostart(False)
+        check("autostart default off", main.is_autostart_enabled() is False)
+        ok_a, err_a = main.set_autostart(True)
+        check("autostart set on", ok_a and main.is_autostart_enabled(), "err=%r" % (err_a,))
+        ok_b, _err_b = main.set_autostart(False)
+        check("autostart set off", ok_b and not main.is_autostart_enabled())
+    finally:
+        main.set_autostart(_was_auto)  # 恢复开发者本机原状
+
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
     make_test_wav(wav)
@@ -408,7 +499,8 @@ def main_flow():
     book.observe_balance(100.0)
     book.observe_balance(97.3)
     check("balance diff usage", abs(book.today_usage() - 15.2) < 0.001)
-    pet.cfg["budget"] = 10.0
+    # 预算口径仅 API 消费（2.7）：设 2.0 触发
+    pet.cfg["budget"] = 2.0
     pet.cfg["balance_alert"] = 0.0
     msgs = book.check_alerts(97.3, pet.cfg["budget"], pet.cfg["balance_alert"])
     check("budget alert fires", len(msgs) >= 1, "msgs=%r" % (msgs,))
@@ -549,13 +641,13 @@ def main_flow():
     pet_dialogs._warn = lambda *a, **k: None
     try:
         ridlg = pet_dialogs.RoleImportDialog(pet)
-        ridlg._do_import()
-        check("import reject: no base", ridlg.result_data() is None)
-        ridlg._single.setChecked(False)
-        ridlg._dual.setChecked(True)
-        ridlg._base_edit.setText(os.path.join(_tmp, "opaque.png"))
-        ridlg._do_import()
-        check("import reject: dual missing full", ridlg.result_data() is None)
+        ridlg._do_import()  # 形态 0 无图 → 提示并拒绝
+        check("import reject: no form img", ridlg.result_data() is None)
+        ridlg._add_form("第二形态")
+        ridlg._form_rows[0]["src"] = os.path.join(_tmp, "opaque.png")
+        ridlg._form_views()
+        ridlg._do_import()  # 形态 1 无图 → 提示并拒绝
+        check("import reject: form2 missing", ridlg.result_data() is None)
         ridlg.close()
     except Exception as e:
         check("import reject paths", False, repr(e))

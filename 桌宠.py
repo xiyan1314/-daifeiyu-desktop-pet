@@ -47,7 +47,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -453,9 +453,13 @@ WEATHER_CODES = {
     0: "晴", 1: "基本晴", 2: "多云", 3: "阴",
     45: "有雾", 48: "有雾凇",
     51: "毛毛雨", 53: "毛毛雨", 55: "毛毛雨",
+    56: "冻毛毛雨", 57: "冻毛毛雨",
     61: "小雨", 63: "中雨", 65: "大雨",
+    66: "冻雨", 67: "冻雨",
     71: "小雪", 73: "中雪", 75: "大雪",
+    77: "雪粒",
     80: "阵雨", 81: "阵雨", 82: "强阵雨",
+    85: "阵雪", 86: "阵雪",
     95: "雷雨", 96: "雷雨伴冰雹", 99: "雷雨伴冰雹",
 }
 MAX_REPLY_LEN = 25
@@ -982,11 +986,11 @@ class PetWindow(QWidget):
         self._pet_max.timeout.connect(self._on_pet_watchdog)
 
         self._build_sprites()
-        self.form = "normal"
+        self.form = self.form_keys[0]
         self._digest_timer = None
-        # 双形态时两套图尺寸可能不同：窗口按较大者定，避免吃饱形态溢出/不居中
-        self.base_w = max(self.sprites["normal"]["side"].width(), self.sprites["full"]["side"].width())
-        self.base_h = max(self.sprites["normal"]["side"].height(), self.sprites["full"]["side"].height())
+        # 各形态尺寸可能不同：窗口按较大者定，避免溢出/不居中
+        self.base_w = max(self.sprites[k]["side"].width() for k in self.form_keys)
+        self.base_h = max(self.sprites[k]["side"].height() for k in self.form_keys)
         self.item.setPixmap(self.sprites[self.form]["front"])
         self._using_front = True
 
@@ -1061,6 +1065,8 @@ class PetWindow(QWidget):
         self._wander_act = None
         self._top_act = None
         self._ai_act = None
+        self._autostart_act = None
+        self._autostart_busy = False
 
         # 定时器
         self.idle_timer = QTimer(self)
@@ -1100,7 +1106,7 @@ class PetWindow(QWidget):
 
         # ---- 托盘图标（窗口被遮挡/找不到时的兜底入口）----
         self.tray = QSystemTrayIcon(self)
-        self.tray.setIcon(QIcon(self.sprites["normal"]["front"]))
+        self.tray.setIcon(QIcon(self.sprites[self.form_keys[0]]["front"]))
         tray_menu = QMenu()
         show_act = tray_menu.addAction("🐟 显示桌宠")
         show_act.triggered.connect(self._show_pet)
@@ -1115,6 +1121,16 @@ class PetWindow(QWidget):
         # v1.3：有 Key 且开了 AI 对话（未开挂件）时，启动后补一次余额观测刷新账本基线
         if self.cfg.get("api_key") and self.cfg.get("ai_enabled") and not self.cfg.get("badge"):
             QTimer.singleShot(2500, lambda: self._refresh_balance(manual=False))
+        # B3：启动 3s 后预加载撒钱帧（主线程一次性 ~100ms），避免首次查余额瞬间卡顿
+        QTimer.singleShot(3000, self._preload_money_fx)
+
+    def _preload_money_fx(self):
+        """预热撒钱帧集（86 帧约 6.7MB）：在启动空闲期加载，首次撒钱不再卡。"""
+        try:
+            if not self._fx_money:
+                self._fx_money = pet_anim.load_frame_set(self._fx_money_dir, "money", 86)
+        except Exception:
+            pass
 
     # ---------- 角色加载 ----------
     def _load_img(self, names):
@@ -1143,23 +1159,46 @@ class PetWindow(QWidget):
         p.end()
         return pix
 
+    def _build_form_meta(self):
+        """形态元数据：键列表 + 显示名（默认角色常态/吃饱；自定义角色来自角色记录）。"""
+        if self._custom_role:
+            metas = self.role_lib.form_metas(self.cfg.get("role", ""))
+            if not metas:
+                metas = [{"name": "常态"}]
+            self.form_keys = ["f%d" % i for i in range(len(metas))]
+            self.form_names = {k: (m.get("name") or "形态%d" % (i + 1))
+                               for i, (k, m) in enumerate(zip(self.form_keys, metas))}
+        else:
+            self.form_keys = ["normal", "full"]
+            self.form_names = {"normal": "常态", "full": "吃饱"}
+
     def _build_sprites(self):
         role_pix = self._role_pix()
         if role_pix is not None:
             self._custom_role = True
-            role_full = self._role_full_pix(role_pix) or role_pix  # 单形态：吃饱用同一张图
-            normal_side = normal_front = role_pix
-            full_side = full_front = role_full
-        else:
-            self._custom_role = False
-            normal_side = self._load_img(["character.png", "assets/character.png"]) or self._fallback_pix()
-            normal_front = self._load_img(["character_front.png", "assets/character_front.png"]) or normal_side
-            full_side = self._load_img(["character_full.png", "assets/character_full.png"]) or normal_side
-            full_front = self._load_img(["character_full_front.png", "assets/character_full_front.png"]) or full_side
+            # M2：用 form_paths（与 form_metas 逐项对齐）装配，保证 form_keys 与 sprites 键集一致
+            paths = self.role_lib.form_paths(self.cfg.get("role", ""))
+            if not paths:
+                paths = [None]  # 兜底：全部形态缺失时退化成单形态 base
+            self.sprites = {}
+            for i, p in enumerate(paths):
+                if p:
+                    pix = self._cap_role_pix(QPixmap(p), p) or role_pix
+                else:
+                    pix = role_pix  # 该形态文件缺失：回退 base，键集仍完整
+                self.sprites["f%d" % i] = {"side": pix, "front": pix}
+            self._build_form_meta()
+            return
+        self._custom_role = False
+        normal_side = self._load_img(["character.png", "assets/character.png"]) or self._fallback_pix()
+        normal_front = self._load_img(["character_front.png", "assets/character_front.png"]) or normal_side
+        full_side = self._load_img(["character_full.png", "assets/character_full.png"]) or normal_side
+        full_front = self._load_img(["character_full_front.png", "assets/character_full_front.png"]) or full_side
         self.sprites = {
             "normal": {"side": normal_side, "front": normal_front},
             "full": {"side": full_side, "front": full_front},
         }
+        self._build_form_meta()
 
     def _cap_role_pix(self, pix, path=None):
         """旧版超大角色素材加载时归一化到 512（与导入管线一致）。
@@ -1174,10 +1213,12 @@ class PetWindow(QWidget):
         if max(w, h) <= 512:
             return pix
         try:
-            if path and self.cfg.get("scale_compensated_role") != os.path.basename(path):
+            # 标记按角色 id 记：多形态角色各形态都超大时只补偿一次（L1）
+            mark = self.cfg.get("role", "")
+            if path and self.cfg.get("scale_compensated_role") != mark:
                 factor = min(max(w, h) / 512.0, 4.0 / max(self.cfg.get("scale", 1.0), 0.2))
                 self.cfg["scale"] = min(4.0, round(self.cfg.get("scale", 1.0) * factor, 2))
-                self.cfg["scale_compensated_role"] = os.path.basename(path)
+                self.cfg["scale_compensated_role"] = mark
                 save_config(self.cfg)
         except Exception:
             pass
@@ -1199,22 +1240,6 @@ class PetWindow(QWidget):
             return self._cap_role_pix(QPixmap(path), path) or None
         except Exception:
             return None
-
-    def _role_full_pix(self, base=None):
-        """自定义角色的「吃饱」形态图；单形态/旧角色无变体时回退 base（同图双形态）。
-
-        base 由调用方传入（_build_sprites 已解码过），避免同一 PNG 重复解码。"""
-        base = base if base is not None else self._role_pix()
-        if base is None:
-            return None
-        rid = self.cfg.get("role", "")
-        try:
-            path = self.role_lib.path_for_full(rid)  # rid="" 时 get("") 返回 None → 回退 base
-            if not path or not os.path.isfile(path):
-                return base
-            return self._cap_role_pix(QPixmap(path), path) or base
-        except Exception:
-            return base
 
     def _role_frames(self):
         """自定义角色的动画帧 [QPixmap]；无帧动画角色返回 []。"""
@@ -1257,11 +1282,15 @@ class PetWindow(QWidget):
 
     def _reload_sprites(self):
         """重建角色贴图 / 窗口尺寸 / 动画能力（角色切换与恢复默认共用）。"""
+        if self._digest_timer is not None:
+            self._digest_timer.stop()  # 切换角色：作废旧角色的消化定时器（L1）
         self._build_sprites()
         self._build_state_pix()  # 自定义角色：程序化表情图随底图重建
-        # 双形态时两套图尺寸可能不同：窗口按较大者定，避免吃饱形态溢出/不居中
-        self.base_w = max(self.sprites["normal"]["side"].width(), self.sprites["full"]["side"].width())
-        self.base_h = max(self.sprites["normal"]["side"].height(), self.sprites["full"]["side"].height())
+        # 各形态尺寸可能不同：窗口按较大者定，避免溢出/不居中
+        self.base_w = max(self.sprites[k]["side"].width() for k in self.form_keys)
+        self.base_h = max(self.sprites[k]["side"].height() for k in self.form_keys)
+        if self.form not in self.sprites:
+            self.form = self.form_keys[0]  # 角色形态数变少：回第一形态
         self._wire_anim_sets()
         if self.busy and self.anim_mode == "eat":
             self.busy = False  # S1：吃帧被角色切换打断，_eat_done 不会再回调，显式释放
@@ -1271,7 +1300,7 @@ class PetWindow(QWidget):
         self.set_scale(self.scale)  # 按新角色尺寸重算窗口
         self._play_idle()
         try:
-            self.tray.setIcon(QIcon(self.sprites["normal"]["front"]))
+            self.tray.setIcon(QIcon(self.sprites[self.form_keys[0]]["front"]))
         except Exception:
             pass
         if self.emote_item.isVisible() and getattr(self, "_last_emote_kind", None):
@@ -1288,14 +1317,14 @@ class PetWindow(QWidget):
     def _play_idle(self):
         self._sleeping = False
         self._cur_state = None  # 离开表情/睡眠展示
-        if self.form == "full":
-            # 吃饱形态待机显示真正的吃饱版图（character_full.png），
-            # 之前用吃帧最后一帧（常态形象定格）会把吃饱形象顶掉
-            if self.anim_mode != "full_idle":
+        if self.form != self.form_keys[0]:
+            # 非首形态待机显示该形态静态图（吃帧/待机帧都是首形态形象，会顶掉当前形态）
+            if self.anim_mode != "form_idle":
                 self.anim.stop()
-                self.item.setPixmap(self.sprites["full"]["side"])
-                self._using_front = False
-                self.anim_mode = "full_idle"
+                self.anim_mode = "form_idle"
+            # H1：setPixmap 必须在守卫外——f1→f2 时 anim_mode 已是 form_idle，否则旧形态滞留
+            self.item.setPixmap(self.sprites[self.form]["side"])
+            self._using_front = False
         elif self.has_frames:
             if self.anim_mode != "idle":
                 self.anim_mode = "idle"
@@ -1329,16 +1358,10 @@ class PetWindow(QWidget):
         """构建状态图：默认角色加载内置表情素材；自定义角色生成程序化表情图。"""
         names = tuple(_STATE_MARK_MAP)  # 状态名单一来源，避免双处维护
         if self._custom_role:
-            base = self.sprites["normal"]["side"]
-            full = self.sprites["full"]["side"]
-            normal_states = {s: _make_custom_state_pix(base, s) for s in names}
-            if full.cacheKey() == base.cacheKey():
-                self.state_pix = {"normal": normal_states, "full": normal_states}  # 单形态：共用
-            else:
-                self.state_pix = {
-                    "normal": normal_states,
-                    "full": {s: _make_custom_state_pix(full, s) for s in names},
-                }
+            self.state_pix = {}
+            for k in self.form_keys:
+                base = self.sprites[k]["side"]
+                self.state_pix[k] = {s: _make_custom_state_pix(base, s) for s in names}
             return
         self.state_pix = {"normal": {}, "full": {}}
         for form in ("normal", "full"):
@@ -1353,8 +1376,8 @@ class PetWindow(QWidget):
             alias = self.FULL_STATE_ALIAS.get(state)
             if alias:
                 pix = self.state_pix.get("full", {}).get(alias)
-        if pix is None:
-            pix = self.state_pix.get("normal", {}).get(state)
+        if pix is None and self.form != self.form_keys[0]:
+            pix = self.state_pix.get(self.form_keys[0], {}).get(state)
         return pix
 
     def _show_state(self, state, duration_ms=STATE_DURATION_MS):
@@ -1565,6 +1588,19 @@ class PetWindow(QWidget):
             self._place_fx("petpet")  # 特效层各自跟随缩放（L1 修复）
         if self._fx_money_on:
             self._place_fx("money")
+        self._ensure_on_screen()
+
+    def _ensure_on_screen(self):
+        """窗口完全离开所有屏幕（分辨率切换/拔显示器）时收回主屏右下角。"""
+        try:
+            geo = self.frameGeometry()
+            for scr in QApplication.screens():
+                if scr.availableGeometry().intersects(geo):
+                    return
+            scr = QApplication.primaryScreen().availableGeometry()
+            self.move(scr.right() - self.width() - 40, scr.bottom() - self.height() - 80)
+        except Exception:
+            pass
 
     def _reset_squash(self):
         self.squash_x = 1.0
@@ -1649,6 +1685,7 @@ class PetWindow(QWidget):
 
     def _fly_food(self, food):
         if self.busy:
+            self.show_bubble(random.choice(["嘴里还有呢，等一下~", "还没咽下去啦！"]))
             return
         self.busy = True
         # 不在此播音：食物落嘴时 feed() 会播喂食音，避免「松手音」语义错位
@@ -1719,8 +1756,15 @@ class PetWindow(QWidget):
             self.feed(food)
 
     def _update_badge(self):
-        line1 = "余额 %s %.2f" % (self._currency, self._shown_balance if self._shown_balance is not None else 0.0)
-        line2 = "今日已用 %.2f" % (self._usage or 0.0)
+        bal = self._shown_balance if self._shown_balance is not None else 0.0
+        if self._currency == "CNY":
+            line1 = "余额 ¥%.2f" % bal
+        else:
+            line1 = "余额 %s %.2f" % (self._currency, bal)
+        if self._currency == "CNY":
+            line2 = "今日已用 ¥%.2f" % (self._usage or 0.0)
+        else:
+            line2 = "今日已用 %.2f" % (self._usage or 0.0)
         self.badge.set_info(line1, line2)
         self._position_badge()
 
@@ -1735,7 +1779,10 @@ class PetWindow(QWidget):
         self._usage = self._update_usage_ledger(total)  # 记账在主线程，避免跨线程读写
         if self._manual_pending:
             self._manual_pending = False
-            self.show_bubble("余额 %s %.2f · 今日已用 %.2f（赠送 %.2f）" % (currency, total, self._usage, granted))
+            if currency == "CNY":
+                self.show_bubble("余额 ¥%.2f · 今日已用 ¥%.2f（赠送 ¥%.2f）" % (total, self._usage, granted))
+            else:
+                self.show_bubble("余额 %s %.2f · 今日已用 %.2f（赠送 %.2f）" % (currency, total, self._usage, granted))
             if self.cfg.get("sound", True):
                 play_sound("coin")  # 金币音（借参考插件任务结束音概念）
             self._fx_celebrate()   # 撒钱动画
@@ -1801,7 +1848,7 @@ class PetWindow(QWidget):
             self._balance_timer = QTimer(self)
             self._balance_timer.timeout.connect(lambda: self._refresh_balance(manual=False))
         self._refresh_balance(manual=False)
-        self._balance_timer.start(60000)
+        self._balance_timer.start(300000)  # 5 分钟轮询：60s 太密，浪费额度且易被限流
 
     def _stop_balance_refresh(self):
         if self._balance_timer is not None:
@@ -1856,7 +1903,7 @@ class PetWindow(QWidget):
             return  # 同形态重选：什么都不做，避免待机动画重启造成的帧跳/卡顿
         self.form = form
         if refresh:
-            if self.anim_mode in ("idle", "full_idle"):
+            if self.anim_mode in ("idle", "form_idle"):
                 self._play_idle()
             elif self.anim_mode in ("state", "sleep") and self._cur_state:
                 # 表情/睡眠展示中切形态：立即换成新形态的同一表情，避免瞬时旧形态形象
@@ -1866,24 +1913,29 @@ class PetWindow(QWidget):
         self._apply_transform()
 
     def _digest(self):
-        if self.form == "full":
+        if self.form != self.form_keys[0]:
             # _set_form 内已在待机态回位；状态图展示中不掐断（state 结束时自然回待机）
-            self._set_form("normal")
+            self._set_form(self.form_keys[0])
             self._show_emote("sparkle")
-            self.show_bubble(random.choice(["消化完啦，又饿了~", "瘦回来啦！", "还能再吃一点……"]))
+            if self._custom_role:
+                self.show_bubble("变回「%s」啦~" % self.form_names.get(self.form_keys[0], "第一形态"))
+            else:
+                self.show_bubble(random.choice(["消化完啦，又饿了~", "瘦回来啦！", "还能再吃一点……"]))
 
     def feed(self, food):
         if self.busy:
+            self.show_bubble(random.choice(["嘴里还有呢，等一下~", "别急嘛，还在吃！", "呜……咽不下去啦！"]))
             return
         self.busy = True
         if self.cfg.get("sound", True):
             play_sound("feed")
         line = random.choice(FOOD_LINES.get(food, ["啊呜~好吃！"]))
-        was_full = self.form == "full"  # 必须在 _set_form 之前记录
+        was_first = self.form == self.form_keys[0]  # 必须在 _set_form 之前记录
         self.mood.fed()
-        # refresh=False：形态先行但视觉不切换——常态投喂时先播吃帧（常态形象），
-        # 吃完 _eat_done 才落到吃饱版图，避免「胖→瘦→胖」的 120ms 闪现
-        self._set_form("full", refresh=False)
+        # 喂食：形态顺次前进（多形态循环），refresh=False 先播吃帧再落新形态
+        cur_idx = self.form_keys.index(self.form) if self.form in self.form_keys else 0
+        next_idx = (cur_idx + 1) % len(self.form_keys)
+        self._set_form(self.form_keys[next_idx], refresh=False)
         self._last_activity = time.monotonic()
         if self._digest_timer is not None:
             self._digest_timer.stop()
@@ -1895,12 +1947,12 @@ class PetWindow(QWidget):
         self._digest_timer.setSingleShot(True)
         self._digest_timer.timeout.connect(self._digest)
         self._digest_timer.start(12000)
-        if self.has_frames and not was_full:
-            # 常态 → 吃饱：错峰 120ms 启动吃帧；busy 在 _eat_done 释放
+        if self.has_frames and was_first:
+            # 首形态 → 下一形态：错峰 120ms 启动吃帧；busy 在 _eat_done 释放
             QTimer.singleShot(120, self, self._play_eat)  # 带 context：窗口销毁自动取消
         elif self.has_frames:
-            # 已在吃饱形态：不重播吃帧（吃帧是常态形象，会顶掉吃饱形象），
-            # 以吃饱版开心大笑表达「又吃到了」，并立即释放 busy
+            # 已在非首形态：不重播吃帧（吃帧是首形态形象，会顶掉当前形态），
+            # 以大笑表情表达「又吃到了」，并立即释放 busy
             def _full_refeed():
                 self._show_state("laugh", 2200)
                 self.busy = False
@@ -1975,11 +2027,13 @@ class PetWindow(QWidget):
         cur = self.pos()
         dx = target.x() - cur.x()
         dy = target.y() - cur.y()
-        if abs(dx) < 4 and abs(dy) < 4:
+        if abs(dx) < 3 and abs(dy) < 3:
             return
-        step = 4
-        nx = cur.x() + (step if dx > 0 else (-step if dx < 0 else 0))
-        ny = cur.y() + (step if dy > 0 else (-step if dy < 0 else 0))
+        # 缓动：每 tick 走剩余距离的 35%（至少 2px），远处快、近处慢，接近「追过去」
+        step_x = max(2, int(abs(dx) * 0.35))
+        step_y = max(2, int(abs(dy) * 0.35))
+        nx = cur.x() + (min(step_x, abs(dx)) if dx > 0 else -min(step_x, abs(dx)))
+        ny = cur.y() + (min(step_y, abs(dy)) if dy > 0 else -min(step_y, abs(dy)))
         self.move(nx, ny)
         if dx != 0:
             self.flip = 1 if dx < 0 else -1
@@ -2058,14 +2112,15 @@ class PetWindow(QWidget):
                 params={
                     "latitude": r["latitude"],
                     "longitude": r["longitude"],
-                    "current_weather": True,
+                    # 新版 current 参数（旧 current_weather=true 有下线风险）
+                    "current": "temperature_2m,weather_code,wind_speed_10m",
                 },
                 timeout=8,
-            ).json()["current_weather"]
-            code = w.get("weathercode", 0)
+            ).json()["current"]
+            code = w.get("weather_code", 0)
             desc = WEATHER_CODES.get(code, "晴")
             signals.weather.emit(
-                "%s今天%s，%.0f℃，风速%.0fkm/h" % (city, desc, w["temperature"], w["windspeed"])
+                "%s今天%s，%.0f℃，风速%.0fkm/h" % (city, desc, w["temperature_2m"], w["wind_speed_10m"])
             )
         except Exception as e:
             _log_error("weather_worker: %r" % (e,))
@@ -2153,8 +2208,9 @@ class PetWindow(QWidget):
         msg = dlg.textValue().strip()
         if not (ok and msg):
             return
-        # 夸夸检测：本地触发害羞脸红，无需 API Key
-        if any(k in msg for k in self.PRAISE_KEYWORDS):
+        # 夸夸检测：本地触发害羞脸红，无需 API Key；先排除否定语境（"不好看"等）
+        neg_words = ("不", "别", "没", "讨厌", "难看", "丑", "烦")
+        if any(k in msg for k in self.PRAISE_KEYWORDS) and not any(n in msg for n in neg_words):
             self.mood.blush()
         if not self.cfg.get("ai_enabled"):
             self.cfg["ai_enabled"] = True
@@ -2236,7 +2292,9 @@ class PetWindow(QWidget):
         if self.book is None:
             return 0.0
         try:
-            self.book.observe_balance(total)
+            note = self.book.observe_balance(total)
+            if note:
+                self.show_bubble(note)
             usage = self.book.today_usage()
             alerts = self.book.check_alerts(total, self.cfg.get("budget", 0.0), self.cfg.get("balance_alert", 0.0))
             for msg in alerts:
@@ -2274,7 +2332,7 @@ class PetWindow(QWidget):
             return  # 摸摸头期间不跳不发 zzz（S3 修复）
         if self._sleeping:
             return
-        if self.anim_mode in ("idle", "full_idle") and (time.monotonic() - self._last_activity) > SLEEP_AFTER_SECONDS:
+        if self.anim_mode in ("idle", "form_idle") and (time.monotonic() - self._last_activity) > SLEEP_AFTER_SECONDS:
             self._show_sleep()
             self.show_bubble(random.choice(["呼……呼……", "zzZ……睡得好香~", "睡着了……别吵~"]))
             return
@@ -2381,9 +2439,12 @@ class PetWindow(QWidget):
     def wheelEvent(self, e):
         delta = e.angleDelta().y()
         factor = 1.1 if delta > 0 else (1.0 / 1.1)
+        center_before = self.frameGeometry().center()  # 以中心为锚，避免「往右下长」
         self.set_scale(self.scale * factor)
         self.cfg["scale"] = self.scale
         self._schedule_scale_save()
+        center_after = self.frameGeometry().center()
+        self.move(self.pos() + (center_before - center_after))
 
     # ---------- 右键菜单（v1.3 美化：分区标题 + emoji 图标 + 信息行） ----------
     def _open_menu(self, gp):
@@ -2393,7 +2454,10 @@ class PetWindow(QWidget):
 
         # 顶部信息行：余额 / 今日已用（仅展示，不可点）
         if self._shown_balance is not None:
-            info_text = "💰 余额 %s %.2f · 今日已用 %.2f" % (self._currency, self._shown_balance, self._usage or 0.0)
+            if self._currency == "CNY":
+                info_text = "💰 余额 ¥%.2f · 今日已用 ¥%.2f" % (self._shown_balance, self._usage or 0.0)
+            else:
+                info_text = "💰 余额 %s %.2f · 今日已用 %.2f" % (self._currency, self._shown_balance, self._usage or 0.0)
         else:
             info_text = "📒 今日已用 %.2f" % (self._usage or 0.0)
         menu.addAction(info_text).setEnabled(False)
@@ -2430,10 +2494,12 @@ class PetWindow(QWidget):
         tray_act.toggled.connect(self._set_food_tray)
         food_menu.addSeparator()
         form_menu = food_menu.addMenu("🐡 形态")
-        form_normal = form_menu.addAction("常态")
-        form_normal.triggered.connect(lambda checked=False: self._set_form("normal"))
-        form_full = form_menu.addAction("吃饱")
-        form_full.triggered.connect(lambda checked=False: self._set_form("full"))
+        for key in self.form_keys:
+            name = self.form_names.get(key, key)
+            if key == self.form:
+                name += " ✓"
+            act = form_menu.addAction(name)
+            act.triggered.connect(lambda checked=False, k=key: self._set_form(k))
 
         role_menu = menu.addMenu("🐟 角色")
         role_group = QActionGroup(menu)
@@ -2505,6 +2571,10 @@ class PetWindow(QWidget):
         lines_act = set_menu.addAction("💬 自定义台词…")
         lines_act.triggered.connect(self._open_lines)
         set_menu.addSeparator()
+        self._autostart_act = set_menu.addAction("🚀 开机自启")
+        self._autostart_act.setCheckable(True)
+        self._autostart_act.setChecked(is_autostart_enabled())
+        self._autostart_act.toggled.connect(self._set_autostart)
         key_act = set_menu.addAction("🔑 设置DeepSeek API Key")
         key_act.triggered.connect(self._set_api_key)
         clear_key_act = set_menu.addAction("🧹 清除DeepSeek API Key")
@@ -2526,7 +2596,7 @@ class PetWindow(QWidget):
         quit_act.triggered.connect(self._quit)
 
         menu.exec(gp)
-        self._top_act = self._follow_act = self._wander_act = self._ai_act = None
+        self._top_act = self._follow_act = self._wander_act = self._ai_act = self._autostart_act = None
         menu.deleteLater()
 
     def _make_size_action(self, menu):
@@ -2536,7 +2606,7 @@ class PetWindow(QWidget):
         lay.setContentsMargins(12, 2, 12, 2)
         lbl = QLabel("🎚️ 大小")
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(25, 400)  # 与 set_scale 的 0.2~4.0 夹紧一致（滚轮可到 4x）
+        slider.setRange(20, 400)  # 与 set_scale 的 0.2~4.0 夹紧一致（滚轮可到 4x）
         slider.setFixedWidth(130)
         pct = QLabel()
         lay.addWidget(lbl)
@@ -2573,6 +2643,26 @@ class PetWindow(QWidget):
     def _set_sound(self, on):
         self.cfg["sound"] = bool(on)
         save_config(self.cfg)
+
+    def _set_autostart(self, on):
+        """开机自启开关（默认关闭）：写入/删除 HKCU Run 键。
+
+        失败回弹用 blockSignals + 守卫标志，避免回弹再次触发 toggled 造成
+        提示互相覆盖或无限递归。"""
+        if getattr(self, "_autostart_busy", False):
+            return
+        self._autostart_busy = True
+        try:
+            ok, err = set_autostart(bool(on))
+            if not ok:
+                self._autostart_act.blockSignals(True)
+                self._autostart_act.setChecked(not on)  # 失败回弹勾选（不触发信号）
+                self._autostart_act.blockSignals(False)
+                self.show_bubble("开机自启设置失败：%s" % (err or "未知错误"))
+                return
+            self.show_bubble("开机自启已开启，下次开机我会自己跑出来~" if on else "开机自启已关闭~")
+        finally:
+            self._autostart_busy = False
 
     # ---------- v1.3：音效组 / 试听 / 气泡样式 / 台词 / 记账 / 资源对话框 ----------
     def _set_sound_group(self, name):
@@ -2861,7 +2951,13 @@ def _check_memory():
     try:
         rss_mb = psutil.Process().memory_info().rss / _MB
         ok = rss_mb < 1024
-        with open(os.path.join(DATA_DIR, "memory.log"), "a", encoding="utf-8") as fp:
+        path = os.path.join(DATA_DIR, "memory.log")
+        try:
+            if os.path.getsize(path) > 512 * 1024:  # 与 error.log 同口径：512KB 轮转
+                os.replace(path, path + ".old")
+        except Exception:
+            pass
+        with open(path, "a", encoding="utf-8") as fp:
             fp.write("memory check: %.1f MB, %s\n" % (rss_mb, "OK" if ok else "OVER 1GB"))
         return ok
     except Exception:
@@ -2939,6 +3035,61 @@ def _acquire_single_instance():
         return k32.GetLastError() != 183  # 183 = ERROR_ALREADY_EXISTS：另一实例在运行
     except Exception:
         return True  # 获取失败按放行处理
+
+
+# ---------------- 开机自启（默认关闭，用户自选） ----------------
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "大肥鱼桌宠"
+
+
+def _autostart_command():
+    """自启命令行：绿色版优先用 wscript 拉起 vbs（隐藏窗口）；源码运行用 pythonw。"""
+    base = app_dir()
+    vbs = os.path.join(base, "启动桌宠.vbs")
+    if os.path.isfile(vbs):
+        ws = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "wscript.exe")
+        return '"%s" "%s"' % (ws, vbs)
+    pyw = os.path.join(base, "pythonw.exe")
+    main_py = os.path.join(base, "桌宠.py")
+    if os.path.isfile(pyw) and os.path.isfile(main_py):
+        return '"%s" "%s"' % (pyw, main_py)
+    # 源码运行：优先同目录 pythonw（隐藏窗口），避免登录时闪控制台
+    pyw_next = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if os.path.isfile(pyw_next):
+        return '"%s" "%s"' % (pyw_next, os.path.join(base, "桌宠.py"))
+    return '"%s" "%s"' % (sys.executable, os.path.join(base, "桌宠.py"))
+
+
+def is_autostart_enabled():
+    """读取 HKCU Run 键判断是否已开启自启（任何异常视为未开启）。
+
+    命令与当前启动命令不一致（程序搬家后）视为未开启，避免勾选失实。
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as k:
+            val, _ = winreg.QueryValueEx(k, AUTOSTART_NAME)
+        return bool(val) and str(val).strip() == _autostart_command()
+    except Exception:
+        return False
+
+
+def set_autostart(on):
+    """写入/删除 HKCU Run 键。返回 (ok, err)。"""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE)
+        if on:
+            winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, _autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(key, AUTOSTART_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def main():
