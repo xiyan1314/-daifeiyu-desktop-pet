@@ -47,12 +47,17 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
 SLEEP_AFTER_SECONDS = 60 # 无交互多久入睡
 STATE_DURATION_MS = 2500 # 状态图默认展示时长
+# 跟随/散步行走参数（v1.4.2 降速档：温柔滑行，保证用户能追上点住）
+WALK_INTERVAL_MS = 120   # 行走 tick 间隔
+WALK_EASE = 0.10         # 每 tick 走剩余距离的比例（缓动）
+WALK_STEP_MIN = 1        # 每轴最小步进（px）
+WALK_STEP_MAX = 6        # 每轴最大步进（px，峰值约 50px/s）
 _MB = 1048576.0
 MEI_MAX_AGE_SECONDS = 7 * 86400  # 启动清理：只清理超过 7 天的 _MEI* 残留（降低误删风险）
 SOUND_KIND_MAP = {"boing": "press", "pop": "release", "feed": "feed"}
@@ -571,6 +576,19 @@ def _make_custom_state_pix(base, state):
     return pix
 
 
+def _walk_step(d, cap=None):
+    """行走步进（模块级纯函数，供验证脚本直接断言）：
+    每轴走剩余距离 WALK_EASE，夹紧在 [WALK_STEP_MIN, cap]。
+
+    cap 默认 WALK_STEP_MAX（6px）；主程序按窗口宽度自适应（大屏/大角色不龟速），
+    由 _walk_tick 传入，封顶 40px。
+    """
+    if d == 0:
+        return 0
+    cap = int(cap) if cap else WALK_STEP_MAX
+    return min(cap, max(WALK_STEP_MIN, int(abs(d) * WALK_EASE)))
+
+
 # ---------------- 跨线程信号 ----------------
 class Signals(QObject):
     reply = Signal(str)
@@ -1036,7 +1054,7 @@ class PetWindow(QWidget):
         self.flip = 1  # 1 = 朝左，-1 = 朝右
         self.busy = False
         self.walk_phase = 0
-        self._walk_interval = 80  # 跟随/散步 tick 间隔（v1.4.1 放缓，更好点住）
+        self._walk_interval = WALK_INTERVAL_MS
         self._wander_target = None
         self._tween_anim = None
         self._fly_timer = None
@@ -1976,8 +1994,8 @@ class PetWindow(QWidget):
     def _set_follow_mouse(self, on):
         self.cfg["follow_mouse"] = bool(on)
         if on:
+            self._wake()  # 睡着时开跟随：先醒过来再走（M4）
             self.cfg["wander"] = False
-            self._walk_interval = 80
             if self._wander_act:
                 self._wander_act.setChecked(False)
         save_config(self.cfg)
@@ -1986,8 +2004,8 @@ class PetWindow(QWidget):
     def _set_wander(self, on):
         self.cfg["wander"] = bool(on)
         if on:
+            self._wake()  # 睡着时开散步：先醒过来再走（M4）
             self.cfg["follow_mouse"] = False
-            self._walk_interval = 80
             self._wander_target = None
             if self._follow_act:
                 self._follow_act.setChecked(False)
@@ -2007,12 +2025,23 @@ class PetWindow(QWidget):
             self._apply_transform()
 
     def _walk_tick(self):
+        if self.busy:
+            return  # 喂食/吃帧期间暂停行走，避免「边吃边漂」（M3）
         if not self.has_frames and self._using_front and self.anim_mode not in ("state", "sleep"):
             self.item.setPixmap(self.sprites[self.form]["side"])
             self._using_front = False
         target = None
         if self.cfg.get("follow_mouse"):
             target = QCursor.pos()
+            # 距光标 60px 内停住伴飞：不追到光标正下方，给用户留出点击空间
+            cx, cy = self.frameGeometry().center().x(), self.frameGeometry().center().y()
+            if abs(target.x() - cx) < 60 and abs(target.y() - cy) < 60:
+                # 伴飞静止时复位正面贴图（静止显侧身很怪）
+                if not self.has_frames and not self._using_front:
+                    self.item.setPixmap(self.sprites[self.form]["front"])
+                    self._using_front = True
+                    self._apply_transform()
+                return
         elif self.cfg.get("wander"):
             scr = self._screen_geo(self.frameGeometry().center())
             if self._wander_target is None or self._reached(self._wander_target):
@@ -2029,10 +2058,15 @@ class PetWindow(QWidget):
         dy = target.y() - cur.y()
         if abs(dx) < 3 and abs(dy) < 3:
             return
-        # 缓动（v1.4.1 降速）：每 tick 走剩余距离 15%、上限 14px——
-        # 远处快近处慢，但不再瞬移到鼠标/目标上，用户能追上点住它
-        step_x = min(14, max(1, int(abs(dx) * 0.15)))
-        step_y = min(14, max(1, int(abs(dy) * 0.15)))
+        # 三区速度（v1.4.2）：远距（>200px）快追防 4K 大屏龟速；
+        # 近距缓行（8px 上限，温柔不吓人）；60px 内跟随模式已伴飞停下
+        dist = max(abs(dx), abs(dy))
+        if dist > 200:
+            cap = min(40, max(10, int(self.width() * 0.10)))
+        else:
+            cap = 8
+        step_x = _walk_step(dx, cap)
+        step_y = _walk_step(dy, cap)
         nx = cur.x() + (min(step_x, abs(dx)) if dx > 0 else -min(step_x, abs(dx)))
         ny = cur.y() + (min(step_y, abs(dy)) if dy > 0 else -min(step_y, abs(dy)))
         self.move(nx, ny)

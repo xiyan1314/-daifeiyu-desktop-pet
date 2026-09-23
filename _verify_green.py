@@ -42,7 +42,7 @@ main.DATA_DIR = _tmp
 main.CONFIG_PATH = os.path.join(_tmp, "config.json")
 main.USAGE_PATH = os.path.join(_tmp, "usage.json")
 
-check("green version", main.VERSION == "1.4.1", main.VERSION)
+check("green version", main.VERSION == "1.4.2", main.VERSION)
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 

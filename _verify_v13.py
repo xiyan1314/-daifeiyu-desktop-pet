@@ -94,6 +94,14 @@ def main_flow():
     check("lines_pools built", set(pet.lines_pools) == {"sajiao", "greedy", "happy", "idle"})
     check("bubble style default", main.BUBBLE_STYLE.get("font_size") == 10)
 
+    # ---- 1b. 行走参数断言（v1.4.2 降速档，纯函数直测） ----
+    check("walk interval", main.WALK_INTERVAL_MS == 120)
+    check("walk step far", main._walk_step(1000) == main.WALK_STEP_MAX)
+    check("walk step near", main._walk_step(4) == main.WALK_STEP_MIN)
+    check("walk step mid", main._walk_step(60) == 6)
+    check("walk step adaptive", main._walk_step(1000, 30) == 30)
+    check("walk step zero", main._walk_step(0) == 0)
+
     # ---- 2. 角色导入 + 切换（v1.3.1：单/双形态 + 素材自动处理） ----
     png = os.path.join(_tmp, "role_test.png")
     make_test_png(png)
