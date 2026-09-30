@@ -3056,8 +3056,8 @@ _SINGLE_MUTEX = None
 def _acquire_single_instance():
     """单实例保护：命名互斥体已存在（另一实例在跑）则返回 False。
 
-    使用 Local\ 命名空间（当前登录会话内可见）：不跨用户会话冲突，
-    也不需要 Global\ 所需的 SeCreateGlobalPrivilege（标准用户可用）。
+    使用 Local\\ 命名空间（当前登录会话内可见）：不跨用户会话冲突，
+    也不需要 Global\\ 所需的 SeCreateGlobalPrivilege（标准用户可用）。
     """
     global _SINGLE_MUTEX
     try:
