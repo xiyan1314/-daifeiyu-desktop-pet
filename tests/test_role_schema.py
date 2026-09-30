@@ -459,6 +459,23 @@ def test_custom_actions_accessors(tmp_path):
     assert lib.procs("nope") == {} and lib.procs("r1", 9) == {}
 
 
+def test_form_role_flags(tmp_path):
+    """v2.0.2 断点#12：形态角色标记归一化与访问器（"false"/"0" 字符串不算真）。"""
+    _write_index(tmp_path, [{
+        "id": "r3", "name": "x", "file": "a.png", "form": "dual",
+        "frames": ["a.png"],
+        "forms": [{"name": "常态", "file": "a.png", "sleep_form": "false", "no_feed": "0"},
+                  {"name": "二", "file": "b.png", "sleep_form": True,
+                   "transform_form": "true", "no_feed": 1}],
+        "added": "",
+    }], active="r3")
+    lib = pet_resources.RoleLibrary(str(tmp_path))
+    flags = lib.form_role_flags("r3")
+    assert flags == [{"sleep_form": False, "transform_form": False, "no_feed": False},
+                     {"sleep_form": True, "transform_form": True, "no_feed": True}]
+    assert lib.form_role_flags("nope") == []
+
+
 def test_delete_removes_custom_action_frames(tmp_path):
     """v2.0.1：自定义帧动作的文件也参与角色删除清理（_role_paths 收全动作键）。"""
     roles_dir = tmp_path / "roles"

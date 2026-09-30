@@ -196,6 +196,11 @@ def _norm_procs(v):
     return out
 
 
+def _flag_true(v):
+    """v2.0.2 断点#12：形态标记严格布尔（True/1/"1"/"true" 为真；"false"/"0" 不算）。"""
+    return v is True or v == 1 or v == "1" or v == "true"
+
+
 def _norm_states(v):
     """P1-7：states 归一化 {状态名: png 文件名}；未在 STATE_NAMES 的键丢弃。"""
     if not isinstance(v, dict):
@@ -377,6 +382,11 @@ class RoleLibrary:
         procs = _norm_procs(fm.get("procs"))
         if procs:
             out["procs"] = procs
+        # v2.0.2 断点#12：形态角色标记（睡觉/变身/不参与喂食）。
+        # 仅真值落盘（严格布尔：字符串 "false"/"0" 不算真），缺省 False=现行为等价
+        for _k in ("sleep_form", "transform_form", "no_feed"):
+            if _flag_true(fm.get(_k)):
+                out[_k] = True
         # P1-7 帧间隔：可选全局间隔（缺省沿用 IDLE_FRAME_MS/EAT_FRAME_MS）
         aiv = fm.get("anim_interval_ms")
         if isinstance(aiv, (int, float)) and aiv > 0:
@@ -691,6 +701,24 @@ class RoleLibrary:
         if not (0 <= form_idx < len(forms)):
             return {}
         return dict(forms[form_idx].get("procs") or {})
+
+    def form_role_flags(self, role_id):
+        """v2.0.2 断点#12：逐形态角色标记 [{sleep_form, transform_form, no_feed}]
+        （与 form_metas/form_keys 逐项对齐，缺省全部 False）；角色不存在返回 []。
+
+        严格布尔口径 _flag_true（"false"/"0" 字符串不算真）——读侧兜底：
+        经 _data 直接注入的角色（导入/测试路径）可能未经 _load 归一化。"""
+        r = self.get(str(role_id or ""))
+        if r is None:
+            return []
+        out = []
+        for fm in r.get("forms") or []:
+            out.append({
+                "sleep_form": _flag_true(fm.get("sleep_form")),
+                "transform_form": _flag_true(fm.get("transform_form")),
+                "no_feed": _flag_true(fm.get("no_feed")),
+            })
+        return out
 
     def form_state_paths(self, role_id):
         """P1-7：逐形态状态资源图绝对路径（与 form_metas 逐项对齐）。

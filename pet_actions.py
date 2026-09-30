@@ -77,9 +77,16 @@ class ActionService:
             return  # 摸摸头期间不跳不发 zzz（S3 修复）
         if pet._sleeping:
             return
+        # v2.0.2：待机行为（默认关闭；PetWindow 内部判断时机与去重，未配置=无操作）
+        _maybe_idle = getattr(pet, "maybe_idle_behavior", None)
+        if _maybe_idle is not None:
+            _maybe_idle()
         if pet.anim_mode in ("idle", "form_idle") and (time.monotonic() - pet._last_activity) > self._sleep_after:
             pet._show_sleep()
             pet.show_bubble(random.choice(["呼……呼……", "zzZ……睡得好香~", "睡着了……别吵~"]))
+            return
+        # v2.0.2：行为序列播放中不插播闲逛动作（防随机 jump/emote 与行为步骤互踩）
+        if getattr(pet, "_behavior_seq", None) is not None:
             return
         # P3-2：加权动作目录替代 0.35/0.65 魔法数（可扩展、可点播，共用 play_action）
         name, arg = self._pick()

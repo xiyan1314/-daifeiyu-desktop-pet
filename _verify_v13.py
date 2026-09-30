@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 
 FAILS = []
 CHECKS = []
-EXPECT_CHECKS = 161  # v2.0.1：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
+EXPECT_CHECKS = 180  # v2.0.2：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
 
 
 def check(name, cond, extra=""):
@@ -738,6 +738,125 @@ def main_flow():
     pet.apply_role("")
     check("restore default after custom", not pet._custom_role and pet.cfg.get("role") == "")
 
+    # ---- v2.0.2：行为自定义系统 + 断点#12 ----
+    import pet_behaviors  # noqa: E402
+    check("behavior service created", pet.behaviors is not None)
+    _bhv, _bhv_err = pet.behaviors.add("hello", [
+        {"act": "say", "text": "行为测试"}, {"act": "wait", "ms": 200},
+        {"act": "emote", "kind": "heart"}])
+    check("behavior add+get", _bhv is not None and not _bhv_err
+          and pet.behaviors.get(_bhv["id"])["name"] == "hello", "err=%r" % (_bhv_err,))
+    # 序列执行：say 气泡捕获 + 序列走完自清（不残留 _behavior_seq）
+    _bubbles = []
+    _real_bubble = pet.show_bubble
+    pet.show_bubble = lambda t: _bubbles.append(t)
+    try:
+        pet._run_behavior(_bhv["id"])
+        check("behavior seq starts", pet._behavior_seq is not None)
+        _t0 = time.time()
+        while pet._behavior_seq is not None and time.time() - _t0 < 4:
+            app.processEvents()
+            time.sleep(0.02)
+    finally:
+        pet.show_bubble = _real_bubble
+    check("behavior seq plays+ends", pet._behavior_seq is None
+          and any("行为测试" in b for b in _bubbles), "bubbles=%r" % (_bubbles,))
+    # 待机行为：默认关闭（现行为等价）；配置后空闲超时触发
+    check("behavior idle default off", pet.behaviors.idle(lambda: pet.cfg) is None)
+    pet.cfg["idle_behavior"] = _bhv["id"]
+    pet.cfg["idle_behavior_seconds"] = 5
+    pet._last_activity = time.monotonic() - 10
+    pet.maybe_idle_behavior()
+    check("idle behavior triggers", pet._behavior_seq is not None)
+    pet._behavior_seq = None
+    # 待机行为触发不得重置 _last_activity（入睡计时不受影响 → 行为后仍会入睡）
+    pet._last_activity = time.monotonic() - 70  # 已超入睡阈值
+    _act_before = pet._last_activity
+    pet._last_idle_behavior_at = 0.0  # 清掉上次触发的去重窗口（隔离验证本场景）
+    pet.maybe_idle_behavior()
+    check("idle behavior keeps sleep timer", pet._last_activity == _act_before
+          and pet._behavior_seq is not None)
+    pet._behavior_seq = None
+    pet.cfg["idle_behavior"] = ""
+    pet.cfg["idle_behavior_seconds"] = pet_behaviors.DEFAULT_BEHAVIOR_CFG["idle_behavior_seconds"]
+    # 行为级 off 等价：默认配置下 idle_tick 仍按旧逻辑入睡（行为系统关闭=现行为）
+    _sleep_calls = []
+    _real_show_sleep = pet._show_sleep
+    pet._show_sleep = lambda: _sleep_calls.append(1)
+    pet._last_activity = time.monotonic() - 70
+    pet.anim_mode = "idle"
+    try:
+        pet.actions.idle_tick()
+    finally:
+        pet._show_sleep = _real_show_sleep
+    check("idle tick off-equivalent sleep", len(_sleep_calls) == 1, "n=%d" % len(_sleep_calls))
+    # 配置归一化：越界/坏值钳回默认口径
+    _cfg_saved = dict(pet.cfg)
+    pet.cfg["idle_behavior_seconds"] = 99999
+    pet.cfg["transform_seconds"] = "abc"
+    main.save_config(pet.cfg)
+    _cfg_n = main.load_config()
+    check("config behavior clamp",
+          _cfg_n.get("idle_behavior_seconds") == 60  # 上界=入睡阈值，防死配置
+          and _cfg_n.get("transform_seconds") == pet_behaviors.DEFAULT_BEHAVIOR_CFG["transform_seconds"],
+          "s=%r t=%r" % (_cfg_n.get("idle_behavior_seconds"), _cfg_n.get("transform_seconds")))
+    main.save_config(_cfg_saved)
+    pet.cfg = dict(_cfg_saved)
+    # 断点#12：双形态角色（睡觉/变身/不参与喂食标记；字符串 "false" 不算真）
+    _cb_dir = os.path.join(_tmp, "roles")
+    os.makedirs(_cb_dir, exist_ok=True)
+    for _fn in ("cb_a.png", "cb_b.png"):
+        make_test_png(os.path.join(_cb_dir, _fn), 96, 96)
+    pet.role_lib._data["roles"].append({
+        "id": "cb1", "name": "行为角色", "file": "cb_a.png",
+        "form": "dual", "file_full": "", "frames": ["cb_a.png"], "added": "",
+        "forms": [
+            {"name": "常态", "file": "cb_a.png", "sleep_form": "false"},
+            {"name": "睡觉/变身", "file": "cb_b.png", "sleep_form": True,
+             "transform_form": True, "no_feed": True},
+        ],
+    })
+    pet.role_lib._save()
+    pet.apply_role("cb1")
+    _flags = pet.role_lib.form_role_flags("cb1")
+    check("form flags normalized", len(_flags) == 2
+          and _flags[0] == {"sleep_form": False, "transform_form": False, "no_feed": False}
+          and _flags[1] == {"sleep_form": True, "transform_form": True, "no_feed": True},
+          "flags=%r" % (_flags,))
+    check("transform form entry", pet.has_transform_form is True)
+    # 变身：切到标记形态，_end_transform 回原形态
+    pet._do_transform()
+    check("transform switches", pet.form == "f1" and pet._transform_home == "f0")
+    pet._end_transform()
+    check("transform returns", pet.form == "f0" and pet._transform_home is None)
+    # 睡觉形态：入睡切到标记形态，醒来回原形态
+    pet._show_sleep()
+    check("sleep form switch", pet.form == "f1" and pet._sleep_home == "f0")
+    pet._wake()
+    check("wake returns home", pet.form == "f0" and pet._sleep_home is None and not pet._sleeping)
+    # 不参与喂食：气泡明示且 busy 不置位
+    pet._set_form("f1")
+    _bubbles2 = []
+    pet.show_bubble = lambda t: _bubbles2.append(t)
+    pet.feed("小鱼干")
+    pet.show_bubble = _real_bubble
+    check("no_feed rejects", not pet.busy and bool(_bubbles2),
+          "bubbles=%r busy=%r" % (_bubbles2, pet.busy))
+    pet._set_form("f0")
+    # 行为设置对话框冒烟
+    try:
+        _bd = pet_dialogs.BehaviorDialog(pet, pet.behaviors)
+        _bd.show()
+        app.processEvents()
+        _bd.close()
+        check("behavior dialog smoke", True)
+    except Exception as e:
+        check("behavior dialog smoke", False, repr(e))
+    # 清理
+    pet.apply_role("")
+    pet.role_lib.delete("cb1")
+    pet.behaviors.delete(_bhv["id"])
+
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
     make_test_wav(wav)
@@ -838,6 +957,8 @@ def main_flow():
         check("menu all items", len(texts) >= 35, "count=%d" % len(texts))
         check("menu ledger item", any("账本" in t for t in texts))
         check("menu resource item", any("资源管理" in t for t in texts))
+        check("menu behavior entry", any("行为设置" in t for t in texts))
+        check("menu transform hidden default", not any(t == "🐡 变身" for t in texts))
         check("menu role item", any("角色" in t for t in texts))
         check("menu has size slider", any(isinstance(a, main.QWidgetAction) for a in captured._captured))
         check("menu city item", any("天气城市" in t for t in texts))

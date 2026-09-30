@@ -56,6 +56,7 @@ import pet_menu
 import pet_ai
 import pet_actions
 import pet_main
+import pet_behaviors
 
 
 APP_NAME = "大肥鱼桌宠"
@@ -153,6 +154,11 @@ DEFAULT_CONFIG = {
                 "groundFriction": 2.5, "ceilingBounce": True, "throwPower": 1.0},
     # v2.0：语音系统（默认关闭；默认值单一来源 pet_voice.DEFAULT_VOICE）
     "voice": pet_voice.DEFAULT_VOICE,
+    # v2.0.2：行为系统（默认值单一来源 pet_behaviors.DEFAULT_BEHAVIOR_CFG；
+    # 待机行为默认关闭 = 行为与旧版完全等价）
+    "idle_behavior": pet_behaviors.DEFAULT_BEHAVIOR_CFG["idle_behavior"],
+    "idle_behavior_seconds": pet_behaviors.DEFAULT_BEHAVIOR_CFG["idle_behavior_seconds"],
+    "transform_seconds": pet_behaviors.DEFAULT_BEHAVIOR_CFG["transform_seconds"],
 }
 
 # P1-3：config.json schema 版本（1=旧版全量存储；2=diff 只存改动项）
@@ -164,7 +170,8 @@ CONFIG_FIXES = []
 _SOFT_FIX_KEYS = {"always_on_top", "ai_enabled", "follow_mouse", "wander", "sound", "badge",
                   "ai_base_url", "ai_model", "ai_system_prompt", "lines_extra",
                   "sound_group", "role", "scale_compensated_role",
-                  "ai_persona", "click_through", "role_frame_max", "physics", "voice"}
+                  "ai_persona", "click_through", "role_frame_max", "physics", "voice",
+                  "idle_behavior", "idle_behavior_seconds", "transform_seconds"}
 
 
 def _fix_entry(k, a, b):
@@ -545,6 +552,8 @@ class PetWindow(QWidget):
         # v2.0：语音服务（默认关闭；片段播放注入 preview_audio）
         self.voice = pet_voice.VoiceService(DATA_DIR, lambda: self.cfg,
                                             self._play_voice_clip, _log_error)
+        # v2.0.2：行为自定义服务（待机行为/行为序列；执行调度在本类主线程）
+        self.behaviors = pet_behaviors.BehaviorService(DATA_DIR)
         self.menu_builder = pet_menu.MenuBuilder(self, save_config, is_autostart_enabled)
 
         self.bubble = Bubble()
@@ -684,6 +693,10 @@ class PetWindow(QWidget):
         self._click_cache_key = None
         self._tween_anim = None
         self._tween_finish_cb = None  # P1-2：当前动画的收尾回调（被顶替时手动执行）
+        self._behavior_seq = None     # v2.0.2：在途行为序列（切角色/退出时取消）
+        self._transform_timer = None  # v2.0.2：变身回切定时器
+        self._transform_home = None   # v2.0.2：变身前的形态（回切目标）
+        self._sleep_home = None       # v2.0.2：因睡觉形态切换前的原形态（醒来回切）
         self._mem_epoch = 0  # P1-6：记忆代次（清理记忆后 +1，在途 AI 回复据此判断是否入记忆）
         self._fly_timer = None
         self._anchor_bottom = False
@@ -924,6 +937,183 @@ class PetWindow(QWidget):
         self._state_timer.stop()
         self._run_anim(int(period * cycles), _onv, on_finished=_done)
 
+    # ---------- v2.0.2：行为系统与断点#12 ----------
+    def _action_exists(self, name):
+        """行为引用查表：内建分支 / 帧集动作 / 合成动作（供行为执行前校验，防静默 no-op）。"""
+        return (name in ("jump", "emote", "none")
+                or name in (self.anim._sets or {})
+                or name in self._cur_procs())
+
+    def _form_role_flags(self):
+        """当前角色的逐形态角色标记（与 form_keys 对齐）；默认角色返回 []。"""
+        if not self._custom_role:
+            return []
+        return self.role_lib.form_role_flags(self.cfg.get("role", ""))
+
+    def _flag_forms(self, flag):
+        """带某标记（sleep_form/transform_form/no_feed）的形态键列表。"""
+        out = []
+        for _k, _f in zip(self.form_keys, self._form_role_flags()):
+            if _f.get(flag):
+                out.append(_k)
+        return out
+
+    @property
+    def has_transform_form(self):
+        """v2.0.2：当前角色是否配置了变身形态（菜单「变身」入口显示条件）。"""
+        return bool(self._flag_forms("transform_form"))
+
+    def _form_no_feed(self):
+        """当前形态是否标记「不参与喂食」。"""
+        _idx = self.form_keys.index(self.form) if self.form in self.form_keys else 0
+        _flags = self._form_role_flags()
+        return bool(_flags and 0 <= _idx < len(_flags) and _flags[_idx].get("no_feed"))
+
+    def _sleep_form_key(self):
+        """睡觉形态键（无标记返回 None=现状）。"""
+        _sf = self._flag_forms("sleep_form")
+        return _sf[0] if _sf else None
+
+    def _cancel_transform(self):
+        """停掉变身回切定时器并复位状态（幂等）。"""
+        if self._transform_timer is not None:
+            try:
+                self._transform_timer.stop()
+                self._transform_timer.deleteLater()
+            except RuntimeError:
+                pass  # 有意忽略：定时器可能已被销毁（幂等清理）
+            self._transform_timer = None
+        self._transform_home = None
+
+    def _do_transform(self):
+        """v2.0.2 断点#12：切到变身形态，transform_seconds 后自动回原形态；
+        已在变身形态时再点一次提前变回来。"""
+        if self.busy or self._petting or self._sleeping:
+            return  # 互动/睡眠中不切形态（睡眠中想变先唤醒）
+        _tf = self._flag_forms("transform_form")
+        if not _tf:
+            return
+        _target = _tf[0]
+        _d_secs = pet_behaviors.DEFAULT_BEHAVIOR_CFG["transform_seconds"]
+        if self.form == _target:
+            _home = self._transform_home
+            self._cancel_transform()
+            if _home and _home in self.form_keys:
+                self._set_form(_home)
+            elif self.form != self.form_keys[0]:
+                # 手动停在变身形态且无回切目标：回第一形态（与喂食消化回位同语义）
+                self._set_form(self.form_keys[0])
+            self.show_bubble("变回来啦~")
+            return
+        self._cancel_transform()
+        self._transform_home = self.form
+        self._set_form(_target, cancel_transform=False)
+        self._last_activity = time.monotonic()
+        self.show_bubble("变身！")
+        try:
+            _secs = int(self.cfg.get("transform_seconds", _d_secs) or _d_secs)
+        except (TypeError, ValueError):
+            _secs = _d_secs  # 有意忽略：坏值回默认（normalize 已兜底，此处防御直改 cfg）
+        self._transform_timer = QTimer(self)
+        self._transform_timer.setSingleShot(True)
+        self._transform_timer.timeout.connect(self._end_transform)
+        self._transform_timer.start(max(pet_behaviors.TRANSFORM_SECS_MIN,
+                                        min(pet_behaviors.TRANSFORM_SECS_MAX, _secs)) * 1000)
+
+    def _end_transform(self):
+        _home = self._transform_home  # 先取回切目标（_cancel_transform 会清空）
+        self._cancel_transform()
+        if _home and _home in self.form_keys:
+            self._set_form(_home, cancel_transform=False)
+
+    def maybe_idle_behavior(self):
+        """v2.0.2：待机行为（idle_tick 每拍调用）。未配置/条件不满足 → 不做任何事
+        （默认关闭 = 行为与旧版完全等价）。"""
+        _b = self.behaviors.idle(lambda: self.cfg)
+        if _b is None:
+            return
+        if self.busy or self._petting or self._sleeping:
+            return
+        if self.anim_mode not in ("idle", "form_idle"):
+            return
+        try:
+            _secs = int(self.cfg.get("idle_behavior_seconds",
+                                     pet_behaviors.DEFAULT_BEHAVIOR_CFG["idle_behavior_seconds"]) or 0)
+        except (TypeError, ValueError):
+            _secs = 0  # 有意忽略：坏值按不启用处理（normalize 已兜底，此处防御直改 cfg）
+        _now = time.monotonic()
+        if _secs <= 0 or _now - self._last_activity < _secs:
+            return
+        # 距上次待机行为触发不足 secs → 本轮不重复触发；
+        # 用独立时间戳而非重置 _last_activity：不打断入睡阈值计时
+        # （待机行为触发后仍按现有逻辑进睡眠，除非行为本身含 sleep 步骤）
+        if _now - getattr(self, "_last_idle_behavior_at", 0.0) < _secs:
+            return
+        self._last_idle_behavior_at = _now
+        self._run_behavior(_b["id"])
+
+    def _run_behavior(self, bid):
+        """v2.0.2：启动行为序列（主线程、QTimer 逐步骤调度；不设 busy）。
+
+        序列带代次 token：重触发时旧序列挂起的 singleShot 触发后因代次不符立即退出，
+        不会并行驱动新序列（防 wait 节奏错乱/步骤重叠）。"""
+        _b = self.behaviors.get(bid)
+        if _b is None or not _b.get("steps"):
+            return
+        _gen = getattr(self, "_behavior_gen", 0) + 1
+        self._behavior_gen = _gen
+        self._behavior_seq = {"steps": list(_b["steps"]), "idx": 0, "gen": _gen}
+        self._behavior_step(_gen)
+
+    def _behavior_step(self, gen):
+        """行为序列的下一步（wait 控制步进；喂食/戳戳忙碌时跳过互斥步骤）。"""
+        _seq = self._behavior_seq
+        if _seq is None or _seq.get("gen") != gen:
+            return  # 序列已被新触发顶替：旧链静默退出（幂等）
+        if _seq["idx"] >= len(_seq["steps"]):
+            self._behavior_seq = None
+            return
+        _st = _seq["steps"][_seq["idx"]]
+        _act = _st["act"]
+        if _act == "play_action":
+            # 与 play_action 同款门控：busy/摸摸头时有意跳过（互斥语义，非静默失败）
+            if not (self.busy or self._petting):
+                # 红线：引用的动作已不存在时不静默跳过，气泡明示
+                if self._action_exists(_st["name"]):
+                    self.actions.play_action(_st["name"])
+                else:
+                    self.show_bubble("动作「%s」不见了，跳过~" % _st["name"])
+        elif _act == "say":
+            self.show_bubble(_st["text"])
+        elif _act == "voice":
+            self.voice.play_event(_st["event"])
+        elif _act == "emote":
+            self._show_emote(_st["kind"])
+        elif _act == "form":
+            if not (self.busy or self._petting):
+                if _st["name"] in self.form_keys:
+                    self._stop_tween()  # 与合成动作互斥：先停振荡再切形态
+                    self._set_form(_st["name"])
+                else:
+                    self.show_bubble("形态「%s」不存在，跳过~" % _st["name"])
+        elif _act == "sleep":
+            if not (self.busy or self._petting):
+                self._stop_tween()
+                self._show_sleep()
+                # sleep 为终止步：入睡中继续播后续步骤会被 _wake 回切撤销、语义混乱
+                self._behavior_seq = None
+                return
+        _wait = _st.get("ms", 500) if _act == "wait" else 400
+        _seq["idx"] += 1
+        QTimer.singleShot(_wait, self, lambda: self._behavior_step(gen))
+
+    def _open_behavior_dialog(self):
+        """v2.0.2：行为设置对话框（菜单入口）。"""
+        try:
+            pet_dialogs.BehaviorDialog(self, self.behaviors, save_config).exec()
+        except Exception as e:
+            _log_error("behavior dialog: %r" % (e,))
+
     def _compute_base_size(self):
         """P1-7：窗口基准尺寸。旧角色 = 各形态侧图最大尺寸（现行为）；
         v2 角色 = 各形态 (宽×形态scale, 高×形态scale) 的最大值，保证
@@ -1108,6 +1298,9 @@ class PetWindow(QWidget):
         if self._digest_timer is not None:
             self._digest_timer.stop()  # 切换角色：作废旧角色的消化定时器（L1）
         self._stop_tween()  # v2.0.1：切角色立即停合成动作，防旧角色振荡残留到新角色
+        self._behavior_seq = None      # v2.0.2：切角色取消在途行为序列
+        self._cancel_transform()       # v2.0.2：切角色取消变身回切定时器
+        self._sleep_home = None
         self._build_sprites()
         self._build_state_pix()  # 自定义角色：程序化表情图随底图重建
         # P1-7：各形态尺寸可能不同：窗口按较大者定（v2 角色计入形态 scale），避免溢出/不居中
@@ -1271,7 +1464,15 @@ class PetWindow(QWidget):
             self._play_idle()
 
     def _show_sleep(self):
+        if self._sleeping:
+            return  # v2.0.2：已在睡时重入直接返回（防二次睡眠语音/zzz 重播）
         self.voice.play_event("sleep")  # v2.0：睡眠语音片段（未配置/关闭则静默）
+        # v2.0.2 断点#12：配置了睡觉形态则先切过去（醒来回到原形态）
+        if self._custom_role and not self._sleeping:
+            _sf = self._sleep_form_key()
+            if _sf and _sf != self.form:
+                self._sleep_home = self.form
+                self._set_form(_sf)
         self.anim.stop()
         self.anim_mode = "sleep"
         self._cur_state = "sleep"
@@ -1291,6 +1492,9 @@ class PetWindow(QWidget):
         self._last_activity = time.monotonic()
         if self._sleeping:
             self.voice.play_event("wake")  # v2.0：唤醒语音片段
+            if self._sleep_home and self._sleep_home in self.form_keys:
+                self._set_form(self._sleep_home)  # v2.0.2：醒来回到睡觉前的形态
+            self._sleep_home = None
             self._play_idle()
 
     def _show_pet(self):
@@ -1753,11 +1957,13 @@ class PetWindow(QWidget):
         anim.start()
         return anim
 
-    def _set_form(self, form, refresh=True):
+    def _set_form(self, form, refresh=True, cancel_transform=True):
         if form not in self.sprites:
             return
         if form == self.form:
             return  # 同形态重选：什么都不做，避免待机动画重启造成的帧跳/卡顿
+        if cancel_transform:
+            self._cancel_transform()  # v2.0.2：手动切形态取消变身回切定时器（防 8s 后强制弹回）
         self.form = form
         if self._custom_role:
             # P1-7：形态切换后帧集按「形态×动作」重查；若正在播待机帧，
@@ -1790,6 +1996,11 @@ class PetWindow(QWidget):
     def feed(self, food):
         if self.busy:
             self.show_bubble(random.choice(["嘴里还有呢，等一下~", "别急嘛，还在吃！", "呜……咽不下去啦！"]))
+            return
+        # v2.0.2 断点#12：当前形态标记「不参与喂食」→ 明确拒绝，不静默
+        if self._form_no_feed():
+            self.show_bubble(random.choice(["这个形态不吃东西啦~", "本形态拒绝投喂！",
+                                            "现在只想安静地当一条鱼~"]))
             return
         self.busy = True
         if self.cfg.get("sound", True):

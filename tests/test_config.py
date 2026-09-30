@@ -25,6 +25,15 @@ def cfg_path(tmp_path, monkeypatch):
 
 # ---------------- diff 存储 ----------------
 
+def test_behavior_defaults_single_source():
+    """v2.0.2：行为配置默认值单一来源（DEFAULT_CONFIG 引用 pet_behaviors.DEFAULT_BEHAVIOR_CFG）。"""
+    import pet_behaviors
+    d = pet_behaviors.DEFAULT_BEHAVIOR_CFG
+    assert main.DEFAULT_CONFIG["idle_behavior"] == d["idle_behavior"]
+    assert main.DEFAULT_CONFIG["idle_behavior_seconds"] == d["idle_behavior_seconds"]
+    assert main.DEFAULT_CONFIG["transform_seconds"] == d["transform_seconds"]
+
+
 def test_diff_save_only_changes(cfg_path):
     cfg = dict(main.DEFAULT_CONFIG)
     cfg["city"] = "上海"

@@ -14,6 +14,7 @@ import os
 import pet_log  # P1-手感：物理参数非法时记日志（pet_log 无任何依赖，安全）
 import pet_physics  # P1-手感：默认值单一来源（pet_physics 无 Qt 依赖，无环）
 import pet_voice  # v2.0：语音配置归一化（pet_voice 无环）
+import pet_behaviors  # v2.0.2：行为配置默认值单一来源（pet_behaviors 无环）
 
 # 上界与设置对话框同口径（pet_dialogs.PhysicsDialog 的 spinbox 范围）
 _PHYS_MAX = {"gravity": 10000.0, "restitution": 1.0,
@@ -177,6 +178,27 @@ def normalize_cfg(cfg, defaults, persona_ids):
     cfg["physics"] = _pd
     # v2.0：语音配置归一化（默认关闭；tts_mode 白名单）
     cfg["voice"] = pet_voice.normalize_voice(cfg.get("voice"))
+    # v2.0.2：行为系统配置归一化（默认值单一来源 pet_behaviors.DEFAULT_BEHAVIOR_CFG）
+    _bcfg = pet_behaviors.DEFAULT_BEHAVIOR_CFG
+    cfg["idle_behavior"] = str(cfg.get("idle_behavior", "") or "").strip()
+    # 空闲上界 = 入睡阈值（SLEEP_AFTER_SECONDS）：超过则入睡先于待机行为触发，
+    # 行为永远不可达（死配置）；钳制界限单一来源 pet_behaviors
+    try:
+        cfg["idle_behavior_seconds"] = max(
+            pet_behaviors.IDLE_SECS_MIN,
+            min(pet_behaviors.IDLE_SECS_MAX,
+                int(cfg.get("idle_behavior_seconds",
+                            _bcfg["idle_behavior_seconds"]) or _bcfg["idle_behavior_seconds"])))
+    except (TypeError, ValueError):
+        cfg["idle_behavior_seconds"] = _bcfg["idle_behavior_seconds"]
+    try:
+        cfg["transform_seconds"] = max(
+            pet_behaviors.TRANSFORM_SECS_MIN,
+            min(pet_behaviors.TRANSFORM_SECS_MAX,
+                int(cfg.get("transform_seconds",
+                            _bcfg["transform_seconds"]) or _bcfg["transform_seconds"])))
+    except (TypeError, ValueError):
+        cfg["transform_seconds"] = _bcfg["transform_seconds"]
     cfg["sound_group"] = "custom" if cfg.get("sound_group") == "custom" else "default"
     try:
         bs = cfg.get("bubble_style")

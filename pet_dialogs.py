@@ -97,6 +97,7 @@ from PySide6.QtWidgets import (
 
 import pet_audio
 import pet_resources  # P3-5+：FRAME_MAX（帧上限用户可调）
+import pet_behaviors  # v2.0.2：行为动作白名单/序列校验（BehaviorDialog 共用口径）
 
 # ---------------- 主题 ----------------
 DIALOG_QSS = """
@@ -1394,6 +1395,7 @@ class RoleEditDialog(QDialog):
         self._touched_name = set()
         self._touched_render = set()
         self._touched_interval = set()
+        self._touched_flags = set()   # v2.0.2 断点#12：形态角色标记触碰集合
         self._staged = []            # 本次写入 roles/ 的新文件名（失败/取消时清理）
         self._tmpdir = None
 
@@ -1484,6 +1486,12 @@ class RoleEditDialog(QDialog):
                    self._off_x, self._off_y):
             _w.valueChanged.connect(lambda _v, _w=_w: self._mark("render"))
         self._interval.valueChanged.connect(lambda _v: self._mark("interval"))
+        # v2.0.2 断点#12：形态角色标记（睡觉/变身/不参与喂食）
+        self._ck_sleep_form = QCheckBox("睡觉形态")
+        self._ck_transform_form = QCheckBox("变身形态")
+        self._ck_no_feed = QCheckBox("不参与喂食")
+        for _ck in (self._ck_sleep_form, self._ck_transform_form, self._ck_no_feed):
+            _ck.toggled.connect(lambda _on: self._mark("flags"))
         rg.addWidget(QLabel("锚点 X"), 0, 0)
         rg.addWidget(self._anchor_x, 0, 1)
         rg.addWidget(QLabel("锚点 Y"), 1, 0)
@@ -1496,6 +1504,13 @@ class RoleEditDialog(QDialog):
         rg.addWidget(self._off_y, 4, 1)
         rg.addWidget(QLabel("动画帧间隔"), 5, 0)
         rg.addWidget(self._interval, 5, 1)
+        rg.addWidget(QLabel("角色标记"), 6, 0)
+        _fl_row = QHBoxLayout()
+        _fl_row.addWidget(self._ck_sleep_form)
+        _fl_row.addWidget(self._ck_transform_form)
+        _fl_row.addWidget(self._ck_no_feed)
+        _fl_row.addStretch(1)
+        rg.addLayout(_fl_row, 6, 1)
         right.addWidget(render_box)
 
         st_row = QHBoxLayout()
@@ -1572,6 +1587,15 @@ class RoleEditDialog(QDialog):
                 fm["anim_interval_ms"] = v
             else:
                 fm.pop("anim_interval_ms", None)
+        # v2.0.2 断点#12：形态角色标记——勾选即 True，取消即删除键（缺省 False）
+        if self._cur_idx in self._touched_flags:
+            for _flag, _ck in (("sleep_form", self._ck_sleep_form),
+                               ("transform_form", self._ck_transform_form),
+                               ("no_feed", self._ck_no_feed)):
+                if _ck.isChecked():
+                    fm[_flag] = True
+                else:
+                    fm.pop(_flag, None)
 
     def _refresh_form_list(self):
         self._loading = True
@@ -1607,6 +1631,11 @@ class RoleEditDialog(QDialog):
             self._off_y.setValue(int(off.get("y", 0)))
             aiv = fm.get("anim_interval_ms")
             self._interval.setValue(int(aiv) if isinstance(aiv, (int, float)) and aiv > 0 else 0)
+            # v2.0.2 断点#12：形态角色标记回填（_loading 期间 toggled 不触碰 _touched_flags）。
+            # 用 _flag_true 与运行时同口径：直注数据带 "false"/"0" 字符串时不误勾
+            self._ck_sleep_form.setChecked(pet_resources._flag_true(fm.get("sleep_form")))
+            self._ck_transform_form.setChecked(pet_resources._flag_true(fm.get("transform_form")))
+            self._ck_no_feed.setChecked(pet_resources._flag_true(fm.get("no_feed")))
         finally:
             self._loading = False
         self._update_statuses()
@@ -1669,7 +1698,8 @@ class RoleEditDialog(QDialog):
             fi2 = j if fi == idx else (idx if fi == j else fi)
             new_states[(fi2, st)] = v
         self._pending_states = new_states
-        for touched in (self._touched_name, self._touched_render, self._touched_interval):
+        for touched in (self._touched_name, self._touched_render, self._touched_interval,
+                         self._touched_flags):
             if idx in touched or j in touched:
                 new_t = set()
                 for fi in touched:
@@ -2042,6 +2072,304 @@ class RoleEditDialog(QDialog):
         if self.result() != QDialog.DialogCode.Accepted:
             self._cleanup_staged()  # v2.0.1：取消/关闭时回收未提交的新文件
         super().closeEvent(event)
+
+
+# ---------------- v2.0.2：行为自定义 ----------------
+class BehaviorDialog(QDialog):
+    """行为自定义对话框：列表 + 新建/编辑/删除 + 步骤编辑 + 试播 + 导入/导出。
+
+    待机行为 / 触发秒数 / 变身时长也在这里配置（写 pet.cfg 并 save_cfg 持久化）。
+    """
+
+    def __init__(self, pet, svc=None, save_cfg=None):
+        super().__init__(pet)
+        self.pet = pet
+        self.svc = svc or getattr(pet, "behaviors", None)
+        self._save_cfg = save_cfg or (lambda cfg: None)
+        self._editing_id = None
+        self.setWindowTitle("行为自定义")
+        self.setStyleSheet(DIALOG_QSS)
+        self.resize(640, 500)
+        lay = QVBoxLayout(self)
+
+        # ---- 待机行为设置（断点：待机行为红线） ----
+        idle_row = QHBoxLayout()
+        idle_row.addWidget(QLabel("待机行为"))
+        self._idle_combo = QComboBox()
+        self._idle_secs = QSpinBox()
+        # 上界 = 入睡阈值：超过则待机行为永远不触发（界限单一来源 pet_behaviors）
+        self._idle_secs.setRange(pet_behaviors.IDLE_SECS_MIN, pet_behaviors.IDLE_SECS_MAX)
+        self._idle_secs.setSuffix(" 秒")
+        idle_row.addWidget(self._idle_combo, 1)
+        idle_row.addWidget(QLabel("空闲"))
+        idle_row.addWidget(self._idle_secs)
+        idle_row.addWidget(QLabel("触发；变身时长"))
+        self._transform_secs = QSpinBox()
+        self._transform_secs.setRange(pet_behaviors.TRANSFORM_SECS_MIN,
+                                      pet_behaviors.TRANSFORM_SECS_MAX)
+        self._transform_secs.setSuffix(" 秒")
+        idle_row.addWidget(self._transform_secs)
+        lay.addLayout(idle_row)
+        self._idle_combo.currentIndexChanged.connect(self._on_idle_pick)
+        self._idle_secs.valueChanged.connect(lambda _v: self._save_cfg_vals())
+        self._transform_secs.valueChanged.connect(lambda _v: self._save_cfg_vals())
+
+        # ---- 行为列表 ----
+        lay.addWidget(QLabel("已有行为（双击试播）"))
+        self._list = QListWidget()
+        self._list.currentRowChanged.connect(self._on_sel)
+        self._list.itemDoubleClicked.connect(lambda _i: self._test_play())
+        lay.addWidget(self._list, 2)
+
+        # ---- 名称与步骤编辑 ----
+        nm_row = QHBoxLayout()
+        nm_row.addWidget(QLabel("行为名"))
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("英文字母开头，字母/数字/下划线")
+        nm_row.addWidget(self._name, 1)
+        lay.addLayout(nm_row)
+        lay.addWidget(QLabel("动作序列（按顺序执行，wait 控制间隔）"))
+        self._steps = QListWidget()
+        lay.addWidget(self._steps, 3)
+        add_row = QHBoxLayout()
+        self._act_combo = QComboBox()
+        for act in pet_behaviors.BEHAVIOR_ACTS:
+            self._act_combo.addItem(self._act_label(act), act)
+        self._param = QLineEdit()
+        self._act_combo.currentIndexChanged.connect(
+            lambda _i: self._param.setPlaceholderText(self._param_hint(self._act_combo.currentData())))
+        self._param.setPlaceholderText(self._param_hint(self._act_combo.currentData()))
+        b_add_step = QPushButton("添加步骤")
+        b_add_step.clicked.connect(self._add_step)
+        add_row.addWidget(self._act_combo)
+        add_row.addWidget(self._param, 1)
+        add_row.addWidget(b_add_step)
+        lay.addLayout(add_row)
+        del_row = QHBoxLayout()
+        b_del_step = QPushButton("删除选中步骤")
+        b_del_step.clicked.connect(lambda: self._steps.takeItem(self._steps.currentRow()))
+        del_row.addWidget(b_del_step)
+        del_row.addStretch(1)
+        lay.addLayout(del_row)
+
+        # ---- 按钮 ----
+        btn_row = QHBoxLayout()
+        for _label, _cb in (("新建", self._new), ("保存", self._save), ("删除", self._delete),
+                            ("试播", self._test_play), ("导入…", self._import), ("导出…", self._export),
+                            ("关闭", self.accept)):
+            _b = QPushButton(_label)
+            _b.clicked.connect(_cb)
+            btn_row.addWidget(_b)
+        lay.addLayout(btn_row)
+        self._refresh()
+
+    # ---------- 展示辅助 ----------
+    @staticmethod
+    def _act_label(act):
+        return {"play_action": "动作", "say": "台词", "voice": "语音",
+                "emote": "表情", "form": "切形态", "sleep": "入睡", "wait": "等待"}.get(act, act)
+
+    @staticmethod
+    def _param_hint(act):
+        return {"play_action": "动作名（帧动作/合成动作）", "say": "台词内容",
+                "voice": "事件：reply/feed/poke/sleep/wake",
+                "emote": "表情：note/sparkle/heart/zzz",
+                "form": "形态键（f0/f1 等内部键，见角色形态列表）", "sleep": "无需参数（终止步）",
+                "wait": "等待毫秒数（100~30000）"}.get(act, "")
+
+    @staticmethod
+    def _step_text(st):
+        act = st["act"]
+        if act == "play_action":
+            return "动作：%s" % st["name"]
+        if act == "say":
+            return "台词：%s" % st["text"]
+        if act == "voice":
+            return "语音：%s" % st["event"]
+        if act == "emote":
+            return "表情：%s" % st["kind"]
+        if act == "form":
+            return "切形态：%s" % st["name"]
+        if act == "sleep":
+            return "入睡"
+        return "等待 %d ms" % st["ms"]
+
+    # ---------- 待机/时长设置 ----------
+    def _save_cfg_vals(self):
+        cfg = getattr(self.pet, "cfg", None)
+        if not isinstance(cfg, dict):
+            return
+        cfg["idle_behavior_seconds"] = self._idle_secs.value()
+        cfg["transform_seconds"] = self._transform_secs.value()
+        self._save_cfg(cfg)
+
+    def _on_idle_pick(self, _idx):
+        cfg = getattr(self.pet, "cfg", None)
+        if not isinstance(cfg, dict):
+            return
+        cfg["idle_behavior"] = self._idle_combo.currentData() or ""
+        self._save_cfg(cfg)
+
+    # ---------- 列表 ----------
+    def _refresh(self):
+        self._list.clear()
+        _cfg = getattr(self.pet, "cfg", {}) or {}
+        # 待机行为下拉：不启用 + 全部行为
+        self._idle_combo.blockSignals(True)
+        self._idle_combo.clear()
+        self._idle_combo.addItem("（不启用 → 默认待机）", "")
+        if self.svc is not None:
+            for b in self.svc.list():
+                self._list.addItem("%s（%d 步）" % (b["name"], len(b["steps"])))
+                self._list.item(self._list.count() - 1).setData(Qt.ItemDataRole.UserRole, b["id"])
+                self._idle_combo.addItem("空闲时：" + b["name"], b["id"])
+        _cur = str(_cfg.get("idle_behavior") or "")
+        _found = self._idle_combo.findData(_cur)
+        self._idle_combo.setCurrentIndex(_found if _found >= 0 else 0)
+        self._idle_combo.blockSignals(False)
+        try:
+            self._idle_secs.blockSignals(True)
+            self._idle_secs.setValue(int(_cfg.get("idle_behavior_seconds",
+                                                  pet_behaviors.DEFAULT_BEHAVIOR_CFG["idle_behavior_seconds"])))
+            self._transform_secs.blockSignals(True)
+            self._transform_secs.setValue(int(_cfg.get("transform_seconds",
+                                                       pet_behaviors.DEFAULT_BEHAVIOR_CFG["transform_seconds"])))
+        except (TypeError, ValueError):
+            # 有意忽略：坏值回默认（load 时 normalize 已兜底，此处防御外部直改 cfg）
+            self._idle_secs.setValue(pet_behaviors.DEFAULT_BEHAVIOR_CFG["idle_behavior_seconds"])
+            self._transform_secs.setValue(pet_behaviors.DEFAULT_BEHAVIOR_CFG["transform_seconds"])
+        finally:
+            self._idle_secs.blockSignals(False)
+            self._transform_secs.blockSignals(False)
+
+    def _on_sel(self, row):
+        if row < 0 or self.svc is None:
+            return
+        _b = self.svc.get(self._list.item(row).data(Qt.ItemDataRole.UserRole))
+        if _b is None:
+            return
+        self._editing_id = _b["id"]
+        self._name.setText(_b["name"])
+        self._steps.clear()
+        for _st in _b["steps"]:
+            _it = QListWidgetItem(self._step_text(_st))
+            _it.setData(Qt.ItemDataRole.UserRole, _st)
+            self._steps.addItem(_it)
+
+    def _new(self):
+        self._editing_id = None
+        self._name.clear()
+        self._steps.clear()
+        self._list.setCurrentRow(-1)
+
+    def _add_step(self):
+        act = self._act_combo.currentData()
+        raw = self._param.text().strip()
+        st = {"act": act}
+        if act == "play_action":
+            if not raw:
+                _warn(self, "行为编辑", "请填动作名")
+                return
+            st["name"] = raw
+        elif act == "say":
+            if not raw:
+                _warn(self, "行为编辑", "请填台词")
+                return
+            st["text"] = raw
+        elif act == "voice":
+            st["event"] = raw or "poke"
+        elif act == "emote":
+            st["kind"] = raw or "note"
+        elif act == "form":
+            if not raw:
+                _warn(self, "行为编辑", "请填形态名")
+                return
+            st["name"] = raw
+        elif act == "wait":
+            st["ms"] = raw or "500"
+        norm, err = pet_behaviors.validate_steps([st])
+        if norm is None:
+            _warn(self, "行为编辑", err)
+            return
+        _it = QListWidgetItem(self._step_text(norm[0]))
+        _it.setData(Qt.ItemDataRole.UserRole, norm[0])
+        self._steps.addItem(_it)
+        self._param.clear()
+
+    def _collect_steps(self):
+        out = []
+        for _i in range(self._steps.count()):
+            _st = self._steps.item(_i).data(Qt.ItemDataRole.UserRole)
+            if isinstance(_st, dict):
+                out.append(_st)
+        return out
+
+    def _save(self):
+        if self.svc is None:
+            return
+        _steps = self._collect_steps()
+        if self._editing_id:
+            _ok, _err = self.svc.update(self._editing_id, self._name.text(), _steps)
+        else:
+            _b, _err = self.svc.add(self._name.text(), _steps)
+            _ok = _b is not None
+            if _ok:
+                self._editing_id = _b["id"]  # 新建成功后进入编辑态（试播/再保存走 update）
+        if not _ok:
+            _warn(self, "行为编辑", _err or "保存失败")
+            return
+        _row = self._list.currentRow()
+        self._refresh()
+        if _row >= 0 and _row < self._list.count():
+            self._list.setCurrentRow(_row)
+
+    def _delete(self):
+        _row = self._list.currentRow()
+        if _row < 0 or self.svc is None:
+            return
+        _bid = self._list.item(_row).data(Qt.ItemDataRole.UserRole)
+        _ok, _err = self.svc.delete(_bid)
+        if not _ok:
+            _warn(self, "行为编辑", _err)
+            return
+        # 删除的若是当前待机行为 → 同步清配置（防悬挂引用静默失效）
+        _cfg = getattr(self.pet, "cfg", None)
+        if isinstance(_cfg, dict) and str(_cfg.get("idle_behavior") or "") == _bid:
+            _cfg["idle_behavior"] = ""
+            self._save_cfg(_cfg)
+        self._new()
+        self._refresh()
+
+    def _test_play(self):
+        self._save()  # 先保存再试播（试播内容 = 已保存内容）
+        if self._editing_id:
+            _runner = getattr(self.pet, "_run_behavior", None)
+            if _runner is not None:
+                _runner(self._editing_id)
+
+    def _import(self):
+        if self.svc is None:
+            return
+        _path, _f = QFileDialog.getOpenFileName(self, "导入行为资源", "", "行为 JSON (*.json)")
+        if not _path:
+            return
+        _b, _err = self.svc.import_file(_path)
+        if _b is None:
+            _warn(self, "行为编辑", _err)
+            return
+        self._refresh()
+
+    def _export(self):
+        _row = self._list.currentRow()
+        if _row < 0 or self.svc is None:
+            return
+        _bid = self._list.item(_row).data(Qt.ItemDataRole.UserRole)
+        _path, _f = QFileDialog.getSaveFileName(self, "导出行为资源", "", "行为 JSON (*.json)")
+        if not _path:
+            return
+        _ok, _err = self.svc.export_file(_bid, _path)
+        if not _ok:
+            _warn(self, "行为编辑", _err)
 
 
 # ---------------- a) 角色面板 ----------------

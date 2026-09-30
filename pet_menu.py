@@ -142,6 +142,9 @@ class MenuBuilder:
         # v2.0：语音设置（开关/合成方式/事件片段）
         voice_act = set_menu.addAction("🎤 语音设置…")
         voice_act.triggered.connect(lambda: pet_dialogs.open_voice(pet))
+        # v2.0.2：行为设置（待机行为/行为编辑/变身时长）
+        beh_act = set_menu.addAction("🧩 行为设置…")
+        beh_act.triggered.connect(lambda checked=False: pet._open_behavior_dialog())
         fm_act.triggered.connect(lambda: pet_dialogs.set_frame_max(pet, self._save_cfg))
         snd_set = set_menu.addMenu("🎵 音效设置")
         grp_group = QActionGroup(menu)
@@ -194,6 +197,11 @@ class MenuBuilder:
                 _label = "✦ %s（合成）" % _name if _kind == "proc" else "✦ %s" % _name
                 a = act_menu.addAction(_label)
                 a.triggered.connect(lambda checked=False, n=_name: pet.actions.play_action(n))
+
+        # v2.0.2 断点#12：变身（仅自定义角色有变身形态时显示）
+        if pet.has_transform_form:
+            tf_act = menu.addAction("🐡 变身")
+            tf_act.triggered.connect(lambda checked=False: pet._do_transform())
 
         praise_act = menu.addAction("❤️ 夸夸她")
         praise_act.triggered.connect(lambda checked=False: pet.mood.blush())
