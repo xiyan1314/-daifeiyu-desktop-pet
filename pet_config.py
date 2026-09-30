@@ -15,6 +15,7 @@ import pet_log  # P1-手感：物理参数非法时记日志（pet_log 无任何
 import pet_physics  # P1-手感：默认值单一来源（pet_physics 无 Qt 依赖，无环）
 import pet_voice  # v2.0：语音配置归一化（pet_voice 无环）
 import pet_behaviors  # v2.0.2：行为配置默认值单一来源（pet_behaviors 无环）
+import pet_chat  # v2.0.4：AI 默认接口/模型单一来源（pet_chat 无 Qt、无环）
 
 # 上界与设置对话框同口径（pet_dialogs.PhysicsDialog 的 spinbox 范围）
 _PHYS_MAX = {"gravity": 10000.0, "restitution": 1.0,
@@ -156,7 +157,7 @@ def normalize_cfg(cfg, defaults, persona_ids):
         cfg["ai_max_tokens"] = 60
         cfg["ai_reply_len"] = 25
     cfg["ai_base_url"] = str(cfg.get("ai_base_url", "") or "").strip().rstrip("/")
-    cfg["ai_model"] = str(cfg.get("ai_model", "deepseek-chat") or "deepseek-chat").strip()
+    cfg["ai_model"] = str(cfg.get("ai_model", pet_chat.DEFAULT_MODEL) or pet_chat.DEFAULT_MODEL).strip()
     cfg["ai_system_prompt"] = str(cfg.get("ai_system_prompt", "") or "")
     cfg["ai_persona"] = str(cfg.get("ai_persona", "default") or "default")
     if cfg["ai_persona"] not in persona_ids and cfg["ai_persona"] != "custom":

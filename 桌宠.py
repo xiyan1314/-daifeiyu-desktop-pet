@@ -61,7 +61,7 @@ import pet_export
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "2.0.1"
+VERSION = "2.0.4"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -143,7 +143,7 @@ DEFAULT_CONFIG = {
     "scale_compensated_role": "",  # 旧版超大角色素材的 scale 一次性补偿标记（文件名）
     "chat_memory_rounds": 3,  # P1-6：对话上下文轮数（0~10；0=不带记忆）
     "ai_base_url": "",        # P1-10：AI 接口地址（空=默认 api.deepseek.com）
-    "ai_model": "deepseek-chat",  # P1-10：模型名（OpenAI 兼容，支持本地 Ollama）
+    "ai_model": pet_chat.DEFAULT_MODEL,  # P1-10：模型名（单一来源 pet_chat.DEFAULT_MODEL）
     "ai_system_prompt": "",   # P1-10：人设（空=内置大肥鱼人设）
     "ai_max_tokens": 60,
     "ai_reply_len": 25,
@@ -2530,13 +2530,13 @@ class PetWindow(QWidget):
         else:
             self.preview_audio(path)
 
-    VOICE_SKIP_TEXTS = ("API Key 不对，查一下？", "DeepSeek 余额不足，去平台充点~",
-                         "问太多次啦，歇会儿再来~", "网络不好，听不清啦……")
-
     def _on_reply_voice(self, text):
-        """v2.0：AI 回复 → 语音播放。优先级：reply 片段 > TTS 合成；错误提示文本不朗读。"""
+        """v2.0：AI 回复 → 语音播放。优先级：reply 片段 > TTS 合成；错误提示文本不朗读。
+
+        v2.0.4：跳过判定改为前缀匹配（pet_chat.API_ERROR_PREFIXES 与 explain_api_error
+        同源维护）——旧精确匹配表在错误文案归类化后已成死条目。"""
         text = (text or "").strip()
-        if not text or text in self.VOICE_SKIP_TEXTS:
+        if not text or text.startswith(pet_chat.API_ERROR_PREFIXES):
             return
         p = self.voice.clip("reply")
         if p is not None:
@@ -2687,6 +2687,11 @@ class PetWindow(QWidget):
     def _quit(self):
         """退出：停止全部定时器/动画、隐藏窗口、清理临时文件，然后结束进程。"""
         self._closing = True  # P1-5：先立退出标志，在途网络请求信号/气泡被守卫拦下
+        # v2.0.4：等在途 API 测试线程收敛（运行中析构 QThread 是 Qt6 致命错误）
+        try:
+            pet_dialogs.shutdown_api_tests()
+        except Exception:
+            pass  # 有意忽略：退出清理尽力而为（无在途线程时为空操作）
         try:
             self.bubble.hide()
             self.badge.hide()

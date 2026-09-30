@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QInputDialog, QLineEdit
 
 import pet_dialogs  # AI 设置对话框（pet_dialogs 不 import 桌宠，无循环）
+import pet_chat  # v2.0.4：is_local_base（本地模型免 Key 判断，pet_chat 无环）
 
 
 class AIService:
@@ -124,7 +125,8 @@ class AIService:
             if pet._ai_act:
                 pet._ai_act.setChecked(True)
             self._save_cfg(cfg)
-        if not cfg.get("api_key"):
+        # v2.0.4：本地服务（Ollama 等）无需 Key；云服务商才要求先填 Key
+        if not cfg.get("api_key") and not pet_chat.is_local_base(cfg.get("ai_base_url", "")):
             self.set_api_key()
             if not self._cfg().get("api_key"):
                 return  # 没填 Key：放弃本次对话

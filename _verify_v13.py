@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 
 FAILS = []
 CHECKS = []
-EXPECT_CHECKS = 189  # v2.0.3：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
+EXPECT_CHECKS = 195  # v2.0.4：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
 
 
 def check(name, cond, extra=""):
@@ -928,6 +928,42 @@ def main_flow():
         for _bid in _resx.get("behavior_map", {}).values():
             pet.behaviors.delete(_bid)  # 导入的行为副本同样清掉，防脏状态干扰后续检查
     pet.behaviors.delete(_eb["id"])
+
+    # ---- v2.0.4：其他模型 API（服务商预设 + 错误归类 + 连通性测试） ----
+    import pet_chat as _pc
+    # 防回归：version_info.txt 与 main.VERSION 必须同步（v2.0.2/2.0.3 曾漏更 About 版本）
+    with open(os.path.join(HERE, "version_info.txt"), "r", encoding="utf-8") as _vf:
+        _vraw = _vf.read()
+    check("version files synced",
+          ("FileVersion', '%s'" % main.VERSION) in _vraw
+          and ("ProductVersion', '%s'" % main.VERSION) in _vraw)
+    check("api error classify",
+          "密钥" in _pc.explain_api_error(401)
+          and "额度" in _pc.explain_api_error(402)
+          and "地区" in _pc.explain_api_error(403, "country not supported")
+          and "模型名" in _pc.explain_api_error(404)
+          and "限流" in _pc.explain_api_error(429)
+          and "开小差" in _pc.explain_api_error(500))
+    check("api providers presets",
+          all((_pc.AI_PROVIDERS.get(p) or {}).get("base_url")
+              and (_pc.AI_PROVIDERS.get(p) or {}).get("model")
+              for p in _pc.AI_PROVIDERS if p != "custom")
+          and "custom" in _pc.AI_PROVIDERS
+          and len([p for p in _pc.AI_PROVIDERS if p != "custom"]) >= 14)
+    check("api defaults single source",
+          _pc.DEFAULT_MODEL == _pc.AI_PROVIDERS["deepseek"]["model"]
+          and _pc.DEFAULT_BASE_URL == _pc.AI_PROVIDERS["deepseek"]["base_url"])
+    # 127.0.0.1:1 回环端口：REFUSED 即时失败；防火墙 DROP 也 ≤1s 超时，不依赖外网
+    check("api connection unreachable",
+          _pc.test_api_connection("http://127.0.0.1:1", "m", "k", timeout=1)[0] is False)
+    try:
+        _aid = pet_dialogs.AISettingsDialog(pet)
+        _aid.show()
+        app.processEvents()
+        _aid.close()
+        check("ai settings dialog smoke", True)
+    except Exception as e:
+        check("ai settings dialog smoke", False, repr(e))
 
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")

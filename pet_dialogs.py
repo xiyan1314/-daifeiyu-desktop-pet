@@ -98,6 +98,7 @@ from PySide6.QtWidgets import (
 import pet_audio
 import pet_resources  # P3-5+：FRAME_MAX（帧上限用户可调）
 import pet_behaviors  # v2.0.2：行为动作白名单/序列校验（BehaviorDialog 共用口径）
+import pet_chat  # v2.0.4：服务商预设/错误归类/连通性测试（pet_chat 无 Qt 依赖，无环）
 
 # ---------------- 主题 ----------------
 DIALOG_QSS = """
@@ -2373,24 +2374,86 @@ class BehaviorDialog(QDialog):
 
 
 # ---------------- a) 角色面板 ----------------
+class _ApiTestWorker(QThread):
+    """v2.0.4：AI 连通性测试（工作线程；结果经 Signal 回主线程，绝不跨线程触 UI）。"""
+
+    result = Signal(str)
+
+    def __init__(self, base_url, model, key, parent=None):
+        super().__init__(parent)
+        self._args = (base_url, model, key)
+
+    def run(self):
+        try:
+            _ok, _msg = pet_chat.test_api_connection(self._args[0], self._args[1],
+                                                     self._args[2], timeout=10)
+            self.result.emit(("✅ " if _ok else "❌ ") + _msg)
+        except Exception:
+            # 有意忽略：test_api_connection 已兜底不抛；此处防御性收尾（线程内不触 UI）
+            self.result.emit("❌ 测试失败，请稍后再试")
+
+
+# v2.0.4：在途测试线程登记表——退出路径（桌宠._quit → shutdown_api_tests）
+# 收敛所有在途 QThread，防「运行中析构 QThread」Qt6 致命崩溃
+_API_TEST_WORKERS = set()
+
+
+def shutdown_api_tests():
+    """退出前收敛在途 API 测试线程（wait 至测试超时；仍不死才 terminate）。"""
+    for w in list(_API_TEST_WORKERS):
+        try:
+            if not w.isRunning():
+                continue
+            w.wait(11000)
+            if w.isRunning():
+                w.terminate()
+                w.wait(2000)
+        except RuntimeError:
+            pass  # 有意忽略：线程已被删除（幂等收敛）
+
+
 class AISettingsDialog(QDialog):
-    """AI 接口/模型/人设/回复长度设置（P1-10，OpenAI 兼容，支持本地 Ollama）。"""
+    """AI 接口/模型/人设/回复长度设置（P1-10，OpenAI 兼容，支持本地 Ollama）。
+
+    v2.0.4：服务商预设（一键填地址/模型）+ 连通性测试（错误归类中文提示）。"""
 
     def __init__(self, parent=None):
         super().__init__(_qt_parent(parent))
         self._pet = parent
+        self._worker = None
         self.setWindowTitle("AI 设置")
         self.setStyleSheet(DIALOG_QSS)
-        self.resize(560, 500)
+        self.resize(560, 560)
         cfg = _get(parent, "cfg") or {}
         root = QVBoxLayout(self)
+        # v2.0.4：服务商预设（选中即填接口地址与模型名，仍可手改）
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("服务商预设"))
+        self._preset = QComboBox()
+        for _pid, _p in pet_chat.AI_PROVIDERS.items():
+            self._preset.addItem(_p["name"], _pid)
+            if _pid in ("qianfan", "siliconflow"):
+                self._preset.insertSeparator(self._preset.count())  # 国内/国际/本地分组分隔线
+        self._preset.setCurrentIndex(self._preset.findData("custom"))
+        self._preset.currentIndexChanged.connect(self._on_preset_changed)
+        preset_row.addWidget(self._preset, 1)
+        root.addLayout(preset_row)
         root.addWidget(QLabel("接口地址（OpenAI 兼容；留空 = DeepSeek 官方）"))
         self._base = QLineEdit(cfg.get("ai_base_url", ""))
-        self._base.setPlaceholderText("https://api.deepseek.com")
+        self._base.setPlaceholderText(pet_chat.DEFAULT_BASE_URL)
         root.addWidget(self._base)
         root.addWidget(QLabel("模型名（本地 Ollama 可填 qwen2.5 之类）"))
-        self._model = QLineEdit(cfg.get("ai_model", "deepseek-chat"))
+        self._model = QLineEdit(cfg.get("ai_model", pet_chat.DEFAULT_MODEL))
         root.addWidget(self._model)
+        # v2.0.4：连通性测试（错误归类中文提示）
+        test_row = QHBoxLayout()
+        self._test_btn = QPushButton("测试连接")
+        self._test_btn.clicked.connect(self._test_connection)
+        self._test_label = QLabel("")
+        self._test_label.setWordWrap(True)
+        test_row.addWidget(self._test_btn)
+        test_row.addWidget(self._test_label, 1)
+        root.addLayout(test_row)
         root.addWidget(QLabel("人设预设（选「自定义」可完全自己写）"))
         self._persona = QComboBox()
         self._persona.addItem("内置大肥鱼（又娇又赖，默认）", "default")
@@ -2437,10 +2500,66 @@ class AISettingsDialog(QDialog):
         """预设选择：仅「自定义」时启用人设编辑框。"""
         self._prompt.setEnabled(self._persona.currentData() == "custom")
 
+    def _on_preset_changed(self, _idx):
+        """v2.0.4：服务商预设——选中即填接口地址与模型名（custom 不覆盖用户输入）。"""
+        _pid = self._preset.currentData()
+        _p = pet_chat.AI_PROVIDERS.get(_pid)
+        if not _p or _pid == "custom":
+            return
+        self._base.setText(_p.get("base_url", ""))
+        self._model.setText(_p.get("model", ""))
+
+    def _test_connection(self):
+        """v2.0.4：用当前填写的地址/模型/Key 发最小请求，结果归类中文提示。"""
+        try:
+            _running = self._worker is not None and self._worker.isRunning()
+        except RuntimeError:
+            _running = False  # 已删除的线程包装（幂等防御）
+        if _running:
+            return  # 测试进行中：不重复发起
+        cfg = _get(self._pet, "cfg") or {}
+        _key = str(cfg.get("api_key") or "")
+        _base_now = self._base.text().strip().rstrip("/")
+        if not _key and not pet_chat.is_local_base(_base_now):
+            # 云服务商需要 Key；本地服务（Ollama 等）放行空 Key
+            self._test_label.setText("❌ 云服务商要先填 API Key（本地 Ollama 无需 Key）")
+            return
+        self._test_btn.setEnabled(False)
+        self._test_label.setText("测试中……")
+        # 线程不挂父对象：对话框关闭不能拖线程下水（运行中销毁 QThread 会崩）；
+        # finished → deleteLater 由绑定方法自持引用，线程自然结束后自删；
+        # 同时登记进全局表，退出路径由 shutdown_api_tests 收敛
+        self._worker = _ApiTestWorker(_base_now, self._model.text().strip(), _key, None)
+        self._worker.result.connect(self._on_test_result)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.finished.connect(lambda w=self._worker: _API_TEST_WORKERS.discard(w))
+        _API_TEST_WORKERS.add(self._worker)
+        self._worker.start()
+
+    def _on_test_result(self, msg):
+        """测试结果（主线程）：回填标签并恢复按钮。"""
+        self._test_label.setText(msg)
+        self._test_btn.setEnabled(True)
+        self._worker = None  # 结果已回：释放引用，线程由 finished→deleteLater 收尾
+
+    def closeEvent(self, event):
+        """关闭对话框：在途测试线程断连结果槽后自然结束（不随窗口销毁）。"""
+        _w = getattr(self, "_worker", None)
+        try:
+            _running = _w is not None and _w.isRunning()
+        except RuntimeError:
+            _running = False  # 已删除的线程包装（幂等防御）
+        if _running:
+            try:
+                _w.result.disconnect(self._on_test_result)
+            except (TypeError, RuntimeError):
+                pass  # 有意忽略：已断开或槽不存在（幂等）
+        super().closeEvent(event)
+
     def _save(self):
         data = {
             "ai_base_url": self._base.text().strip().rstrip("/"),
-            "ai_model": self._model.text().strip() or "deepseek-chat",
+            "ai_model": self._model.text().strip() or pet_chat.DEFAULT_MODEL,
             "ai_persona": self._persona.currentData() or "default",
             "ai_system_prompt": self._prompt.toPlainText().strip(),
             "ai_reply_len": self._reply.value(),
