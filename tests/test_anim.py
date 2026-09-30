@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """pet_anim.FrameAnim 边界（loops/stop/on_finish/空帧集/重复 play）。"""
 import pytest
-from PySide6.QtGui import QColor, QGuiApplication, QPixmap
+from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtWidgets import QApplication
 
 import pet_anim
 
 
 @pytest.fixture(scope="module")
 def qapp():
-    app = QGuiApplication.instance() or QGuiApplication([])
+    # 用 QApplication 而非 QGuiApplication：全仓测试共享同一个应用单例，
+    # 若先建 QGuiApplication，后续 QApplication.instance() 会误判导致控件类崩溃
+    app = QApplication.instance() or QApplication([])
     yield app
 
 

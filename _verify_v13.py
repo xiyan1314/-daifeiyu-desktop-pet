@@ -37,6 +37,7 @@ def check(name, cond, extra=""):
 _tmp = tempfile.mkdtemp(prefix="dfy_v13_")
 import pet_dialogs  # noqa: E402
 import 桌宠 as main  # noqa: E402
+from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402  # P1-1 异步向导等待用
 main.DATA_DIR = _tmp
 main.CONFIG_PATH = os.path.join(_tmp, "config.json")
 main.USAGE_PATH = os.path.join(_tmp, "usage.json")
@@ -343,7 +344,7 @@ def main_flow():
     w.write(img1)
     rawdir = tempfile.mkdtemp(prefix="role_raw_")
     raws, errg = pet_dialogs._extract_video_frames(gif1, rawdir)
-    # offscreen 下 QImageWriter 写的 GIF 可能被 QMovie 判为无效：只断言拒绝路径
+    # offscreen 下 QImageWriter 写的 GIF 可能被 QImageReader 判为无效：只断言拒绝路径
     check("gif rejected", raws is None and bool(errg), "err=%r" % (errg,))
     fake = os.path.join(_tmp, "fake.mp4")
     with open(fake, "wb") as fh:
@@ -386,22 +387,38 @@ def main_flow():
                 check("union canvas same dims", len(dims) == 1, "dims=%r" % (dims,))
         shutil.rmtree(rd4, ignore_errors=True)
         # 向导接线（高-1 回归）：_pick_video → frames_video=True → _do_import 传 same_size=True
+        # P1-1 起抽帧/导入走工作线程：用事件循环等待完成（最多 40s）
         from PySide6.QtWidgets import QFileDialog
         real_gofn = QFileDialog.getOpenFileName
         real_prep = pet_dialogs._prepare_role_frames
         real_warn = pet_dialogs._warn
         calls = []
-        def _rec(srcs, out_dir, same_size=True):
+
+        def _rec(srcs, out_dir, same_size=True, cancel=None, progress=None):
             calls.append(bool(same_size))
-            return real_prep(srcs, out_dir, same_size)
+            return real_prep(srcs, out_dir, same_size, cancel=cancel, progress=progress)
         pet_dialogs._prepare_role_frames = _rec
         pet_dialogs._warn = lambda *a, **k: None
         QFileDialog.getOpenFileName = lambda *a, **k: (vid, "")
+
+        def _wait_until(cond, timeout_s):
+            loop = QEventLoop()
+
+            def _tick():
+                if cond():
+                    loop.quit()
+                else:
+                    QTimer.singleShot(50, _tick)
+            QTimer.singleShot(int(timeout_s * 1000), loop.quit)
+            QTimer.singleShot(0, _tick)
+            loop.exec()
         try:
             wdlg = pet_dialogs.RoleImportDialog(pet)
             wdlg._pick_video()
-            check("wizard video flag", wdlg._frames_video is True)
+            _wait_until(lambda: wdlg._frames_video or (wdlg._worker is None and wdlg._frames_raw), 40)
+            check("wizard video flag", wdlg._frames_video is True, "video=%r" % (wdlg._frames_video,))
             wdlg._do_import()
+            _wait_until(lambda: wdlg.result_data() is not None or wdlg._worker is None, 40)
             dataw = wdlg.result_data()
             check("wizard union path", bool(calls) and calls[-1] is True, "calls=%r" % (calls,))
             check("wizard frames result", dataw is not None and len(dataw.get("frames", [])) >= 2)

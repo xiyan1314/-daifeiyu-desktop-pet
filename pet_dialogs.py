@@ -17,6 +17,8 @@
 - class RoleImportDialog(QDialog)：角色导入向导——1~8 个形态自由增删、
   每个形态独立命名选图；素材自动处理（去背景/裁剪/缩放）；
   支持多帧动画素材（多选图片 = 帧序列、视频/GIF 自动抽帧，统一画布处理）。
+  P1-1 起：素材处理与视频/GIF 抽帧在 _ImportWorker 工作线程执行（可取消、
+  进度信号回主线程），UI 不阻塞、无 QApplication.processEvents。
 - class SoundPanel(QWidget)：音频片段列表（试听 / 导入 / 重命名 / 删除）+
   自定义音效组 5 行槽位（默认 / 静音 / 片段）。
 - class ResourceManagerDialog(QDialog)：QTabWidget 两页签（角色 / 音效），
@@ -58,8 +60,8 @@ import shutil
 import tempfile
 import time
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtCore import QEventLoop, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -303,7 +305,11 @@ _IMG_BG_TOL = 40             # 去背景颜色容差（RGB 各通道最大差值
 _IMG_MIN_PX = 8
 
 
-def _remove_background(img):
+class ImportCancelled(Exception):
+    """P1-1：用户取消导入/抽帧处理（工作线程内抛出，上层转为友好提示）。"""
+
+
+def _remove_background(img, cancel=None):
     """无透明通道图自动去背景：从四边泛洪「与边界同色相连」的区域并置透明。
 
     返回处理后的 QImage；若剩余内容不足 1%（背景色与主体大面积同色相连）
@@ -336,7 +342,8 @@ def _remove_background(img):
         visited[i] = 1
         processed += 1
         if processed % 8192 == 0:
-            QApplication.processEvents()  # 大图泛洪数秒：周期让事件循环喘气，避免假死
+            if cancel is not None and cancel():
+                raise ImportCancelled()
         p = y * bpl + x * 4  # 行对齐：与 _content_bbox 的 y*bpl+x*4 一致
         r, g, b = raw[p], raw[p + 1], raw[p + 2]
         if x > 0 and not visited[i - 1]:
@@ -370,7 +377,7 @@ def _remove_background(img):
     return out.copy()
 
 
-def _content_bbox(img):
+def _content_bbox(img, cancel=None):
     """非透明像素包围盒 (x, y, w, h)；全透明返回 None。"""
     w, h = img.width(), img.height()
     try:
@@ -382,7 +389,8 @@ def _content_bbox(img):
     for y in range(h):
         row = y * bpl
         if y % 256 == 0:
-            QApplication.processEvents()  # 大图扫描：周期让事件循环喘气
+            if cancel is not None and cancel():
+                raise ImportCancelled()
         for x in range(w):
             if raw[row + x * 4 + 3] > 8:
                 if x < minx:
@@ -398,11 +406,12 @@ def _content_bbox(img):
     return (minx, miny, maxx - minx + 1, maxy - miny + 1)
 
 
-def _load_prepared(src, max_px=None):
+def _load_prepared(src, max_px=None, cancel=None):
     """加载素材并做通用预处理：预缩放 → 无透明通道自动去背景。
 
     max_px=None 用全局 _IMG_MAX_PROCESS_PX（2048）；帧动画可传 1024 控制峰值。
     返回 (img, notes) 或 (None, None)。notes 为这一阶段的说明列表。
+    cancel 为可调用的取消检测（工作线程内周期询问），取消时抛 ImportCancelled。
     """
     img = QImage(src)
     if img.isNull():
@@ -418,7 +427,7 @@ def _load_prepared(src, max_px=None):
                          Qt.TransformationMode.SmoothTransformation)
         notes.append("超大图已预缩放")
     if not had_alpha:
-        removed = _remove_background(img)
+        removed = _remove_background(img, cancel=cancel)
         if removed is None:
             notes.append("背景与主体相连，保留原图")
         else:
@@ -427,15 +436,15 @@ def _load_prepared(src, max_px=None):
     return img, notes
 
 
-def _prepare_role_png(src, out_path):
+def _prepare_role_png(src, out_path, cancel=None):
     """导入素材自动处理：无透明通道→去背景；裁剪透明边距；>512px 等比缩小。
 
     成功返回 (True, notes)；失败返回 (False, err)。notes 为中文说明列表。
     """
-    img, notes = _load_prepared(src)
+    img, notes = _load_prepared(src, cancel=cancel)
     if img is None:
         return False, "无法加载该图片"
-    bbox = _content_bbox(img)
+    bbox = _content_bbox(img, cancel=cancel)
     if bbox is None:
         return False, "图片没有可见内容"
     x, y, w, h = bbox
@@ -454,7 +463,7 @@ def _prepare_role_png(src, out_path):
     return True, notes
 
 
-def _prepare_role_frames(srcs, out_dir, same_size=True):
+def _prepare_role_frames(srcs, out_dir, same_size=True, cancel=None, progress=None):
     """批量处理帧素材到统一画布（帧动画导入用）。
 
     same_size=True（视频/GIF 抽帧，原始尺寸一致）：先算全部帧的内容**并集 bbox**，
@@ -462,19 +471,24 @@ def _prepare_role_frames(srcs, out_dir, same_size=True):
     same_size=False（多选图片，尺寸可能不一）：逐帧独立处理（去背景/裁剪/缩放），
     最后把每帧内容居中放进最大帧尺寸的透明画布（尺寸一致、防帧间跳动）。
     返回 (out_paths, notes) 或 (None, err)。
+    cancel 为取消检测回调（工作线程内周期询问）；progress 为进度文本回调。
     """
+    n = len(srcs)
     imgs = []
     for i, s in enumerate(srcs):
-        img, _load_notes = _load_prepared(s, max_px=1024)  # 帧序列峰值控制（输出 ≤512）
+        if cancel is not None and cancel():
+            raise ImportCancelled()
+        if progress is not None:
+            progress("处理帧 %d/%d…" % (i + 1, n))
+        img, _load_notes = _load_prepared(s, max_px=1024, cancel=cancel)  # 帧序列峰值控制（输出 ≤512）
         if img is None:
             return None, "第 %d 帧无法加载" % (i + 1)
         imgs.append(img)
-        QApplication.processEvents()  # 多帧连续处理：周期呼吸
     if same_size:
         # 并集 bbox：所有帧裁到同一矩形，保留帧间平移
         union = None
         for img in imgs:
-            b = _content_bbox(img)
+            b = _content_bbox(img, cancel=cancel)
             if b is None:
                 return None, "存在空白帧"
             if union is None:
@@ -488,6 +502,8 @@ def _prepare_role_frames(srcs, out_dir, same_size=True):
         cw, ch = max(1, int(round(uw * scale))), max(1, int(round(uh * scale)))
         outs = []
         for i, img in enumerate(imgs):
+            if cancel is not None and cancel():
+                raise ImportCancelled()
             crop = img.copy(ux, uy, uw, uh)
             if scale < 1.0:
                 crop = crop.scaled(cw, ch, Qt.AspectRatioMode.IgnoreAspectRatio,
@@ -503,7 +519,9 @@ def _prepare_role_frames(srcs, out_dir, same_size=True):
     # 多选图片：逐帧独立处理 → 居中放进统一画布
     processed = []
     for i, img in enumerate(imgs):
-        b = _content_bbox(img)
+        if cancel is not None and cancel():
+            raise ImportCancelled()
+        b = _content_bbox(img, cancel=cancel)
         if b is None:
             return None, "第 %d 帧没有可见内容" % (i + 1)
         x, y, w, h = b
@@ -517,6 +535,8 @@ def _prepare_role_frames(srcs, out_dir, same_size=True):
     max_h = max(p.height() for p in processed)
     outs = []
     for i, p in enumerate(processed):
+        if cancel is not None and cancel():
+            raise ImportCancelled()
         canvas = QImage(max_w, max_h, QImage.Format.Format_ARGB32)
         canvas.fill(0)
         painter = QPainter(canvas)
@@ -538,13 +558,29 @@ def _qt_parent(pet):
 # ---------------- 视频 / GIF 抽帧 ----------------
 
 
-def _extract_video_frames(src, out_dir):
+def _pump_events(ms=10):
+    """局部事件循环泵：在当前线程内处理事件（工作线程泵 QtMultimedia 帧投递）。
+    P1-1：替代 QApplication.processEvents。注意：若在主线程调用，效果等同
+    QApplication.processEvents 的局部版（同样会分发 GUI 事件）——生产路径全在
+    工作线程，主线程只可能出现在 v13/绿色版无头直测中。"""
+    loop = QEventLoop()
+    t0 = time.time()
+    while time.time() - t0 < ms / 1000.0:
+        loop.processEvents(QEventLoop.ProcessEventsFlag.AllEvents)
+        time.sleep(0.002)
+
+
+def _extract_video_frames(src, out_dir, cancel=None, progress=None):
     """从视频（mp4/webm/mov/avi 等）或 GIF 均匀抽帧（视频 3~20 帧、GIF 3~24 帧）。
 
     视频走 QtMultimedia（QMediaPlayer + QVideoSink，绿色版自带 ffmpeg 后端），
-    GIF 走 QMovie。返回 (原始帧 png 路径列表, err)；失败返回 (None, err)。
+    GIF 走 QImageReader（同步逐帧读，无事件循环依赖）。返回
+    (原始帧 png 路径列表, err)；失败返回 (None, err)。
     捕获时即缩到 ≤1024（控制 4K 大视频的内存峰值），后续统一走
     _prepare_role_frames（并集画布 + 统一缩放，保留主体平移）。
+
+    P1-1：全程可在工作线程调用（cancel/progress 可选回调）；视频路径的帧投递
+    由本线程局部事件循环泵送，不阻塞 UI、不重入主事件循环。
     """
     ext = os.path.splitext(str(src))[1].lower()
     raws = []
@@ -559,31 +595,31 @@ def _extract_video_frames(src, out_dir):
 
     try:
         if ext == ".gif":
-            from PySide6.QtGui import QMovie
-            movie = QMovie(src)
-            if not movie.isValid():
-                movie.stop()
-                return None, "GIF 无法读取"
-            movie.setCacheMode(QMovie.CacheMode.CacheNone)  # 帧不驻留缓存：控制大 GIF 内存峰值
-            n = movie.frameCount()
+            reader = QImageReader(src)
+            n = reader.imageCount()
+            if n < 0:
+                return None, "无法读取 GIF 帧数（文件可能损坏？）"
             if n <= 1:
-                movie.stop()
                 return None, "GIF 只有 %d 帧，帧动画至少需要 2 帧" % n
             if n > 120:
-                movie.stop()
                 return None, "GIF 帧数太多（%d 帧），建议改用视频或减少帧数" % n
             take = min(24, n)
             idxs = [int(round(i * (n - 1) / float(take - 1))) for i in range(take)]
-            for i in idxs:
-                movie.jumpToFrame(i)
-                t0 = time.time()
-                while movie.currentFrameNumber() != i and time.time() - t0 < 2:
-                    QApplication.processEvents()
-                    time.sleep(0.005)
-                if movie.currentFrameNumber() != i:
-                    continue  # 超时未到目标帧：跳过，避免误取旧帧造成重复
-                _cap(movie.currentPixmap().toImage())
-            movie.stop()
+            need = set(idxs)
+            # 顺序读帧并只保留采样点：部分 GIF 插件 jumpToImage 返回 False
+            # 但 read() 仍按序推进——用顺序读最稳，且最多只驻留 take 帧的内存
+            i = 0
+            while i < n:
+                if cancel is not None and cancel():
+                    raise ImportCancelled()
+                img = reader.read()
+                if img is None or img.isNull():
+                    break
+                if i in need:
+                    if progress is not None:
+                        progress("读取 GIF 帧 %d/%d…" % (i + 1, n))
+                    _cap(img.convertToFormat(QImage.Format.Format_ARGB32))
+                i += 1
         else:
             from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
             player = QMediaPlayer()
@@ -592,8 +628,10 @@ def _extract_video_frames(src, out_dir):
             player.setSource(QUrl.fromLocalFile(os.path.abspath(src)))
             t0 = time.time()
             while player.duration() <= 0 and time.time() - t0 < 5:
-                QApplication.processEvents()
-                time.sleep(0.01)
+                if cancel is not None and cancel():
+                    player.stop()
+                    raise ImportCancelled()
+                _pump_events(20)
             dur = player.duration()
             if dur <= 0:
                 player.stop()
@@ -609,14 +647,18 @@ def _extract_video_frames(src, out_dir):
                     got.append(frame.toImage())
 
             sink.videoFrameChanged.connect(_on_frame)
+            if progress is not None:
+                progress("读取首帧…")
             # S1：Qt6 ffmpeg 后端只在播放/暂停态向 sink 投帧——先 play() 拿首帧再 pause()
             # 大文件/高分辨率解码慢：首帧超时随文件大小放宽（无 GPU 软解 HEVC 场景）
             first_cap = 10 if os.path.getsize(src) > 50 * 1024 * 1024 else 5
             player.play()
             t0 = time.time()
             while not got and time.time() - t0 < first_cap:
-                QApplication.processEvents()
-                time.sleep(0.005)
+                if cancel is not None and cancel():
+                    player.stop()
+                    raise ImportCancelled()
+                _pump_events(10)
             player.pause()
             if not got:
                 sink.videoFrameChanged.disconnect(_on_frame)
@@ -624,18 +666,28 @@ def _extract_video_frames(src, out_dir):
                 return None, "无法从视频读取画面"
             _cap(got[0])  # 首帧（t=0 位置）
             for i in range(1, take):
+                if cancel is not None and cancel():
+                    player.stop()
+                    raise ImportCancelled()
+                if progress is not None:
+                    progress("抽视频帧 %d/%d…" % (i + 1, take))
                 t = int(dur * i / float(take))
                 del got[:]
                 player.setPosition(t)  # 暂停态下 seek 仍会投递目标帧
                 t1 = time.time()
                 while not got and time.time() - t1 < 3:
-                    QApplication.processEvents()
-                    time.sleep(0.005)
+                    if cancel is not None and cancel():
+                        player.stop()
+                        raise ImportCancelled()
+                    _pump_events(10)
                 if got:
                     _cap(got[0])
             sink.videoFrameChanged.disconnect(_on_frame)
             player.stop()
-            player.deleteLater()
+            # 注：worker 线程无事件循环，deleteLater 的 DeferredDelete 永不处理会泄漏 C++ 对象；
+            # player/sink 均为局部变量，返回后由引用计数安全释放（sink 连接随析构断开）
+    except ImportCancelled:
+        raise
     except Exception as e:
         return None, "抽帧失败：%s" % e
     if len(raws) < 2:
@@ -647,6 +699,97 @@ def _extract_video_frames(src, out_dir):
             return None, "保存抽帧结果失败"
         paths.append(p)
     return paths, None
+
+
+# ---------------- P1-1：导入工作线程 ----------------
+
+
+def _run_import_pipeline(forms, frames_raw, frames_video, tmpdir, cancel=None, progress=None):
+    """角色导入的纯处理部分（无 UI），在工作线程内执行。
+
+    返回 (result_dict, None) 或 (None, err)。result_dict 与旧 _do_import 一致，
+    但不含 name（由主线程在完成时从控件实时读取，保持旧行为）。
+    """
+    frames_out = []
+    if frames_raw:
+        if progress is not None:
+            progress("帧动画统一画布处理…")
+        frames_out, notesf = _prepare_role_frames(
+            frames_raw, tmpdir, same_size=bool(frames_video), cancel=cancel, progress=progress)
+        if frames_out is None:
+            return None, "帧处理失败：%s" % notesf
+        base_out = frames_out[0]
+        notes = ["帧动画 %d 帧：%s" % (len(frames_out), "、".join(notesf))]
+        forms_out = [(forms[0][0], base_out)]
+    else:
+        base_out = os.path.join(tmpdir, "role_base.png")
+        if progress is not None:
+            progress("处理第 1 形态…")
+        ok1, notes1 = _prepare_role_png(forms[0][1], base_out, cancel=cancel)
+        if not ok1:
+            return None, "第 1 形态处理失败：%s" % notes1
+        notes = ["第 1 形态：%s" % ("、".join(notes1) if notes1 else "无需处理")]
+        forms_out = [(forms[0][0], base_out)]
+    for i, (nm, src) in enumerate(forms[1:], start=1):
+        if cancel is not None and cancel():
+            raise ImportCancelled()
+        if progress is not None:
+            progress("处理第 %d 形态（%s）…" % (i + 1, nm))
+        fp = os.path.join(tmpdir, "form%d.png" % i)
+        okf, notesf = _prepare_role_png(src, fp, cancel=cancel)
+        if not okf:
+            return None, "第 %d 形态处理失败：%s" % (i + 1, notesf)
+        forms_out.append((nm, fp))
+        notes.append("第 %d 形态（%s）：%s" % (i + 1, nm, "、".join(notesf) if notesf else "无需处理"))
+    return {"base": base_out, "frames": frames_out, "forms": forms_out, "notes": notes}, None
+
+
+class _ImportWorker(QThread):
+    """P1-1：素材处理工作线程（图像管线 / 视频-GIF 抽帧）。
+
+    任务 dict：{"kind": "extract", "src", "out_dir", "name_hint"} 或
+    {"kind": "import", "forms", "frames_raw", "frames_video", "tmpdir"}。
+    进度 progress(str)、结果 done_ok(object)、失败 failed(str) 经信号回主线程；
+    cancel() 请求取消（管线周期检查，最终以 failed("已取消处理") 结束）。
+    """
+    progress = Signal(str)
+    done_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, task, parent=None):
+        super().__init__(parent)
+        self._task = task
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _is_cancelled(self):
+        return self._cancelled
+
+    def run(self):
+        task = self._task
+        try:
+            if task["kind"] == "extract":
+                raws, err = _extract_video_frames(
+                    task["src"], task["out_dir"],
+                    cancel=self._is_cancelled, progress=self.progress.emit)
+                if err:
+                    self.failed.emit(err)
+                else:
+                    self.done_ok.emit({"raws": raws, "name_hint": task.get("name_hint", "")})
+            else:
+                res, err = _run_import_pipeline(
+                    task["forms"], task.get("frames_raw") or [], task.get("frames_video", False),
+                    task["tmpdir"], cancel=self._is_cancelled, progress=self.progress.emit)
+                if err:
+                    self.failed.emit(err)
+                else:
+                    self.done_ok.emit(res)
+        except ImportCancelled:
+            self.failed.emit("已取消处理")
+        except Exception as e:
+            self.failed.emit("处理失败：%s" % e)
 
 
 # ---------------- 角色导入向导 ----------------
@@ -668,6 +811,18 @@ class RoleImportDialog(QDialog):
         self.resize(600, 430)
         self._tmpdir = None
         self._result = None
+        self._worker = None       # P1-1：在途工作线程（None=空闲）
+        self._worker_kind = None  # P1-1：当前任务类型（extract/import）
+        self._busy_state = False  # P1-1：处理中标志（形态行按钮随 busy 禁用）
+        self._stopping = False    # P1-1：停止请求中（吞掉迟到进度，防覆盖「正在停止…」文案）
+        # P1-1：应用退出前收敛在途工作线程（父窗口析构路径不经过 closeEvent，
+        # 必须挂 aboutToQuit，否则 QThread: Destroyed while thread is still running）。
+        # 注意：绑定方法会被应用单例强引用——closeEvent 真正关闭时必须 disconnect，
+        # 否则每次打开向导泄漏一个隐藏对话框。
+        try:
+            QApplication.instance().aboutToQuit.connect(self._shutdown_worker)
+        except Exception:
+            pass  # instance() 为 None（无应用上下文）时静默跳过：此时也不存在退出流程
 
         root = QVBoxLayout(self)
         root.addWidget(QLabel("选好图片点「导入」即可：自动去背景、裁剪边距、统一大小。"))
@@ -724,10 +879,14 @@ class RoleImportDialog(QDialog):
         btns = QHBoxLayout()
         self._ok = QPushButton("导入")
         self._cancel = QPushButton("取消")
+        self._stop_btn = QPushButton("停止处理")  # P1-1：处理中可见，可取消工作线程
+        self._stop_btn.clicked.connect(self._stop_worker)
+        self._stop_btn.setVisible(False)
         self._ok.setDefault(True)
         self._ok.clicked.connect(self._do_import)
         self._cancel.clicked.connect(self.reject)
         btns.addStretch(1)
+        btns.addWidget(self._stop_btn)
         btns.addWidget(self._ok)
         btns.addWidget(self._cancel)
         root.addLayout(btns)
@@ -781,6 +940,10 @@ class RoleImportDialog(QDialog):
             self._forms_box.addWidget(row_w)
             fr["name_edit"] = name_edit
             fr["file_edit"] = file_edit
+            fr["pick"] = pick
+            fr["rem"] = rem
+            pick.setEnabled(not self._busy_state)  # P1-1：处理中禁改形态，防快照与界面不一致
+            rem.setEnabled(not self._busy_state)
 
     def _add_form(self, name=""):
         if len(self._form_rows) >= 8:
@@ -823,12 +986,101 @@ class RoleImportDialog(QDialog):
             self._name_edit.setText(os.path.splitext(os.path.basename(src))[0])
 
     def _set_busy(self, on, text="处理中…"):
-        """处理期间统一禁/启用导入、取消与全部素材选择按钮（防重入嵌套抽帧）。"""
+        """处理期间统一禁/启用导入、取消与全部素材选择按钮（防重入嵌套抽帧）；
+        P1-1：处理中显示「停止处理」按钮，窗口本身保持可拖动。"""
+        self._busy_state = bool(on)
         self._ok.setEnabled(not on)
         self._cancel.setEnabled(not on)
         self._ok.setText(text if on else "导入")
+        self._stop_btn.setVisible(on)
+        self._stop_btn.setEnabled(on)
         for b in self._mat_btns:
             b.setEnabled(not on)
+        for fr in self._form_rows:  # P1-1：形态行按钮同步禁用，防处理中改形态列表
+            for k in ("pick", "rem"):
+                btn = fr.get(k)
+                if btn is not None:
+                    btn.setEnabled(not on)
+
+    def _start_worker(self, task):
+        """启动工作线程并接线进度/结果/失败信号（P1-1）。"""
+        w = _ImportWorker(task, self)
+        w.progress.connect(self._on_worker_progress)
+        w.done_ok.connect(self._on_worker_done)
+        w.failed.connect(self._on_worker_failed)
+        w.finished.connect(w.deleteLater)
+        self._worker = w
+        self._worker_kind = task["kind"]
+        w.start()
+
+    def _stop_worker(self):
+        """请求取消在途处理：管线周期检查后以「已取消处理」结束。"""
+        if self._worker is not None:
+            self._worker.cancel()
+            self._stopping = True  # 吞掉迟到进度，防覆盖「正在停止……」文案
+            self._stop_btn.setEnabled(False)
+            self._notes.setText("正在停止……")
+
+    def _shutdown_worker(self):
+        """取消并等待在途工作线程收敛（≤3s；超时 terminate 兜底）。
+
+        供 closeEvent 与应用 aboutToQuit 共用：任何销毁路径都不让
+        QThread 在运行中被析构（Qt fatal）。等待前断开信号，避免收敛期间
+        排队中的 failed 在稍后主线程恢复事件循环时弹出多余提示。"""
+        w = self._worker
+        if w is None:
+            return
+        w.cancel()
+        for sig in (w.done_ok, w.failed, w.progress):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        if not w.wait(3000):
+            try:
+                w.terminate()  # 极端兜底：管线卡死时强杀，防退出卡住
+                w.wait(1000)
+                w.deleteLater()  # terminate 不发射 finished，手动释放防泄漏
+            except Exception:
+                pass
+        self._worker = None
+        self._worker_kind = None
+
+    def _on_worker_progress(self, text):
+        if self._stopping:
+            return  # 停止请求中：迟到进度不再覆盖「正在停止……」文案
+        self._notes.setText(text)
+        self._frames_status.setText(text)
+
+    def _on_worker_done(self, res):
+        self._worker = None
+        self._worker_kind = None
+        self._stopping = False
+        if "raws" in res:
+            # 抽帧完成
+            self._set_busy(False)
+            self._set_frames(res["raws"],
+                             "已抽 %d 帧（视频/GIF 均匀采样，导入时统一自动处理）" % len(res["raws"]),
+                             name_hint=res.get("name_hint") or "", video=True)
+            return
+        # 导入处理完成：补名字（完成时从控件实时读取，保持旧行为）
+        res["name"] = self._name_edit.text().strip() or getattr(self, "_name_hint", "") or "未命名"
+        self._set_busy(False)
+        self._result = res
+        self.accept()
+
+    def _on_worker_failed(self, err):
+        kind = self._worker_kind
+        self._worker = None
+        self._worker_kind = None
+        self._stopping = False
+        self._set_busy(False)
+        if kind == "import":
+            self._cleanup_tmp()  # 线程已结束，此时清理临时目录安全
+        if err == "已取消处理":
+            self._notes.setText("已停止处理")  # 主动停止不是错误：静默恢复 UI，不弹错误框
+            return
+        _warn(self, "抽帧" if kind == "extract" else "导入角色", err)
 
     def _validate_image(self, src, title):
         """素材校验：存在/大小/可加载。返回 (pix, err)。"""
@@ -906,23 +1158,19 @@ class RoleImportDialog(QDialog):
                 return
         except Exception:
             pass
+        # P1-1：每次抽帧前重建临时目录——重试成功后旧 raw_fXX.png 不残留
+        if self._rawdir:
+            shutil.rmtree(self._rawdir, ignore_errors=True)
+        self._rawdir = tempfile.mkdtemp(prefix="role_raw_")
         self._set_busy(True, text="抽帧中…")
         self._frames_status.setText("正在抽帧……")
-        QApplication.processEvents()
-        raws, err = None, None
-        try:
-            if self._rawdir is None:
-                self._rawdir = tempfile.mkdtemp(prefix="role_raw_")
-            raws, err = _extract_video_frames(src, self._rawdir)
-        except Exception as e:
-            err = "抽帧失败：%s" % e
-        finally:
-            self._set_busy(False)
-        if err:
-            _warn(self, "抽帧", err)
-            return
-        self._set_frames(raws, "已抽 %d 帧（视频/GIF 均匀采样，导入时统一自动处理）" % len(raws),
-                         name_hint=os.path.splitext(os.path.basename(src))[0], video=True)
+        # P1-1：抽帧移入工作线程，UI 不再阻塞（窗口可拖动、可「停止处理」）
+        self._start_worker({
+            "kind": "extract",
+            "src": src,
+            "out_dir": self._rawdir,
+            "name_hint": os.path.splitext(os.path.basename(src))[0],
+        })
 
     def _do_import(self):
         # 收集形态（名字从控件实时读）
@@ -939,57 +1187,17 @@ class RoleImportDialog(QDialog):
         if not forms:
             _warn(self, "导入角色", "请先添加形态并选图")
             return
-        # 大图去背景/裁剪要几秒：禁全部按钮（含素材选择，防重入/嵌套抽帧）
+        # P1-1：图像管线（去背景/裁剪/缩放，可能数秒）移入工作线程
         self._set_busy(True)
         self._notes.setText("正在自动处理素材（去背景 / 裁剪 / 缩放）……")
-        QApplication.processEvents()
-        try:
-            self._tmpdir = tempfile.mkdtemp(prefix="role_prep_")
-            frames_out = []
-            if self._frames_raw:
-                # 帧动画：统一画布处理（并集裁剪/逐帧居中），首帧即形态 0
-                frames_out, notesf = _prepare_role_frames(
-                    self._frames_raw, self._tmpdir, same_size=bool(self._frames_video))
-                if frames_out is None:
-                    self._cleanup_tmp()  # 保留原始抽帧：失败后可重试（L3）
-                    _warn(self, "导入角色", "帧处理失败：%s" % notesf)
-                    return
-                base_out = frames_out[0]
-                notes = ["帧动画 %d 帧：%s" % (len(frames_out), "、".join(notesf))]
-                forms_out = [(forms[0][0], base_out)]
-            else:
-                base_out = os.path.join(self._tmpdir, "role_base.png")
-                ok1, notes1 = _prepare_role_png(forms[0][1], base_out)
-                if not ok1:
-                    self._cleanup_tmp()
-                    _warn(self, "导入角色", "第 1 形态处理失败：%s" % notes1)
-                    return
-                notes = ["第 1 形态：%s" % ("、".join(notes1) if notes1 else "无需处理")]
-                forms_out = [(forms[0][0], base_out)]
-            # 其余形态逐个处理
-            for i, (nm, src) in enumerate(forms[1:], start=1):
-                fp = os.path.join(self._tmpdir, "form%d.png" % i)
-                okf, notesf = _prepare_role_png(src, fp)
-                if not okf:
-                    self._cleanup_tmp()
-                    _warn(self, "导入角色", "第 %d 形态处理失败：%s" % (i + 1, notesf))
-                    return
-                forms_out.append((nm, fp))
-                notes.append("第 %d 形态（%s）：%s" % (i + 1, nm, "、".join(notesf) if notesf else "无需处理"))
-            self._result = {
-                "name": self._name_edit.text().strip()
-                        or getattr(self, "_name_hint", "") or "未命名",
-                "base": base_out,
-                "frames": frames_out or [],
-                "forms": forms_out,
-                "notes": notes,
-            }
-            self.accept()
-        except Exception as e:
-            self._cleanup_tmp()
-            _warn(self, "导入角色", "处理失败：%s" % e)
-        finally:
-            self._set_busy(False)
+        self._tmpdir = tempfile.mkdtemp(prefix="role_prep_")
+        self._start_worker({
+            "kind": "import",
+            "forms": forms,
+            "frames_raw": list(self._frames_raw),
+            "frames_video": bool(self._frames_video),
+            "tmpdir": self._tmpdir,
+        })
 
     def _cleanup_tmp(self):
         """只清理本次导入的处理临时目录（保留原始抽帧供失败重试）。"""
@@ -1004,9 +1212,15 @@ class RoleImportDialog(QDialog):
             self._rawdir = None
 
     def closeEvent(self, event):
-        if not self._ok.isEnabled():
-            event.ignore()  # 处理中：忽略关闭，防止清理正在写入的临时目录
-            return
+        if self._worker is not None:
+            self._shutdown_worker()  # P1-1：关闭先收敛在途线程（防 QThread 运行中析构）
+            self._set_busy(False)    # 取消处理即视为结束：允许本次关闭继续
+        # P1-1：真正关闭时断开 aboutToQuit 连接——绑定方法被应用单例强引用，
+        # 不断开会泄漏对话框（_tmpdir/_result 常驻、临时目录永不清理）
+        try:
+            QApplication.instance().aboutToQuit.disconnect(self._shutdown_worker)
+        except Exception:
+            pass
         self._cleanup()
         super().closeEvent(event)
 
