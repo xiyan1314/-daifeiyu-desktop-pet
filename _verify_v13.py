@@ -520,8 +520,10 @@ def main_flow():
         pet._autostart_act = _real_act
         pet.show_bubble = _real_sb2
 
-    # 开机自启：保存原状 → 往返测试 → 恢复（不动用户真实设置）
-    _was_auto = main.is_autostart_enabled()
+    # 开机自启：往返测试打到专用探针键（CI 机器上真实 Run 键可能不可写/不存在；
+    # 代码路径与真实键完全一致，仅键名不同），不再触碰用户真实设置
+    _real_key = main.AUTOSTART_KEY
+    main.AUTOSTART_KEY = r"Software\DaFeiYuPet\CIProbe"
     try:
         main.set_autostart(False)
         check("autostart default off", main.is_autostart_enabled() is False)
@@ -529,8 +531,9 @@ def main_flow():
         check("autostart set on", ok_a and main.is_autostart_enabled(), "err=%r" % (err_a,))
         ok_b, _err_b = main.set_autostart(False)
         check("autostart set off", ok_b and not main.is_autostart_enabled())
+        main.set_autostart(False)  # 清理探针值
     finally:
-        main.set_autostart(_was_auto)  # 恢复开发者本机原状
+        main.AUTOSTART_KEY = _real_key
 
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")

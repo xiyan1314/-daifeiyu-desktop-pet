@@ -3506,7 +3506,11 @@ def set_autostart(on):
     """写入/删除 HKCU Run 键。返回 (ok, err)。"""
     try:
         import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE)
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE)
+        except FileNotFoundError:
+            # 目标键不存在（个别环境 Run 键缺失）：创建后写入，不把环境差异当错误
+            key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE)
         if on:
             winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, _autostart_command())
         else:
