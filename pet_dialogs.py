@@ -2158,3 +2158,94 @@ class LinesDialog(QDialog):
         self._edits[pool].clear()
         _call(self._pet, "save_lines", pool, [])
         _call(self._pet, "show_bubble", "「%s」台词恢复默认啦~" % label)
+
+
+# ---------------- P0-1：PetWindow 对话框入口函数（迁移自桌宠.py） ----------------
+# 全部鸭子类型访问 pet（show_bubble / cfg / role_lib / apply_role），不 import 桌宠。
+def open_resource_manager(pet, tab=0):
+    try:
+        dlg = ResourceManagerDialog(pet, tab)
+        modal(dlg)
+    except Exception as e:
+        pet_log.log_error("resource_manager failed: %r" % (e,))
+        pet.show_bubble("资源管理窗口打不开……")
+
+
+def open_ledger(pet):
+    try:
+        dlg = LedgerDialog(pet)
+        modal(dlg)
+    except Exception as e:
+        pet_log.log_error("ledger dialog failed: %r" % (e,))
+
+
+def open_bubble_style(pet):
+    try:
+        dlg = BubbleStyleDialog(pet)
+        modal(dlg)
+    except Exception as e:
+        pet_log.log_error("bubble_style dialog failed: %r" % (e,))
+
+
+def open_lines(pet):
+    try:
+        dlg = LinesDialog(pet)
+        modal(dlg)
+    except Exception as e:
+        pet_log.log_error("lines dialog failed: %r" % (e,))
+
+
+def open_ai_settings(pet):
+    try:
+        dlg = AISettingsDialog(pet)
+        modal(dlg)
+    except Exception as e:
+        pet_log.log_error("ai settings dialog failed: %r" % (e,))
+
+
+def ask_amount(pet, title, label, cur):
+    """数值输入对话框（预算 / 余额预警共用）：置顶 + 显式焦点，规避前台锁。"""
+    dlg = QInputDialog(pet)
+    dlg.setWindowTitle(title)
+    dlg.setLabelText(label)
+    dlg.setInputMode(QInputDialog.InputMode.DoubleInput)
+    dlg.setDoubleRange(0.0, 99999.0)
+    dlg.setDoubleDecimals(2)
+    dlg.setDoubleValue(cur)
+    dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+    dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
+    dlg.setFocus()
+    if dlg.exec() == QDialog.DialogCode.Accepted:
+        return round(max(0.0, dlg.doubleValue()), 2)
+    return None
+
+
+def set_frame_max(pet, save_cfg):
+    """P3-5+：帧动画帧数上限（读侧与导入管线共用，改完立即生效）。"""
+    cur = int(pet.cfg.get("role_frame_max", 24) or 24)
+    dlg = QInputDialog(pet)
+    dlg.setWindowTitle("帧数上限")
+    dlg.setLabelText("帧动画角色最多多少帧？（2~60，对导入与加载立即生效）")
+    dlg.setInputMode(QInputDialog.InputMode.IntInput)
+    dlg.setIntRange(2, 60)
+    dlg.setIntValue(cur)
+    dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+    dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
+    dlg.setFocus()
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return
+    val = dlg.intValue()
+    pet.cfg["role_frame_max"] = val
+    save_cfg(pet.cfg)
+    pet_resources.FRAME_MAX = val
+    # 已载入角色立即按新上限重建（调小立即截断生效；调大下次导入即用）
+    try:
+        pet.role_lib._load()
+        pet.apply_role(pet.cfg.get("role", ""))
+    except Exception:
+        pass  # 有意忽略：重建失败下次启动自愈，不影响上限已落盘
+    pet.show_bubble("帧上限改为 %d 帧啦~" % val)
