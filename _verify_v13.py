@@ -600,6 +600,26 @@ def main_flow():
         except Exception:
             pass  # 有意忽略：复位失败不影响后续检查
 
+    # ---- v2.0：语音系统（默认关闭 / 配置归一化 / 片段注册） ----
+    check("voice default off", pet.cfg.get("voice", {}).get("enabled") is False)
+    check("voice service", hasattr(pet, "voice") and pet.voice is not None)
+    _wav = os.path.join(_tmp, "t.wav")
+    import wave as _wave
+    with _wave.open(_wav, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(22050)
+        f.writeframes(b"\x00\x00" * 100)
+    _okv, _errv = pet.voice.set_clip("reply", _wav)
+    check("voice clip roundtrip", _okv and pet.voice.clip("reply") is not None
+          and os.path.isfile(pet.voice.clip("reply")), "err=%r" % (_errv,))
+    pet.voice.set_clip("reply", None)
+    check("voice clip clear", pet.voice.clip("reply") is None)
+    try:
+        os.remove(_wav)
+    except Exception:
+        pass  # 有意忽略：临时 wav 清理尽力而为
+
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
     make_test_wav(wav)

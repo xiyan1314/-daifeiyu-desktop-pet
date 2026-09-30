@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 
 import pet_log
 import pet_physics
+import pet_voice
 import pet_anim
 import pet_fx
 import pet_mood
@@ -58,7 +59,7 @@ import pet_main
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.6.2"
+VERSION = "2.0.0"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -150,6 +151,8 @@ DEFAULT_CONFIG = {
     # P1-手感：甩抛物理（默认关闭=行为与旧版逐像素一致；参数与 pet_physics.DEFAULT_PHYSICS 同构）
     "physics": {"enabled": False, "gravity": 1400.0, "restitution": 0.78,
                 "groundFriction": 2.5, "ceilingBounce": True, "throwPower": 1.0},
+    # v2.0：语音系统（默认关闭；默认值单一来源 pet_voice.DEFAULT_VOICE）
+    "voice": pet_voice.DEFAULT_VOICE,
 }
 
 # P1-3：config.json schema 版本（1=旧版全量存储；2=diff 只存改动项）
@@ -161,7 +164,7 @@ CONFIG_FIXES = []
 _SOFT_FIX_KEYS = {"always_on_top", "ai_enabled", "follow_mouse", "wander", "sound", "badge",
                   "ai_base_url", "ai_model", "ai_system_prompt", "lines_extra",
                   "sound_group", "role", "scale_compensated_role",
-                  "ai_persona", "click_through", "role_frame_max", "physics"}
+                  "ai_persona", "click_through", "role_frame_max", "physics", "voice"}
 
 
 def _fix_entry(k, a, b):
@@ -442,6 +445,8 @@ class Signals(QObject):
     reply = Signal(str)
     reply_ok = Signal()  # AI 回复成功（主线程播任务完成音）
     ai_emote = Signal(str, str)  # P3-3：AI 回复带出表情（mode=state/emote, kind）
+    voice_play = Signal(str)  # v2.0：合成 worker 线程 → 主线程播放投递（QMediaPlayer 仅主线程）
+    voice_error = Signal(str)  # v2.0：合成失败原因 → 主线程气泡（不跨线程碰 Qt 控件）
     weather = Signal(str)
     weather_done = Signal()
     ai_done = Signal()
@@ -533,6 +538,9 @@ class PetWindow(QWidget):
                                                   play_sound, save_config, _log_error, self.ai.set_api_key)
         self.actions = pet_actions.ActionService(self, lambda: self.cfg, pick_idle_action,
                                                  SLEEP_AFTER_SECONDS)
+        # v2.0：语音服务（默认关闭；片段播放注入 preview_audio）
+        self.voice = pet_voice.VoiceService(DATA_DIR, lambda: self.cfg,
+                                            self._play_voice_clip, _log_error)
         self.menu_builder = pet_menu.MenuBuilder(self, save_config, is_autostart_enabled)
 
         self.bubble = Bubble()
@@ -745,6 +753,9 @@ class PetWindow(QWidget):
         # 跨线程信号
         signals.weather.connect(self.show_bubble)
         signals.reply.connect(self.show_bubble)
+        signals.reply.connect(self._on_reply_voice)  # v2.0：AI 回复语音（默认关闭）
+        signals.voice_play.connect(self.preview_audio)  # v2.0：主线程播放合成/片段
+        signals.voice_error.connect(self.show_bubble)  # v2.0：合成失败原因主线程气泡
         signals.ai_emote.connect(self.chat.on_ai_emote)  # P3-3：AI 回复带出的表情
         signals.reply_ok.connect(self.chat.on_reply_ok)  # 任务完成音回主线程播
         signals.balance_updated.connect(self.balance.on_updated)
@@ -1200,6 +1211,7 @@ class PetWindow(QWidget):
             self._play_idle()
 
     def _show_sleep(self):
+        self.voice.play_event("sleep")  # v2.0：睡眠语音片段（未配置/关闭则静默）
         self.anim.stop()
         self.anim_mode = "sleep"
         self._cur_state = "sleep"
@@ -1218,6 +1230,7 @@ class PetWindow(QWidget):
     def _wake(self):
         self._last_activity = time.monotonic()
         if self._sleeping:
+            self.voice.play_event("wake")  # v2.0：唤醒语音片段
             self._play_idle()
 
     def _show_pet(self):
@@ -1712,6 +1725,7 @@ class PetWindow(QWidget):
         self.busy = True
         if self.cfg.get("sound", True):
             play_sound("feed")
+        self.voice.play_event("feed")  # v2.0：喂食语音片段
         line = random.choice(FOOD_LINES.get(food, ["啊呜~好吃！"]))
         was_first = self.form == self.form_keys[0]  # 必须在 _set_form 之前记录
         self.mood.fed()
@@ -1883,6 +1897,7 @@ class PetWindow(QWidget):
                 return  # 摸头成功的松手：不戳、不贴边（M-1 修复）
             if not self._moved:
                 self.mood.poke()
+                self.voice.play_event("poke")  # v2.0：被戳语音片段
             else:
                 # P1-手感：仅开启物理时估速甩抛；默认关闭走原贴边逻辑（逐字节等价）
                 if self._physics_on():
@@ -2187,6 +2202,37 @@ class PetWindow(QWidget):
     def _apply_sound_group(self):
         """启动 / 菜单切组时按配置把音效组同步进 pet_audio（不改变配置）。"""
         self.apply_sound_group(None, as_custom=False)
+
+    def _play_voice_clip(self, path):
+        """v2.0：语音片段/合成结果播放。合成 worker 线程经 signals 投递回主线程
+        （QMediaPlayer 只能在主线程使用；wav 的 winsound 链路线程安全但统一走主线程更稳）。"""
+        if threading.current_thread() is not threading.main_thread():
+            signals.voice_play.emit(path)
+        else:
+            self.preview_audio(path)
+
+    VOICE_SKIP_TEXTS = ("API Key 不对，查一下？", "DeepSeek 余额不足，去平台充点~",
+                         "问太多次啦，歇会儿再来~", "网络不好，听不清啦……")
+
+    def _on_reply_voice(self, text):
+        """v2.0：AI 回复 → 语音播放。优先级：reply 片段 > TTS 合成；错误提示文本不朗读。"""
+        text = (text or "").strip()
+        if not text or text in self.VOICE_SKIP_TEXTS:
+            return
+        p = self.voice.clip("reply")
+        if p is not None:
+            self._play_voice_clip(p)
+            return
+        self.voice.speak(text, on_error=signals.voice_error.emit)
+
+    def apply_voice(self, data=None):
+        """v2.0：语音设置回调（归一化后落盘）。"""
+        if not isinstance(data, dict):
+            return
+        vcfg = pet_voice.normalize_voice({**self.cfg.get("voice", {}), **data})
+        self.cfg["voice"] = vcfg
+        save_config(self.cfg)
+        self.show_bubble("语音设置已更新~")
 
     def preview_audio(self, path):
         """试听：wav 走 winsound 主链路；mp3 等降级 QMediaPlayer。返回是否发出。"""

@@ -13,6 +13,7 @@ import os
 
 import pet_log  # P1-手感：物理参数非法时记日志（pet_log 无任何依赖，安全）
 import pet_physics  # P1-手感：默认值单一来源（pet_physics 无 Qt 依赖，无环）
+import pet_voice  # v2.0：语音配置归一化（pet_voice 无环）
 
 # 上界与设置对话框同口径（pet_dialogs.PhysicsDialog 的 spinbox 范围）
 _PHYS_MAX = {"gravity": 10000.0, "restitution": 1.0,
@@ -174,6 +175,8 @@ def normalize_cfg(cfg, defaults, persona_ids):
         pet_log.log_error("load_config: 物理参数非法已回退默认: %s" % ",".join(_pd["_fixed"]))
         _pd.pop("_fixed")
     cfg["physics"] = _pd
+    # v2.0：语音配置归一化（默认关闭；tts_mode 白名单）
+    cfg["voice"] = pet_voice.normalize_voice(cfg.get("voice"))
     cfg["sound_group"] = "custom" if cfg.get("sound_group") == "custom" else "default"
     try:
         bs = cfg.get("bubble_style")

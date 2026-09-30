@@ -2915,6 +2915,130 @@ def open_physics(pet):
         pet_log.log_error("physics dialog failed: %r" % (e,))
 
 
+class VoiceDialog(QDialog):
+    """v2.0：语音设置——开关 / 合成方式（系统语音或 API）/ 事件片段导入试听。
+
+    片段由用户自行准备（wav/mp3）；AI 合成受限时主界面气泡明确提示原因（不静默）。"""
+
+    EVENTS = (("reply", "AI 回复"), ("feed", "喂食"), ("poke", "被戳"),
+              ("sleep", "睡觉"), ("wake", "醒来"))
+
+    def __init__(self, parent=None):
+        super().__init__(_qt_parent(parent))
+        self._pet = parent
+        self.setWindowTitle("语音设置")
+        self.setStyleSheet(DIALOG_QSS)
+        self.resize(520, 420)
+        cfg = (_get(parent, "cfg") or {}).get("voice") or {}
+        root = QVBoxLayout(self)
+        self._en = QCheckBox("开启语音（默认关闭）")
+        self._en.setChecked(bool(cfg.get("enabled")))
+        root.addWidget(self._en)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("AI 声音合成"))
+        self._mode = QComboBox()
+        self._mode.addItem("关闭合成（只用片段）", "off")
+        self._mode.addItem("本地系统语音（离线，无需 Key）", "sapi")
+        self._mode.addItem("API 合成（OpenAI 兼容 /audio/speech）", "api")
+        root.addWidget(row)
+        root.addWidget(self._mode)
+        _mi = self._mode.findData(cfg.get("tts_mode", "off"))
+        if _mi >= 0:
+            self._mode.setCurrentIndex(_mi)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("合成声音"))
+        self._voice = QLineEdit(cfg.get("tts_voice", ""))
+        self._voice.setPlaceholderText("留空用系统默认；如 Microsoft Huihui Desktop / alloy")
+        row2.addWidget(self._voice)
+        root.addLayout(row2)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("TTS 模型"))
+        self._model = QLineEdit(cfg.get("tts_model", ""))
+        self._model.setPlaceholderText("留空用 tts-1")
+        row3.addWidget(self._model)
+        root.addLayout(row3)
+        root.addWidget(QLabel("事件片段（自己准备的 wav/mp3；导入即用，可试听/清除）"))
+        self._row_labels = {}
+        for key, label in self.EVENTS:
+            r = QHBoxLayout()
+            r.addWidget(QLabel(label))
+            st = QLabel("—")
+            r.addWidget(st)
+            self._row_labels[key] = st
+            b1 = QPushButton("导入…")
+            b1.clicked.connect(lambda _c=False, k=key: self._import(k))
+            b2 = QPushButton("试听")
+            b2.clicked.connect(lambda _c=False, k=key: self._test(k))
+            b3 = QPushButton("清除")
+            b3.clicked.connect(lambda _c=False, k=key: self._clear(k))
+            r.addWidget(b1)
+            r.addWidget(b2)
+            r.addWidget(b3)
+            root.addLayout(r)
+        self._refresh_rows()
+        btns = QHBoxLayout()
+        ok = QPushButton("保存")
+        cancel = QPushButton("取消")
+        ok.setDefault(True)
+        ok.clicked.connect(self._save)
+        cancel.clicked.connect(self.reject)
+        btns.addStretch(1)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        root.addLayout(btns)
+
+    def _refresh_rows(self):
+        """导入/清除后即时刷新「✓ 已配 / —」标签。"""
+        voice = _get(self._pet, "voice")
+        for key, lbl in self._row_labels.items():
+            cur = voice.clip(key) if voice is not None else None
+            lbl.setText("✓ 已配" if cur else "—")
+
+    def _import(self, key):
+        src, _f = QFileDialog.getOpenFileName(self, "导入语音片段", "", "音频 (*.wav *.mp3)")
+        if not src:
+            return
+        ok, err = _get(self._pet, "voice").set_clip(key, src)
+        if not ok:
+            _warn(self, "语音片段", err or "导入失败")
+            return
+        self._refresh_rows()
+
+    def _test(self, key):
+        p = _get(self._pet, "voice").clip(key)
+        if p is None:
+            _warn(self, "试听", "该事件还没配片段")
+            return
+        try:
+            _call(self._pet, "preview_audio", p)
+        except Exception as e:
+            _warn(self, "试听", "播放失败：%s" % e)
+
+    def _clear(self, key):
+        ok, err = _get(self._pet, "voice").set_clip(key, None)
+        if not ok:
+            _warn(self, "语音片段", err or "清除失败")
+            return
+        self._refresh_rows()
+
+    def _save(self):
+        data = {"enabled": self._en.isChecked(),
+                "tts_mode": self._mode.currentData(),
+                "tts_voice": self._voice.text().strip(),
+                "tts_model": self._model.text().strip()}
+        _call(self._pet, "apply_voice", data)
+        self.accept()
+
+
+def open_voice(pet):
+    """v2.0：语音设置对话框入口。"""
+    try:
+        dlg = VoiceDialog(pet)
+        modal(dlg)
+    except Exception as e:
+        pet_log.log_error("voice dialog failed: %r" % (e,))
+
+
 def ask_amount(pet, title, label, cur):
     """数值输入对话框（预算 / 余额预警共用）：置顶 + 显式焦点，规避前台锁。"""
     dlg = QInputDialog(pet)

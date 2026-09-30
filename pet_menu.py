@@ -139,6 +139,9 @@ class MenuBuilder:
         # P1-手感：物理参数设置（重力/反弹/摩擦/顶边/力度）
         phys_param_act = set_menu.addAction("🌀 物理参数…")
         phys_param_act.triggered.connect(lambda: pet_dialogs.open_physics(pet))
+        # v2.0：语音设置（开关/合成方式/事件片段）
+        voice_act = set_menu.addAction("🎤 语音设置…")
+        voice_act.triggered.connect(lambda: pet_dialogs.open_voice(pet))
         fm_act.triggered.connect(lambda: pet_dialogs.set_frame_max(pet, self._save_cfg))
         snd_set = set_menu.addMenu("🎵 音效设置")
         grp_group = QActionGroup(menu)
