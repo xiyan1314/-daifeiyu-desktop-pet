@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 import pet_log
+import pet_physics
 import pet_anim
 import pet_fx
 import pet_mood
@@ -57,7 +58,7 @@ import pet_main
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -146,6 +147,9 @@ DEFAULT_CONFIG = {
     "ai_persona": "default",  # P1-10+：人设预设 id（default/sheshe/tsundere/custom）
     "click_through": False,   # P3-1：透明区点击穿透（只命中身体，默认关闭）
     "role_frame_max": 24,     # P3-5+：帧动画帧数上限（2~60，用户可调）
+    # P1-手感：甩抛物理（默认关闭=行为与旧版逐像素一致；参数与 pet_physics.DEFAULT_PHYSICS 同构）
+    "physics": {"enabled": False, "gravity": 1400.0, "restitution": 0.78,
+                "groundFriction": 2.5, "ceilingBounce": True, "throwPower": 1.0},
 }
 
 # P1-3：config.json schema 版本（1=旧版全量存储；2=diff 只存改动项）
@@ -157,7 +161,7 @@ CONFIG_FIXES = []
 _SOFT_FIX_KEYS = {"always_on_top", "ai_enabled", "follow_mouse", "wander", "sound", "badge",
                   "ai_base_url", "ai_model", "ai_system_prompt", "lines_extra",
                   "sound_group", "role", "scale_compensated_role",
-                  "ai_persona", "click_through"}
+                  "ai_persona", "click_through", "role_frame_max", "physics"}
 
 
 def _fix_entry(k, a, b):
@@ -671,6 +675,19 @@ class PetWindow(QWidget):
         self._mem_epoch = 0  # P1-6：记忆代次（清理记忆后 +1，在途 AI 回复据此判断是否入记忆）
         self._fly_timer = None
         self._anchor_bottom = False
+        # ---- P1-手感：甩抛物理（默认关闭，行为与旧版逐像素一致） ----
+        self._flying = False        # 飞行中（不响应戳戳/摸摸头/贴边）
+        self._flight_vx = 0.0
+        self._flight_vy = 0.0
+        self._flight_last = 0.0
+        self._land_squash = 1.0
+        self._drag_samples = []     # [(t, x, y)] 拖拽轨迹采样（松手估速，只留最近 200ms）
+        self._spring_vx = 0.0       # 过阻尼弹簧跟手状态（K=200/C=30）
+        self._spring_vy = 0.0
+        self._last_drag_t = None
+        self._flight_timer = QTimer(self)
+        self._flight_timer.setInterval(16)
+        self._flight_timer.timeout.connect(self._flight_tick)
 
         scale = self.cfg.get("scale", 1.0)
         if not os.path.exists(CONFIG_PATH):
@@ -1778,6 +1795,8 @@ class PetWindow(QWidget):
         self._apply_transform()
 
     def _snap_to_edge(self):
+        if self._flying:
+            return  # P1-手感：飞行中不触发吸附，落地静止后再允许
         # P1-4：以「所在屏」（间隙取最近屏）吸附，混合 DPI 下用逻辑坐标天然对齐
         scr = self._screen_geo(self.frameGeometry().center())
         if scr is None:
@@ -1798,7 +1817,13 @@ class PetWindow(QWidget):
     # ---------- 鼠标事件 ----------
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            if self._flying:
+                return  # P1-手感：飞行中不响应戳戳/摸摸头（落地静止后恢复）
             self._wake()
+            self._drag_samples = []  # P1-手感：新一轮拖拽轨迹采样
+            self._spring_vx = 0.0
+            self._spring_vy = 0.0
+            self._last_drag_t = time.monotonic()
             self._press_global = e.globalPosition().toPoint()
             self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
             self._moved = False
@@ -1833,10 +1858,16 @@ class PetWindow(QWidget):
                 self._hold_timer.stop()
                 if self._petting:
                     self._end_petting()
-            self.move(gp - self._drag_offset)
+            if self._physics_on() and not self._flying:
+                self._record_drag_sample(gp)  # P1-手感：仅开启物理时采样（默认关闭零开销）
+                self._physics_drag_move(gp)  # 过阻尼弹簧跟手（K=200/C=30，ζ≈1.06）
+            else:
+                self.move(gp - self._drag_offset)
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            if self._flying and self._press_global is None:
+                return  # P1-手感：飞行中点到宠物（press 被忽略）——release 一并忽略，防状态陈旧
             self._drag_offset = None
             self._press_global = None
             self._hold_timer.stop()
@@ -1853,7 +1884,160 @@ class PetWindow(QWidget):
             if not self._moved:
                 self.mood.poke()
             else:
+                # P1-手感：仅开启物理时估速甩抛；默认关闭走原贴边逻辑（逐字节等价）
+                if self._physics_on():
+                    self._record_drag_sample(e.globalPosition().toPoint())
+                    if self._maybe_throw():
+                        return
                 self._snap_to_edge()
+
+    # ---------- P1-手感：甩抛物理（默认关闭） ----------
+    def _physics_on(self):
+        return bool((self.cfg.get("physics") or {}).get("enabled"))
+
+    def _record_drag_sample(self, gp):
+        """拖拽轨迹采样：只保留最近 SAMPLE_WINDOW（200ms），估速窗口内才保留。"""
+        self._drag_samples.append((time.monotonic(), gp.x(), gp.y()))
+        self._drag_samples = pet_physics.trim_samples(self._drag_samples)
+
+    def _physics_drag_move(self, gp):
+        """过阻尼弹簧跟手（K=200 / C=30，ζ≈1.06 不过冲）：不再直接 self.move()。"""
+        now = time.monotonic()
+        if self._last_drag_t is None:
+            self._last_drag_t = now
+        dt = min(0.05, max(0.002, now - self._last_drag_t))
+        self._last_drag_t = now
+        target = gp - self._drag_offset
+        cur = self.pos()
+        K, C = 200.0, 30.0
+        self._spring_vx += (K * (target.x() - cur.x()) - C * self._spring_vx) * dt
+        self._spring_vy += (K * (target.y() - cur.y()) - C * self._spring_vy) * dt
+        self.move(cur.x() + int(round(self._spring_vx * dt)),
+                  cur.y() + int(round(self._spring_vy * dt)))
+
+    def _maybe_throw(self):
+        """松手估速：超过死区（500px/s）进入甩抛飞行，返回 True；否则 False（走贴边）。"""
+        if not self._physics_on():
+            return False  # 严重修复：默认关闭绝不甩飞（旧版贴边行为）
+        phys = self.cfg.get("physics") or {}
+        vx, vy = pet_physics.estimate_throw(
+            self._drag_samples, now=time.monotonic(),
+            throw_power=float(phys.get("throwPower", 1.0)))
+        if not (vx or vy):
+            return False
+        self._flying = True
+        self._flight_vx = vx
+        self._flight_vy = vy
+        self._flight_last = time.monotonic()
+        self._flight_start = time.monotonic()
+        self._air_static_ticks = 0
+        self._flight_timer.start(pet_physics.FLIGHT_TICK_MS)
+        return True
+
+    def _flight_rect(self):
+        """当前所在屏的可用区域 (left, top, right, bottom)；无屏返回 None。"""
+        scr = self._screen_geo(self.frameGeometry().center())
+        if scr is None:
+            return None
+        r = scr.getRect()  # (x, y, w, h)
+        return r[0], r[1], r[0] + r[2], r[1] + r[3]
+
+    def _flight_tick(self):
+        """飞行积分步进：重力+四边反弹+地面摩擦。
+
+        落地冲击（step_physics 返回的 impact）≥300 时播 Q 弹（与静止判定解耦）；
+        静止收尾：贴地双速极小，或空中连续 N 拍双速极小，或飞行超 5s（防漂浮软锁）。"""
+        phys = self.cfg.get("physics") or {}
+        rect = self._flight_rect()
+        if rect is None:
+            self._end_flight()
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_flight_start", now) > pet_physics.FLIGHT_MAX_SECONDS:
+            self._end_flight()  # 飞行时长上限：漂浮模式等任何情况都不会软锁
+            return
+        dt = min(pet_physics.DT_MAX, max(0.001, now - self._flight_last))
+        self._flight_last = now
+        nx, ny, nvx, nvy, on_ground, impact = pet_physics.step_physics(
+            float(self.x()), float(self.y()), self._flight_vx, self._flight_vy,
+            self.width(), self.height(), rect, dt, phys)
+        self._flight_vx, self._flight_vy = nvx, nvy
+        self.move(int(round(nx)), int(round(ny)))
+        if impact >= pet_physics.SQUASH_LIGHT_IMPACT:
+            self._land_squash = pet_physics.landing_squash(impact)
+            if self._land_squash < 1.0:
+                self._play_landing_bounce()
+        if on_ground and abs(nvy) < pet_physics.STATIC_VY and abs(nvx) < pet_physics.STATIC_VX:
+            self._end_flight()
+            return
+        # 空中静止判定（gravity=0 漂浮模式不会触地）：连续 N 拍双速极小 → 收尾
+        if not on_ground and abs(nvy) < pet_physics.STATIC_VY and abs(nvx) < pet_physics.STATIC_VX:
+            self._air_static_ticks = getattr(self, "_air_static_ticks", 0) + 1
+            if self._air_static_ticks >= pet_physics.AIR_STATIC_TICKS:
+                self._end_flight()
+        else:
+            self._air_static_ticks = 0
+
+    def _play_landing_bounce(self):
+        """落地 Q 弹（220ms 曲线）：经 _run_anim 单动画槽。
+
+        显式收尾回调只复位 squash、不动 busy（喂食等动作的 busy 由各自流程管理，
+        避免 Q 弹结束把吃帧的 busy 提前误清）。"""
+        squash = self._land_squash
+
+        def _bounce_done():
+            self.squash_x = 1.0
+            self.squash_y = 1.0
+            self._apply_transform()
+
+        self._run_anim(
+            int(pet_physics.BOUNCE_DURATION * 1000),
+            lambda v: self._set_bounce_scale(v, squash),
+            on_finished=_bounce_done)
+
+    def _set_bounce_scale(self, t01, squash):
+        sy = pet_physics.bounce_scale(t01 * pet_physics.BOUNCE_DURATION, squash)
+        self.squash_y = sy
+        self.squash_x = max(pet_physics.SQUASH_MIN_X, 2.0 - sy)  # 体积守恒：压扁时横向鼓出
+        self._apply_transform()
+
+    def _end_flight(self):
+        """落地收尾：停飞行、贴边、恢复散步（按压前在散步则续走）。"""
+        self._flying = False
+        self._flight_timer.stop()
+        self._flight_vx = 0.0
+        self._flight_vy = 0.0
+        self._drag_samples = []
+        self._snap_to_edge()
+        if self._was_walking and self.cfg.get("wander"):
+            self.walk_timer.start(self._walk_interval)
+
+    def _set_physics(self, on):
+        """P1-手感：甩抛物理开关（立即生效并落盘）。关闭时若正在飞行则立即收尾。"""
+        phys = dict(self.cfg.get("physics") or {})
+        phys["enabled"] = bool(on)
+        self.cfg["physics"] = phys
+        save_config(self.cfg)
+        if not on and self._flying:
+            self._end_flight()  # 关闭=停止：不打断预期之外继续飞
+        self.show_bubble("甩抛物理已开启，使劲把我甩出去吧~" if on else "甩抛物理已关闭~")
+
+    def apply_physics(self, data=None):
+        """P1-手感：物理参数回调——与 load_config 同口径归一化（负数/超界回退钳制），
+        数据未变不弹提示。"""
+        if not isinstance(data, dict):
+            return
+        phys = dict(self.cfg.get("physics") or {})
+        phys.update({k: v for k, v in data.items()
+                     if k in ("gravity", "restitution", "groundFriction", "ceilingBounce", "throwPower")})
+        phys = pet_config.normalize_physics(phys)
+        if phys.get("_fixed"):
+            _log_error("apply_physics: 参数非法已修正: %s" % ",".join(phys.pop("_fixed")))
+        if phys == (self.cfg.get("physics") or {}):
+            return  # 值未变：静默返回
+        self.cfg["physics"] = phys
+        save_config(self.cfg)
+        self.show_bubble("物理参数已更新~")
 
     def wheelEvent(self, e):
         delta = e.angleDelta().y()
@@ -2156,7 +2340,7 @@ class PetWindow(QWidget):
             for t in (self.idle_timer, self.walk_timer, self.cpu_timer, self.mood_timer,
                       self._state_timer, self._drag_timer, self._digest_timer,
                       self._fly_timer, self._save_scale_timer, self._food_shown_timer,
-                      self._hold_timer, self._pet_max):
+                      self._hold_timer, self._pet_max, self._flight_timer):  # P1-手感
                 if t is not None:
                     t.stop()
             # 缩放防抖未到期就退出：立即落盘，避免最后一次调大小丢失

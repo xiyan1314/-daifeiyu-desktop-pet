@@ -34,6 +34,10 @@ BOUNCE_C1 = 1.70158          # easeOutBack 常数
 BOUNCE_PEAK = 1.12           # scaleY 过冲上限
 SQUASH_LIGHT_IMPACT = 300.0  # px/s：轻落（压扁 0.8）
 SQUASH_HEAVY_IMPACT = 1500.0 # px/s：重砸（压扁 0.55）
+FLIGHT_TICK_MS = 16          # ms：飞行积分定时器间隔
+FLIGHT_MAX_SECONDS = 5.0     # s：飞行时长上限（防漂浮模式等软锁）
+AIR_STATIC_TICKS = 3         # 空中 |vx|<15 且 |vy|<40 连续 N 拍视为静止收尾
+SQUASH_MIN_X = 0.8           # 压扁时 scaleX 下限（体积守恒）
 
 
 # ---------------- 组成一：轨迹估速 ----------------
@@ -136,7 +140,9 @@ def estimate_throw(samples, now=None, throw_power=1.0):
 def step_physics(x, y, vx, vy, w, h, rect, dt, params=None):
     """单步积分。rect=(left, top, right, bottom) 为可用区域（逻辑 px，右/下为 x+width 语义）。
 
-    返回 (nx, ny, nvx, nvy, on_ground)：位置、速度、是否贴地。
+    返回 (nx, ny, nvx, nvy, on_ground, impact)：
+    impact 为本步落地瞬间的向下冲击速度（px/s，未落地为 0）——供落地 Q 弹
+    判定使用，与「静止判定」解耦（重砸也能弹、轻落才直接停）。
     params 为 DEFAULT_PHYSICS 风格 dict；dt 超 DT_MAX 自动截断。"""
     p = dict(DEFAULT_PHYSICS)
     if params:
@@ -174,8 +180,10 @@ def step_physics(x, y, vx, vy, w, h, rect, dt, params=None):
         else:
             vy = max(0.0, vy)
     # 落地
+    impact = 0.0
     if ny + h > bottom:
         ny = bottom - h
+        impact = max(0.0, vy)  # 落地冲击 = 反弹前的向下速度
         if abs(vy) < STATIC_VY:
             vy = 0.0
         else:
@@ -188,7 +196,7 @@ def step_physics(x, y, vx, vy, w, h, rect, dt, params=None):
     if on_ground and abs(vx) < STATIC_VX and abs(vy) < STATIC_VY:
         vx = 0.0
         vy = 0.0
-    return nx, ny, vx, vy, on_ground
+    return nx, ny, vx, vy, on_ground, impact
 
 
 def landing_squash(impact_speed):

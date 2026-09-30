@@ -92,6 +92,8 @@ class WanderController:
         pet = self.pet
         if pet.busy:
             return  # 喂食/吃帧期间暂停行走，避免「边吃边漂」（M3）
+        if getattr(pet, "_flying", False):
+            return  # P1-手感：甩抛飞行中暂停行走，落地静止后恢复
         if not pet.has_frames and pet._using_front and pet.anim_mode not in ("state", "sleep"):
             pet.item.setPixmap(pet.sprites[pet.form]["side"])
             pet._using_front = False

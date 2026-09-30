@@ -10,6 +10,35 @@ import base64
 import ctypes
 import json
 import os
+
+import pet_log  # P1-手感：物理参数非法时记日志（pet_log 无任何依赖，安全）
+import pet_physics  # P1-手感：默认值单一来源（pet_physics 无 Qt 依赖，无环）
+
+# 上界与设置对话框同口径（pet_dialogs.PhysicsDialog 的 spinbox 范围）
+_PHYS_MAX = {"gravity": 10000.0, "restitution": 1.0,
+             "groundFriction": 50.0, "throwPower": 10.0}
+
+
+def normalize_physics(ph):
+    """P1-手感：物理参数 dict 归一化（load_config 与 apply_physics 共用）。
+
+    默认值取 pet_physics.DEFAULT_PHYSICS（单一来源）；负数/非数字回退默认、
+    上界钳制，非法键收集进返回 dict 的 "_fixed" 列表（调用方记日志后剥除）。"""
+    pd = dict(pet_physics.DEFAULT_PHYSICS)
+    bad = []
+    for k in ("gravity", "restitution", "groundFriction", "throwPower"):
+        try:
+            v = float(ph.get(k, pd[k]))
+            if v < 0:
+                raise ValueError
+            pd[k] = min(v, _PHYS_MAX[k])
+        except (TypeError, ValueError):
+            bad.append(k)
+    pd["enabled"] = _to_bool(ph.get("enabled", False))
+    pd["ceilingBounce"] = _to_bool(ph.get("ceilingBounce", True))
+    if bad:
+        pd["_fixed"] = bad
+    return pd
 from ctypes import wintypes
 
 from PySide6.QtGui import QColor
@@ -135,6 +164,16 @@ def normalize_cfg(cfg, defaults, persona_ids):
         cfg["role_frame_max"] = max(2, min(60, int(cfg.get("role_frame_max", 24) or 24)))
     except (TypeError, ValueError):
         cfg["role_frame_max"] = 24
+    # P1-手感：物理参数归一化（默认值单一来源 pet_physics.DEFAULT_PHYSICS；
+    # 负数/非数字回退默认并记日志、上界按设置对话框同口径钳制，不崩）
+    _phys = cfg.get("physics")
+    if not isinstance(_phys, dict):
+        _phys = {}
+    _pd = normalize_physics(_phys)
+    if _pd.get("_fixed"):
+        pet_log.log_error("load_config: 物理参数非法已回退默认: %s" % ",".join(_pd["_fixed"]))
+        _pd.pop("_fixed")
+    cfg["physics"] = _pd
     cfg["sound_group"] = "custom" if cfg.get("sound_group") == "custom" else "default"
     try:
         bs = cfg.get("bubble_style")

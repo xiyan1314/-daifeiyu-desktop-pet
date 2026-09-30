@@ -562,6 +562,44 @@ def main_flow():
     except Exception as e:
         check("click through composite", False, repr(e))
 
+    # ---- P1-手感：甩抛物理开关与飞行（合成轨迹直测，无真实拖拽） ----
+    try:
+        # 关闭状态守卫：默认关闭时合成快速甩动不得起飞（贴边行为等价）
+        pet._set_physics(False)
+        _now = time.monotonic()
+        _t0 = _now - 0.3
+        pet._drag_samples = [(_t0 + i * 0.015, 100 + i * 10.0, 400) for i in range(21)]
+        check("physics off no throw", not pet._maybe_throw() and not pet._flying)
+        # 开启状态：近地放置（摩擦滑停 ~1s，规避 0.78 弹跳链 8s+ 的完全衰减）+ 手动步进
+        pet._set_physics(True)
+        check("physics toggle on", bool((pet.cfg.get("physics") or {}).get("enabled")))
+        _scr = pet._screen_geo(pet.frameGeometry().center())
+        if _scr is not None:
+            pet.move(_scr.left() + 50, _scr.bottom() - pet.height())
+        _now = time.monotonic()
+        _t0 = _now - 0.3
+        pet._drag_samples = [(_t0 + i * 0.015, pet.x() + i * 10.0, pet.y()) for i in range(21)]
+        _started = pet._maybe_throw()
+        check("physics throw starts", _started and pet._flying)
+        if pet._flying:
+            pet._flight_timer.stop()  # 手动步进期间停掉定时器，避免双驱动
+            _t_end = time.monotonic() + 15.0
+            while pet._flying and time.monotonic() < _t_end:
+                pet._flight_tick()
+                time.sleep(0.016)
+            if pet._flying:
+                pet._end_flight()  # 超时兜底：复位，防残留飞行定时器干扰后续检查
+        check("physics flight lands", not pet._flying)
+        pet._set_physics(False)
+        check("physics toggle off", not bool((pet.cfg.get("physics") or {}).get("enabled")))
+    except Exception as e:
+        check("physics flow", False, repr(e))
+        try:
+            pet._set_physics(False)
+            pet._end_flight()
+        except Exception:
+            pass  # 有意忽略：复位失败不影响后续检查
+
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
     make_test_wav(wav)

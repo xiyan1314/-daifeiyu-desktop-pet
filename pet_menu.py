@@ -50,6 +50,11 @@ class MenuBuilder:
         pet._ai_act.setCheckable(True)
         pet._ai_act.setChecked(pet.cfg.get("ai_enabled", False))
         pet._ai_act.toggled.connect(pet.ai.set_ai_enabled)
+        # P1-手感：甩抛物理开关（默认关闭；开启后拖动变弹簧跟手、松手可甩飞）
+        phys_act = menu.addAction("🌀 甩抛物理")
+        phys_act.setCheckable(True)
+        phys_act.setChecked(bool((pet.cfg.get("physics") or {}).get("enabled")))
+        phys_act.toggled.connect(pet._set_physics)
         menu.addSeparator()
 
         talk_act = menu.addAction("💭 和它说话")
@@ -131,6 +136,9 @@ class MenuBuilder:
         ct_act.toggled.connect(pet._set_click_through)
         # P3-5+：帧数上限用户可调（导入与加载共用）
         fm_act = set_menu.addAction("🎞️ 帧数上限…")
+        # P1-手感：物理参数设置（重力/反弹/摩擦/顶边/力度）
+        phys_param_act = set_menu.addAction("🌀 物理参数…")
+        phys_param_act.triggered.connect(lambda: pet_dialogs.open_physics(pet))
         fm_act.triggered.connect(lambda: pet_dialogs.set_frame_max(pet, self._save_cfg))
         snd_set = set_menu.addMenu("🎵 音效设置")
         grp_group = QActionGroup(menu)

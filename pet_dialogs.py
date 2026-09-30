@@ -2854,6 +2854,67 @@ def open_ai_settings(pet):
         pet_log.log_error("ai settings dialog failed: %r" % (e,))
 
 
+class PhysicsDialog(QDialog):
+    """P1-手感：甩抛物理参数设置（重力/反弹/地面摩擦/顶边反弹/力度增益）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(_qt_parent(parent))
+        self._pet = parent
+        self.setWindowTitle("物理参数")
+        self.setStyleSheet(DIALOG_QSS)
+        self.resize(430, 330)
+        cfg = (_get(parent, "cfg") or {}).get("physics") or {}
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("甩抛手感参数（重力 0 = 漂浮模式；非法值自动回退默认）"))
+        self._spin = {}
+        for label, key, lo, hi in (
+                ("重力 gravity（px/s²）", "gravity", 0.0, 10000.0),
+                ("反弹 restitution（0~1）", "restitution", 0.0, 1.0),
+                ("地面摩擦 groundFriction", "groundFriction", 0.0, 50.0),
+                ("力度增益 throwPower", "throwPower", 0.1, 10.0)):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            sp = QDoubleSpinBox()
+            sp.setRange(lo, hi)
+            sp.setDecimals(2)
+            sp.setValue(float(cfg.get(key, 1.0)))
+            row.addWidget(sp)
+            row.addStretch(1)
+            root.addLayout(row)
+            self._spin[key] = sp
+        self._ceil = QCheckBox("顶边也反弹（ceilingBounce）")
+        self._ceil.setChecked(bool(cfg.get("ceilingBounce", True)))
+        root.addWidget(self._ceil)
+        btns = QHBoxLayout()
+        ok = QPushButton("保存")
+        cancel = QPushButton("取消")
+        ok.setDefault(True)
+        ok.clicked.connect(self._save)
+        cancel.clicked.connect(self.reject)
+        btns.addStretch(1)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        root.addLayout(btns)
+
+    def _save(self):
+        data = {"gravity": self._spin["gravity"].value(),
+                "restitution": self._spin["restitution"].value(),
+                "groundFriction": self._spin["groundFriction"].value(),
+                "throwPower": self._spin["throwPower"].value(),
+                "ceilingBounce": self._ceil.isChecked()}
+        _call(self._pet, "apply_physics", data)
+        self.accept()
+
+
+def open_physics(pet):
+    """P1-手感：物理参数对话框入口（置顶+显式焦点，同其它对话框套路）。"""
+    try:
+        dlg = PhysicsDialog(pet)
+        modal(dlg)
+    except Exception as e:
+        pet_log.log_error("physics dialog failed: %r" % (e,))
+
+
 def ask_amount(pet, title, label, cur):
     """数值输入对话框（预算 / 余额预警共用）：置顶 + 显式焦点，规避前台锁。"""
     dlg = QInputDialog(pet)

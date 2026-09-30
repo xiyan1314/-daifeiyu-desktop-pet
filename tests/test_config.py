@@ -230,6 +230,53 @@ def test_pet_resources_frame_max_default():
     assert pet_resources.FRAME_MAX == 24  # 默认值；桌宠启动时按 cfg 同步
 
 
+# ---------------- P1-手感：物理参数归一化 ----------------
+
+def test_physics_default_off():
+    assert main.DEFAULT_CONFIG["physics"]["enabled"] is False  # 默认关闭=行为不变
+
+
+def test_physics_invalid_values_fall_back(cfg_path):
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 2,
+                   "physics": {"enabled": True, "gravity": -5, "restitution": "abc",
+                               "throwPower": 2.5}}, f, ensure_ascii=False)
+    cfg = main.load_config()
+    ph = cfg["physics"]
+    assert ph["enabled"] is True
+    assert ph["gravity"] == 1400.0   # 负数回退默认
+    assert ph["restitution"] == 0.78  # 非数字回退默认
+    assert ph["throwPower"] == 2.5    # 合法值保留
+    # 软修正不弹「坏值」提示（physics 在 _SOFT_FIX_KEYS）
+    assert not any("physics" in x for x in main.CONFIG_FIXES)
+
+
+def test_physics_valid_values_kept(cfg_path):
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 2,
+                   "physics": {"enabled": True, "gravity": 0, "ceilingBounce": False}},
+                  f, ensure_ascii=False)
+    ph = main.load_config()["physics"]
+    assert ph["gravity"] == 0        # 漂浮模式
+    assert ph["ceilingBounce"] is False
+
+
+def test_physics_upper_bounds_clamped(cfg_path):
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 2,
+                   "physics": {"restitution": 5.0, "gravity": 99999, "throwPower": 100}},
+                  f, ensure_ascii=False)
+    ph = main.load_config()["physics"]
+    assert ph["restitution"] == 1.0   # 上界钳制（防反弹能量发散）
+    assert ph["gravity"] == 10000.0
+    assert ph["throwPower"] == 10.0
+
+
+def test_physics_defaults_single_source():
+    import pet_physics
+    assert main.DEFAULT_CONFIG["physics"] == pet_physics.DEFAULT_PHYSICS  # 默认值单一来源锁定
+
+
 def test_frame_max_read_and_import_side(tmp_path, monkeypatch):
     """FRAME_MAX 读侧截断与导入侧拒绝口径一致（monkeypatch 由 pytest 自动还原）。"""
     import pet_resources

@@ -77,7 +77,7 @@ def test_grounded_slide_no_micro_bounce():
     # 贴地滑行连续多步：vy 恒为 0（无周期性微弹跳），vx 持续摩擦衰减
     x, y, vx, vy = 0.0, 990.0, 100.0, 0.0
     for _ in range(10):
-        x, y, vx, vy, og = ph.step_physics(x, y, vx, vy, 10, 10, (0, 0, 1000, 1000), 0.05)
+        x, y, vx, vy, og, _imp = ph.step_physics(x, y, vx, vy, 10, 10, (0, 0, 1000, 1000), 0.05)
         assert vy == 0.0
         assert og is True
     assert abs(vx) < 100  # 摩擦衰减后明显减速
@@ -93,7 +93,7 @@ def test_estimate_merge_dt_no_peak_inflation():
 # ---------------- 积分：重力/反弹/摩擦 ----------------
 
 def test_free_fall():
-    nx, ny, vx, vy, og = ph.step_physics(0, 0, 0, 0, 10, 10, (0, 0, 1000, 1000), 0.05)
+    nx, ny, vx, vy, og, _imp = ph.step_physics(0, 0, 0, 0, 10, 10, (0, 0, 1000, 1000), 0.05)
     assert nx == 0 and ny > 0
     assert vy == pytest.approx(1400 * 0.05)
     assert og is False
@@ -101,23 +101,24 @@ def test_free_fall():
 
 def test_ground_bounce_restitution():
     # 屏幕坐标：vy 为正 = 下落；以 +800 砸地（含一步重力 70）→ 反向 ×0.78
-    nx, ny, vx, vy, og = ph.step_physics(0, 950, 0, 800, 10, 10, (0, 0, 1000, 1000), 0.05)
+    nx, ny, vx, vy, og, _imp = ph.step_physics(0, 950, 0, 800, 10, 10, (0, 0, 1000, 1000), 0.05)
     assert og is True
     assert vy == pytest.approx(-(800 + 70) * 0.78)
+    assert _imp == pytest.approx(870)  # 落地冲击 = 反弹前向下速度（供 Q 弹判定）
 
 
 def test_wall_bounce():
-    nx, ny, vx, vy, og = ph.step_physics(995, 0, 300, 0, 10, 10, (0, 0, 1000, 1000), 0.05)
+    nx, ny, vx, vy, og, _imp = ph.step_physics(995, 0, 300, 0, 10, 10, (0, 0, 1000, 1000), 0.05)
     assert nx <= 990
     assert vx == pytest.approx(-300 * 0.78)
 
 
 def test_ground_friction_and_static():
-    nx, ny, vx, vy, og = ph.step_physics(0, 990, 30, 0, 10, 10, (0, 0, 1000, 1000), 0.05)
+    nx, ny, vx, vy, og, _imp = ph.step_physics(0, 990, 30, 0, 10, 10, (0, 0, 1000, 1000), 0.05)
     assert og is True
     assert abs(vx) < 30  # 摩擦衰减
     # 静止：贴地小速度 → 双零
-    nx2, ny2, vx2, vy2, og2 = ph.step_physics(0, 990, 5, 5, 10, 10, (0, 0, 1000, 1000), 0.05)
+    nx2, ny2, vx2, vy2, og2, _imp2 = ph.step_physics(0, 990, 5, 5, 10, 10, (0, 0, 1000, 1000), 0.05)
     assert og2 is True and vx2 == 0.0 and vy2 == 0.0
 
 
@@ -130,7 +131,7 @@ def test_dt_clamp():
 def test_zero_gravity_float_mode():
     p = dict(ph.DEFAULT_PHYSICS)
     p["gravity"] = 0
-    nx, ny, vx, vy, og = ph.step_physics(0, 0, 0, 100, 10, 10, (0, 0, 1000, 1000), 0.05, p)
+    nx, ny, vx, vy, og, _imp = ph.step_physics(0, 0, 0, 100, 10, 10, (0, 0, 1000, 1000), 0.05, p)
     assert vy == 100  # 无重力：速度不变
     assert ny == pytest.approx(100 * 0.05)
 
