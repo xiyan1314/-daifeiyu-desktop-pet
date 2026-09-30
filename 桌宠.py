@@ -62,7 +62,7 @@ import pet_alarm
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "2.0.5"
+VERSION = "2.0.6"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -2667,14 +2667,15 @@ class PetWindow(QWidget):
         self.bubble.update()
 
     def save_lines(self, pool, lines):
-        """保存自定义台词：pool ∈ sajiao/greedy/happy/idle。"""
+        """保存自定义台词：pool ∈ sajiao/greedy/happy/idle。
+
+        v2.0.6：解除数量与长度限制（不再截断），想写多少写多少。"""
         pool = pool if pool in ("sajiao", "greedy", "happy", "idle") else "idle"
         clean = []
         for x in (lines or []):
             s = str(x).strip()
             if s:
-                clean.append(s[:60])
-        clean = clean[:20]
+                clean.append(s)
         le = dict(self.cfg.get("lines_extra") or {})
         le[pool] = clean
         self.cfg["lines_extra"] = le

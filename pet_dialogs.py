@@ -29,7 +29,7 @@
 - class BubbleStyleDialog(QDialog)：背景 / 文字 / 描边三色 + 字号 8~18 +
   圆角 0~30 + 实时预览，保存回调 pet.apply_bubble_style。
 - class LinesDialog(QDialog)：撒娇 / 贪吃 / 开心 / 闲逛 四页台词编辑
-  （每行一条，最多 20 行、每行最长 60 字），保存回调 pet.save_lines。
+  （每行一条，数量与长度无限制），保存回调 pet.save_lines。
 
 与主程序的耦合方式（全部防御性 getattr，缺省不崩）：
 - pet.cfg（配置 dict）、pet.role_lib、pet.audio_lib、pet.book（可能 None）
@@ -3535,10 +3535,9 @@ class BubbleStyleDialog(QDialog):
 
 # ---------------- f) 台词设置对话框 ----------------
 class LinesDialog(QDialog):
-    """台词设置：撒娇 / 贪吃 / 开心 / 闲逛 四页，每行一条台词。"""
+    """台词设置：撒娇 / 贪吃 / 开心 / 闲逛 四页，每行一条台词。
 
-    MAX_LINES = 20
-    MAX_CHARS = 60
+    v2.0.6：台词数量与长度无限制（不截断），想写多少写多少；留空 = 使用内置台词。"""
 
     def __init__(self, parent=None):
         super().__init__(_qt_parent(parent))
@@ -3548,8 +3547,7 @@ class LinesDialog(QDialog):
         self.resize(540, 440)
 
         root = QVBoxLayout(self)
-        root.addWidget(QLabel("每行一条台词；最多 %d 行、每行最多 %d 字。留空 = 使用内置台词。"
-                              % (self.MAX_LINES, self.MAX_CHARS)))
+        root.addWidget(QLabel("每行一条台词，数量与长度不限。留空 = 使用内置台词。"))
         self._tabs = QTabWidget()
         self._edits = {}
         for label, pool in _LINE_POOLS:
@@ -3599,20 +3597,7 @@ class LinesDialog(QDialog):
 
     # ---------- 动作 ----------
     def _save(self):
-        for label, pool in _LINE_POOLS:
-            ed = self._edits[pool]
-            lines = self._parse(ed)
-            if len(lines) > self.MAX_LINES:
-                _warn(self, "保存失败", "「%s」最多 %d 行（当前 %d 行）"
-                      % (label, self.MAX_LINES, len(lines)))
-                self._tabs.setCurrentWidget(ed)
-                return
-            for ln in lines:
-                if len(ln) > self.MAX_CHARS:
-                    _warn(self, "保存失败", "「%s」有台词超过 %d 字：%s…"
-                          % (label, self.MAX_CHARS, ln[:12]))
-                    self._tabs.setCurrentWidget(ed)
-                    return
+        # v2.0.6：数量/长度无限制，直接保存（空行由 _parse 剔除，留空 = 使用内置）
         for _label, pool in _LINE_POOLS:
             _call(self._pet, "save_lines", pool, self._parse(self._edits[pool]))
         self.accept()
