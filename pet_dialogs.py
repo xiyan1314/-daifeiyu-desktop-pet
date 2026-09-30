@@ -63,7 +63,7 @@ import time
 
 import pet_log
 
-from PySide6.QtCore import QEventLoop, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QEventLoop, QTime, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -91,6 +91,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -99,6 +100,7 @@ import pet_audio
 import pet_resources  # P3-5+：FRAME_MAX（帧上限用户可调）
 import pet_behaviors  # v2.0.2：行为动作白名单/序列校验（BehaviorDialog 共用口径）
 import pet_chat  # v2.0.4：服务商预设/错误归类/连通性测试（pet_chat 无 Qt 依赖，无环）
+import pet_alarm  # v2.0.5：闹钟服务（AlarmDialog 共用时间校验/铃声导入口径）
 
 # ---------------- 主题 ----------------
 DIALOG_QSS = """
@@ -2371,6 +2373,178 @@ class BehaviorDialog(QDialog):
         _ok, _err = self.svc.export_file(_bid, _path)
         if not _ok:
             _warn(self, "行为编辑", _err)
+
+
+# ---------------- v2.0.5：闹钟 ----------------
+class AlarmDialog(QDialog):
+    """闹钟设置：列表 + 新建/编辑/删除 + 自定义铃声（wav/mp3）+ 启用开关 + 试听。"""
+
+    DEFAULT_TIME = QTime(7, 30)  # 新建闹钟默认时间（唯一来源）
+
+    def __init__(self, pet, svc=None):
+        super().__init__(pet)
+        self.pet = pet
+        self.svc = svc or getattr(pet, "alarms", None)
+        self._editing_id = None
+        self._pending_ringtone = ""  # 本次导入的新铃声文件名（保存时写入）
+        self._ring_dirty = False
+        self.setWindowTitle("闹钟")
+        self.setStyleSheet(DIALOG_QSS)
+        self.resize(540, 470)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("闹钟列表（到点气泡提醒 + 铃声 + 语音播报；"
+                             "今天已过的时刻会立即响一次）"))
+        self._list = QListWidget()
+        self._list.currentRowChanged.connect(self._on_sel)
+        lay.addWidget(self._list, 2)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("时间"))
+        self._time = QTimeEdit()
+        self._time.setDisplayFormat("HH:mm")
+        row1.addWidget(self._time)
+        row1.addWidget(QLabel("文案"))
+        self._label = QLineEdit()
+        self._label.setPlaceholderText("到点气泡与语音文案（默认「闹钟」）")
+        row1.addWidget(self._label, 1)
+        lay.addLayout(row1)
+        row2 = QHBoxLayout()
+        self._ring_btn = QPushButton("选铃声…（wav/mp3）")
+        self._ring_btn.clicked.connect(self._pick_ringtone)
+        self._ring_clear = QPushButton("清除铃声")
+        self._ring_clear.clicked.connect(self._clear_ring)
+        self._ring_test = QPushButton("试听")
+        self._ring_test.clicked.connect(self._test_ring)
+        row2.addWidget(self._ring_btn)
+        row2.addWidget(self._ring_clear)
+        row2.addWidget(self._ring_test)
+        self._ck_enabled = QCheckBox("启用")
+        self._ck_enabled.setChecked(True)
+        row2.addWidget(self._ck_enabled)
+        row2.addStretch(1)
+        lay.addLayout(row2)
+        self._ring_label = QLabel("（默认提示音）")
+        self._ring_label.setWordWrap(True)
+        lay.addWidget(self._ring_label)
+        btn_row = QHBoxLayout()
+        for _lbl, _cb in (("新建", self._new), ("保存", self._save),
+                          ("删除", self._delete), ("关闭", self.accept)):
+            _b = QPushButton(_lbl)
+            _b.clicked.connect(_cb)
+            btn_row.addWidget(_b)
+        lay.addLayout(btn_row)
+        self._time.setTime(self.DEFAULT_TIME)  # 打开即显示默认 07:30（点「新建」同款）
+        self._refresh()
+
+    # ---------- 列表 ----------
+    def _refresh(self):
+        self._list.clear()
+        if self.svc is None:
+            return
+        for a in self.svc.list():
+            _mark = "🔔" if a.get("ringtone") else "🔕"
+            _state = "已启用" if a.get("enabled") else "已停用"
+            _it = QListWidgetItem("%s  %s　%s　%s" % (a["time"], _mark, a["label"], _state))
+            _it.setData(Qt.ItemDataRole.UserRole, a["id"])
+            self._list.addItem(_it)
+
+    def _on_sel(self, row):
+        if row < 0 or self.svc is None:
+            return
+        _a = self.svc.get(self._list.item(row).data(Qt.ItemDataRole.UserRole))
+        if _a is None:
+            return
+        self._editing_id = _a["id"]
+        _t = QTime.fromString(_a["time"], "HH:mm")
+        self._time.setTime(_t if _t.isValid() else self.DEFAULT_TIME)
+        self._label.setText(_a.get("label") or "")
+        self._ck_enabled.setChecked(bool(_a.get("enabled")))
+        self._pending_ringtone = _a.get("ringtone") or ""
+        self._ring_dirty = False
+        self._ring_label.setText("铃声：" + self._pending_ringtone if self._pending_ringtone
+                                 else "（默认提示音）")
+
+    def _new(self):
+        self._editing_id = None
+        self._time.setTime(self.DEFAULT_TIME)
+        self._label.clear()
+        self._ck_enabled.setChecked(True)
+        self._pending_ringtone = ""
+        self._ring_dirty = True  # 新建：保存时把「默认提示音」作为初始值落盘（add 走 ringtone=""）
+        self._ring_label.setText("（默认提示音）")
+        self._list.setCurrentRow(-1)
+
+    # ---------- 铃声 ----------
+    def _pick_ringtone(self):
+        if self.svc is None:
+            return
+        _path, _f = QFileDialog.getOpenFileName(
+            self, "选铃声", "", "音频 (*%s)" % " *".join(pet_alarm.RINGTONE_EXTS))
+        if not _path:
+            return
+        _fn, _err = self.svc.import_ringtone(_path)
+        if _fn is None:
+            _warn(self, "闹钟", _err)
+            return
+        self._pending_ringtone = _fn
+        self._ring_dirty = True
+        self._ring_label.setText("铃声：" + _fn)
+
+    def _clear_ring(self):
+        self._pending_ringtone = ""
+        self._ring_dirty = True
+        self._ring_label.setText("（默认提示音）")
+
+    def _test_ring(self):
+        _fn = self._pending_ringtone
+        _path = self.svc.ringtone_path(_fn) if (self.svc and _fn) else None
+        if not _path:
+            _warn(self, "闹钟", "还没有铃声，先选一个（或直接保存用默认提示音）")
+            return
+        if _call(self.pet, "preview_audio", _path) is not True:
+            _warn(self, "闹钟", "播放失败：铃声文件可能已损坏")
+
+    # ---------- 保存/删除 ----------
+    def _save(self):
+        if self.svc is None:
+            return
+        _t = self._time.time().toString("HH:mm")
+        _label = self._label.text().strip() or "闹钟"
+        _enabled = self._ck_enabled.isChecked()
+        if self._editing_id:
+            _ok, _err = self.svc.update(self._editing_id, time_s=_t, label=_label,
+                                        enabled=_enabled,
+                                        ringtone=self._pending_ringtone if self._ring_dirty else None)
+            _saved_id = self._editing_id
+        else:
+            # v2.0.5 修复：新建也必须落「启用」勾选（此前恒启用，违背用户意图）
+            _a, _err = self.svc.add(_t, _label, self._pending_ringtone, enabled=_enabled)
+            _ok = _a is not None
+            _saved_id = _a["id"] if _ok else None
+        if not _ok:
+            _warn(self, "闹钟", _err or "保存失败")
+            return
+        self._refresh()
+        # 恢复选中到刚保存的闹钟（_on_sel 回填保存后的规范化值，表单状态干净）
+        for _i in range(self._list.count()):
+            if self._list.item(_i).data(Qt.ItemDataRole.UserRole) == _saved_id:
+                self._list.setCurrentRow(_i)
+                break
+
+    def _delete(self):
+        _row = self._list.currentRow()
+        if _row < 0 or self.svc is None:
+            return
+        _aid = self._list.item(_row).data(Qt.ItemDataRole.UserRole)
+        _a = self.svc.get(_aid)
+        _tlabel = ("「%s」%s" % (_a.get("label"), _a.get("time"))) if _a else "这个闹钟"
+        if not _confirm(self, "闹钟", "删除 %s 吗？" % _tlabel):
+            return
+        _ok, _err = self.svc.delete(_aid)
+        if not _ok:
+            _warn(self, "闹钟", _err)
+            return
+        self._new()
+        self._refresh()
 
 
 # ---------------- a) 角色面板 ----------------

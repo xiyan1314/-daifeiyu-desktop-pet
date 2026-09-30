@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 
 FAILS = []
 CHECKS = []
-EXPECT_CHECKS = 195  # v2.0.4：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
+EXPECT_CHECKS = 206  # v2.0.5：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
 
 
 def check(name, cond, extra=""):
@@ -965,6 +965,57 @@ def main_flow():
     except Exception as e:
         check("ai settings dialog smoke", False, repr(e))
 
+    # ---- v2.0.5：闹钟系统（到点提醒 + 自定义铃声 + 语音提醒） ----
+    import pet_alarm as _pa
+    check("alarm service created", pet.alarms is not None)
+    _alm, _aerr = pet.alarms.add("06:00", "早起")
+    check("alarm add+get", _alm is not None and not _aerr
+          and pet.alarms.get(_alm["id"])["time"] == "06:00", "err=%r" % (_aerr,))
+    check("alarm time validation",
+          _pa.valid_time("07:30") and _pa.valid_time("23:59")
+          and not _pa.valid_time("24:00") and not _pa.valid_time("7:5"))
+    check("alarm due pure",
+          len(_pa.due_alarms([{"id": "x", "time": "06:00", "enabled": True,
+                               "last_fired_date": ""}], "06:01", "2026-09-30")) == 1
+          and _pa.due_alarms([{"id": "x", "time": "06:00", "enabled": True,
+                               "last_fired_date": "2026-09-30"}], "06:01", "2026-09-30") == [])
+    # 当日去重：mark_fired 后同日不再响
+    pet.alarms.mark_fired(_alm["id"], _pa.today_str())
+    check("alarm fired dedup",
+          pet.alarms.get(_alm["id"])["last_fired_date"] == _pa.today_str()
+          and not _pa.due_alarms(pet.alarms.list(), "23:59", _pa.today_str()))
+    # 自定义铃声导入（wav）
+    _ring = os.path.join(_tmp, "ring.wav")
+    make_test_wav(_ring)
+    _rfn, _rerr = pet.alarms.import_ringtone(_ring)
+    check("alarm ringtone import", _rfn is not None and not _rerr
+          and pet.alarms.ringtone_path(_rfn) is not None, "err=%r" % (_rerr,))
+    # 分享包：manifest 携带闹钟设置（铃声文件不随包）
+    _malm, _ealm = pet_export.build_manifest(
+        {"id": "x1", "name": "x", "file": "a.png", "form": "single",
+         "frames": ["a.png"], "added": ""},
+        [], {}, [{"time": "06:00", "label": "早起", "enabled": True}])
+    check("bundle carries alarms", isinstance(_malm.get("alarms"), list)
+          and _malm["alarms"][0]["time"] == "06:00", "err=%r" % (_ealm,))
+    # 导入闹钟设置：id 换新、停用状态保留、铃声缺失明确警告
+    _awarns = pet._apply_imported_alarms(
+        [{"time": "07:00", "label": "导入闹钟", "enabled": False, "ringtone": "x.wav"}])
+    _aimp = [a for a in pet.alarms.list() if a["label"] == "导入闹钟"]
+    check("import applies alarms", len(_aimp) == 1 and _aimp[0]["enabled"] is False
+          and any("铃声不在包内" in w for w in _awarns), "warns=%r" % (_awarns,))
+    # 闹钟对话框冒烟
+    try:
+        _adlg = pet_dialogs.AlarmDialog(pet, pet.alarms)
+        _adlg.show()
+        app.processEvents()
+        _adlg.close()
+        check("alarm dialog smoke", True)
+    except Exception as e:
+        check("alarm dialog smoke", False, repr(e))
+    # 清理
+    for _aid2 in [a["id"] for a in pet.alarms.list()]:
+        pet.alarms.delete(_aid2)
+
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
     make_test_wav(wav)
@@ -1066,6 +1117,7 @@ def main_flow():
         check("menu ledger item", any("账本" in t for t in texts))
         check("menu resource item", any("资源管理" in t for t in texts))
         check("menu behavior entry", any("行为设置" in t for t in texts))
+        check("menu alarm entry", any("闹钟" in t for t in texts))
         check("menu transform hidden default", not any(t == "🐡 变身" for t in texts))
         check("menu bundle entries", any("导出角色包" in t for t in texts)
               and any("导入角色包" in t for t in texts))
@@ -1166,7 +1218,8 @@ def run_module_smokes():
     import subprocess
     py = sys.executable
     here = HERE
-    for mod in ("pet_anim", "pet_mood", "pet_fx", "pet_resources", "pet_book", "pet_audio"):
+    for mod in ("pet_anim", "pet_mood", "pet_fx", "pet_resources", "pet_book", "pet_audio",
+                "pet_alarm"):
         p = subprocess.run(
             [py, os.path.join(here, mod + ".py")],
             cwd=here, capture_output=True, timeout=120,

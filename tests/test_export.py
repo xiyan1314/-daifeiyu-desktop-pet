@@ -64,7 +64,7 @@ def test_build_manifest_excludes_secrets():
     assert "api_key" not in m["config"]  # 敏感键不在可分享配置里
     assert m["excluded"] == ["api_key"]  # 仅以键名记录被排除项（供导入侧提示）
     assert m["format"] == pet_export.BUNDLE_FORMAT
-    assert m["alarms"] is None  # 闹钟预留字段
+    assert m["alarms"] is None  # 不传 alarms → 不含闹钟设置（v2.0.5 起可选携带）
     assert m["config"]["voice"]["enabled"] is True  # 语音开关导出
     assert "city" not in m["config"]  # 白名单外键不导出
     assert m["behaviors"][0]["name"] == "hi"

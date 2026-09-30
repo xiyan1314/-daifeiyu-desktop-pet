@@ -150,6 +150,9 @@ class MenuBuilder:
         # v2.0.2：行为设置（待机行为/行为编辑/变身时长）
         beh_act = set_menu.addAction("🧩 行为设置…")
         beh_act.triggered.connect(lambda checked=False: pet._open_behavior_dialog())
+        # v2.0.5：闹钟（到点提醒 + 自定义铃声 + 语音提醒）
+        alarm_act = set_menu.addAction("⏰ 闹钟…")
+        alarm_act.triggered.connect(lambda checked=False: pet._open_alarm_dialog())
         fm_act.triggered.connect(lambda: pet_dialogs.set_frame_max(pet, self._save_cfg))
         snd_set = set_menu.addMenu("🎵 音效设置")
         grp_group = QActionGroup(menu)

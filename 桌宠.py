@@ -58,10 +58,11 @@ import pet_actions
 import pet_main
 import pet_behaviors
 import pet_export
+import pet_alarm
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "2.0.4"
+VERSION = "2.0.5"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -555,6 +556,8 @@ class PetWindow(QWidget):
                                             self._play_voice_clip, _log_error)
         # v2.0.2：行为自定义服务（待机行为/行为序列；执行调度在本类主线程）
         self.behaviors = pet_behaviors.BehaviorService(DATA_DIR)
+        # v2.0.5：闹钟服务（到点判定在主线程 QTimer 轮询）
+        self.alarms = pet_alarm.AlarmService(DATA_DIR)
         self.menu_builder = pet_menu.MenuBuilder(self, save_config, is_autostart_enabled)
 
         self.bubble = Bubble()
@@ -677,6 +680,12 @@ class PetWindow(QWidget):
         self.mood_timer.setInterval(1000)
         self.mood_timer.timeout.connect(self._mood_tick)
         self.mood_timer.start()
+
+        # v2.0.5：闹钟轮询（15s 一拍，秒级精度足够；到点判定纯函数）
+        self._alarm_timer = QTimer(self)
+        self._alarm_timer.setInterval(15000)
+        self._alarm_timer.timeout.connect(self._alarm_tick)
+        self._alarm_timer.start()
 
         # ---- 阶段3：音频（参考项目 WAV + 合成回退）----
         pet_audio.init(os.path.join(resource_dir("assets"), "sounds"))
@@ -1115,6 +1124,41 @@ class PetWindow(QWidget):
         except Exception as e:
             _log_error("behavior dialog: %r" % (e,))
 
+    # ---------- v2.0.5：闹钟系统 ----------
+    def _alarm_tick(self):
+        """闹钟轮询：到点 → 记已响 + 气泡 + 铃声（自定义优先，缺省系统音）+ 语音提醒。"""
+        try:
+            due = pet_alarm.due_alarms(self.alarms.list(), pet_alarm.now_hhmm(),
+                                       pet_alarm.today_str())
+        except Exception as e:
+            _log_error("alarm tick: %r" % (e,))  # 有意忽略：判定失败本轮跳过，下拍重试
+            return
+        for _a, _t in due:
+            # per-alarm 兜底：单条闹钟的任何异常不得延后剩余闹钟
+            try:
+                self.alarms.mark_fired(_a["id"], pet_alarm.today_str())
+                _label = _a.get("label") or "闹钟"
+                self.show_bubble("⏰ %s 到点啦！" % _label)
+                _rt = self.alarms.ringtone_path(_a.get("ringtone") or "")
+                # 铃声与默认音统一受「音效」开关控制（关闭=只气泡+语音，不响铃）
+                if _rt and self.cfg.get("sound", True):
+                    if self.preview_audio(_rt) is not True:
+                        _log_error("alarm ringtone play failed: %s" % _a.get("ringtone"))
+                elif self.cfg.get("sound", True):
+                    play_sound("coin")  # 缺省提示音
+                # 语音提醒：语音系统开启且合成方式非 off 时朗读标签（speak 内部自检）
+                self.voice.speak("⏰ %s，时间到了" % _label,
+                                 on_error=signals.voice_error.emit)
+            except Exception as e:
+                _log_error("alarm fire: %r" % (e,))  # 有意忽略：单条失败不拖累后续闹钟
+
+    def _open_alarm_dialog(self):
+        """v2.0.5：闹钟设置对话框（菜单入口）。"""
+        try:
+            pet_dialogs.AlarmDialog(self, self.alarms).exec()
+        except Exception as e:
+            _log_error("alarm dialog: %r" % (e,))  # 有意忽略：对话框失败只记日志不崩主程序
+
     # ---------- v2.0.3：角色导出/导入（分享包） ----------
     def _export_role(self):
         """导出当前自定义角色（素材+行为+可分享配置）为 .dfypet.zip。"""
@@ -1126,7 +1170,8 @@ class PetWindow(QWidget):
             "角色包 (*.dfypet.zip)")
         if not _path:
             return
-        _ok, _err = pet_export.export_bundle(self.role_lib, self.behaviors, self.cfg, _path)
+        _ok, _err = pet_export.export_bundle(self.role_lib, self.behaviors, self.cfg, _path,
+                                                alarms_getter=self.alarms.list)
         if _ok:
             self.show_bubble("角色包已导出，可以分享给朋友啦~")
         else:
@@ -1137,7 +1182,8 @@ class PetWindow(QWidget):
         _path, _f = QFileDialog.getOpenFileName(self, "导入角色包", "", "角色包 (*.dfypet.zip)")
         if not _path:
             return
-        _res, _err = pet_export.import_bundle(self.role_lib, self.behaviors, self.cfg, _path)
+        _res, _err = pet_export.import_bundle(self.role_lib, self.behaviors, self.cfg, _path,
+                                                alarms_apply=self._apply_imported_alarms)
         if _res is None:
             self.show_bubble("导入失败：%s" % _err)
             return
@@ -1152,6 +1198,35 @@ class PetWindow(QWidget):
         if _res["warnings"]:
             _msg += "（%s）" % "；".join(_res["warnings"][:2])
         self.show_bubble(_msg)
+
+    def _apply_imported_alarms(self, alarms_list):
+        """v2.0.5：导入包内闹钟设置（id 换新；铃声文件不随包 → 明确提示换默认音；
+        预留字段 repeat/snooze_min 一并透传）。"""
+        warnings = []
+        for a in (alarms_list or []):
+            try:
+                if not isinstance(a, dict):
+                    warnings.append("跳过非法闹钟条目")
+                    continue
+                _t = str(a.get("time") or "")
+                if not pet_alarm.valid_time(_t):
+                    warnings.append("闹钟「%s」时间非法，已跳过" % (_t or "?"))
+                    continue
+                _na, _err = self.alarms.add(
+                    _t, str(a.get("label") or "闹钟"),
+                    enabled=a.get("enabled") is not False,
+                    repeat=str(a.get("repeat") or ""),
+                    snooze_min=a.get("snooze_min")
+                    if isinstance(a.get("snooze_min"), int) else 0)
+                if _na is None:
+                    warnings.append("闹钟「%s」未导入：%s" % (_t, _err))
+                    continue
+                if a.get("ringtone"):
+                    warnings.append("闹钟「%s」的铃声不在包内，已用默认提示音" % _t)
+            except Exception as e:
+                # 有意忽略：单条坏数据不中断整个导入（转警告）
+                warnings.append("闹钟导入异常，已跳过：%s" % e)
+        return warnings
 
     def _compute_base_size(self):
         """P1-7：窗口基准尺寸。旧角色 = 各形态侧图最大尺寸（现行为）；
@@ -2710,7 +2785,8 @@ class PetWindow(QWidget):
             for t in (self.idle_timer, self.walk_timer, self.cpu_timer, self.mood_timer,
                       self._state_timer, self._drag_timer, self._digest_timer,
                       self._fly_timer, self._save_scale_timer, self._food_shown_timer,
-                      self._hold_timer, self._pet_max, self._flight_timer):  # P1-手感
+                      self._hold_timer, self._pet_max, self._flight_timer,  # P1-手感
+                      self._alarm_timer):  # v2.0.5：闹钟轮询
                 if t is not None:
                     t.stop()
             # 缩放防抖未到期就退出：立即落盘，避免最后一次调大小丢失

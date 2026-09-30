@@ -1,0 +1,164 @@
+# -*- coding: utf-8 -*-
+"""v2.0.5 闹钟系统回归：时间校验/到点判定/CRUD/持久化容错/铃声导入/预留字段透传。
+
+纯逻辑，无需 Qt。
+"""
+import json
+
+import pet_alarm
+
+
+def test_valid_and_normalize_time():
+    assert pet_alarm.valid_time("00:00") and pet_alarm.valid_time("23:59")
+    assert pet_alarm.valid_time("07:30")
+    for bad in ("24:00", "12:60", "7:5", "abc", "", None, "12:3x"):
+        assert not pet_alarm.valid_time(bad), bad
+    assert pet_alarm.normalize_time("07:05") == "07:05"
+    assert pet_alarm.normalize_time("7:5") == ""  # 严格 HH:MM
+
+
+def test_due_alarms_semantics():
+    base = {"id": "a1", "time": "08:00", "label": "x", "enabled": True,
+            "ringtone": "", "last_fired_date": ""}
+    # 未到点
+    assert pet_alarm.due_alarms([base], "07:59", "2026-09-30") == []
+    # 到点（now >= time）
+    due = pet_alarm.due_alarms([base], "08:00", "2026-09-30")
+    assert len(due) == 1 and due[0][1] == "08:00"
+    # 同日已触发 → 不再响
+    base2 = dict(base, last_fired_date="2026-09-30")
+    assert pet_alarm.due_alarms([base2], "09:00", "2026-09-30") == []
+    # 跨天重新待命
+    assert pet_alarm.due_alarms([base2], "09:00", "2026-10-01")
+    # disabled / 坏时间条目跳过
+    assert pet_alarm.due_alarms([dict(base, enabled=False)], "09:00", "2026-09-30") == []
+    assert pet_alarm.due_alarms([dict(base, time="bad")], "09:00", "2026-09-30") == []
+    assert pet_alarm.due_alarms(["junk"], "09:00", "2026-09-30") == []
+
+
+def test_crud_roundtrip(tmp_path):
+    svc = pet_alarm.AlarmService(str(tmp_path))
+    assert svc.list() == []
+    a, err = svc.add("07:30", "起床啦")
+    assert a is not None and not err, err
+    assert len(a["id"]) == 8 and svc.get(a["id"])["label"] == "起床啦"
+    # 标签截断
+    a2, _ = svc.add("08:00", "x" * 100)
+    assert svc.get(a2["id"])["label"] == "x" * pet_alarm.ALARM_LABEL_MAX
+    ok, err = svc.update(a["id"], time_s="09:15", label="改名", enabled=False)
+    assert ok and not err
+    assert svc.get(a["id"])["time"] == "09:15" and svc.get(a["id"])["enabled"] is False
+    ok, err = svc.update(a["id"], time_s="25:00")
+    assert not ok and "HH:MM" in err
+    ok, err = svc.update("nope", label="x")
+    assert not ok and "不存在" in err
+    # 持久化 roundtrip
+    svc2 = pet_alarm.AlarmService(str(tmp_path))
+    assert svc2.get(a["id"])["label"] == "改名"
+    ok, err = svc2.delete(a["id"])
+    assert ok and not err and svc2.get(a["id"]) is None
+    ok, err = svc2.delete(a["id"])
+    assert not ok and "不存在" in err
+
+
+def test_add_invalid_and_cap(tmp_path):
+    svc = pet_alarm.AlarmService(str(tmp_path))
+    a, err = svc.add("bad")
+    assert a is None and "HH:MM" in err
+    for i in range(pet_alarm.ALARMS_MAX):
+        svc.add("%02d:%02d" % (i // 60, i % 60))
+    a, err = svc.add("23:59")
+    assert a is None and "最多" in err
+
+
+def test_corrupted_index(tmp_path):
+    idx = tmp_path / "alarms.json"
+    idx.write_text("{{{ not json", encoding="utf-8")
+    svc = pet_alarm.AlarmService(str(tmp_path))
+    assert svc.list() == []
+    idx.write_text('{"alarms": [{"time": "bad"}]}', encoding="utf-8")
+    svc2 = pet_alarm.AlarmService(str(tmp_path))
+    assert svc2.list() == []  # 坏时间条目丢弃
+
+
+def test_mark_fired(tmp_path):
+    svc = pet_alarm.AlarmService(str(tmp_path))
+    a, _ = svc.add("07:00")
+    svc.mark_fired(a["id"], "2026-09-30")
+    assert svc.get(a["id"])["last_fired_date"] == "2026-09-30"
+    svc.mark_fired("nope", "2026-09-30")  # 不存在：静默无副作用
+    assert svc.get(a["id"])["last_fired_date"] == "2026-09-30"
+
+
+def test_toggle(tmp_path):
+    svc = pet_alarm.AlarmService(str(tmp_path))
+    a, _ = svc.add("07:00")
+    ok, err = svc.toggle(a["id"], False)
+    assert ok and not err and svc.get(a["id"])["enabled"] is False
+    ok, err = svc.toggle(a["id"], True)
+    assert ok and svc.get(a["id"])["enabled"] is True
+
+
+def test_ringtone_import(tmp_path):
+    svc = pet_alarm.AlarmService(str(tmp_path))
+    src = tmp_path / "tone.wav"
+    src.write_bytes(b"RIFF fake wav data")
+    fn, err = svc.import_ringtone(str(src))
+    assert fn is not None and not err, err
+    assert fn.endswith(".wav") and svc.ringtone_path(fn) is not None
+    assert svc.ringtone_path("") is None and svc.ringtone_path("nope.wav") is None
+    # 坏扩展/缺失文件
+    bad = tmp_path / "tone.txt"
+    bad.write_bytes(b"x")
+    fn2, err2 = svc.import_ringtone(str(bad))
+    assert fn2 is None and "wav/mp3" in err2
+    fn3, err3 = svc.import_ringtone(str(tmp_path / "gone.mp3"))
+    assert fn3 is None and "不存在" in err3
+    # update 的铃声字段校验
+    a, _ = svc.add("07:00", ringtone=fn)
+    ok, err = svc.update(a["id"], ringtone="x.txt")
+    assert not ok and "wav/mp3" in err
+
+
+def test_reserved_fields_passthrough(tmp_path):
+    """repeat/snooze_min 预留字段：导入数据透传不丢（未来版本回填逻辑）。"""
+    idx = tmp_path / "alarms.json"
+    idx.write_text(json.dumps({"alarms": [{"id": "12345678", "time": "08:00",
+                                           "label": "x", "enabled": True,
+                                           "ringtone": "", "last_fired_date": "",
+                                           "repeat": "daily", "snooze_min": 5}]},
+                              ensure_ascii=False), encoding="utf-8")
+    svc = pet_alarm.AlarmService(str(tmp_path))
+    a = svc.get("12345678")
+    assert a is not None
+    # 预留字段原样透传：repeat 字符串、snooze_min 非负 int（未来版本直接升级不丢数据）
+    assert a["repeat"] == "daily" and a["snooze_min"] == 5
+
+
+def test_due_multiple_and_midnight():
+    base = {"id": "a", "time": "08:00", "enabled": True, "last_fired_date": ""}
+    alarms = [dict(base, id="a1", time="08:00"), dict(base, id="a2", time="08:30"),
+              dict(base, id="a3", time="23:59")]
+    due = pet_alarm.due_alarms(alarms, "23:59", "2026-09-30")
+    assert sorted(a["id"] for a, _t in due) == ["a1", "a2", "a3"]  # 同拍到点全触发
+    # 跨午夜：次日 00:00 时 23:59 闹钟不得重响（"00:00" >= "23:59" 为假）
+    assert pet_alarm.due_alarms(alarms, "00:00", "2026-10-01") == []
+    # 00:00 闹钟在新的一天 00:00 触发
+    assert len(pet_alarm.due_alarms([dict(base, id="a0", time="00:00")],
+                                    "00:00", "2026-10-01")) == 1
+
+
+def test_norm_alarm_rejects_path_ringtone():
+    a, err = pet_alarm.AlarmService._norm_alarm(
+        {"id": "x", "time": "08:00", "ringtone": "..\..\evil.wav"})
+    assert a is not None and not err
+    assert a["ringtone"] == ""  # 路径注入清洗为默认提示音
+
+
+def test_ringtone_size_cap(tmp_path):
+    svc = pet_alarm.AlarmService(str(tmp_path))
+    src = tmp_path / "big.wav"
+    src.write_bytes(b"x" * 100)
+    svc.RINGTONE_MAX_BYTES = 10  # 收紧阈值验证上限先于读取
+    fn, err = svc.import_ringtone(str(src))
+    assert fn is None and "太大" in err

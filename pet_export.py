@@ -12,11 +12,11 @@ MIT License
 
 包结构：
   manifest.json  {"format":"dfypet-role","version":1,"role":{...},"behaviors":[...],
-                  "config":{...},"excluded":["api_key",...],"alarms":null}
+                  "config":{...},"excluded":["api_key",...],"alarms":[闹钟设置]}
   roles/<文件名>  角色引用的全部 png（manifest.role 内以文件名引用）
 
-闹钟（系统⑥，v2.0.5）尚未实现：manifest 预留 "alarms" 字段（null），
-导入侧对缺失/未知字段宽容处理，后续版本回填。
+闹钟设置（系统⑥）v2.0.5 已启用：manifest.alarms 携带闹钟列表
+（铃声文件不随包，导入侧换默认提示音并明确警告）；缺失/未知字段宽容处理。
 """
 
 import json
@@ -102,10 +102,11 @@ def _remap_role_files(role, name_map):
     return out
 
 
-def build_manifest(role, behaviors, cfg):
+def build_manifest(role, behaviors, cfg, alarms=None):
     """构造导出 manifest。返回 (manifest, err)；角色缺文件引用报错。
 
-    role=role_lib.get(rid)；behaviors=行为 dict 列表；cfg=当前配置 dict。
+    role=role_lib.get(rid)；behaviors=行为 dict 列表；cfg=当前配置 dict；
+    alarms=闹钟 dict 列表（v2.0.5 起启用；None=不含闹钟设置）。
     """
     if not isinstance(role, dict) or not role.get("id"):
         return None, "角色不存在或数据为空"
@@ -121,15 +122,17 @@ def build_manifest(role, behaviors, cfg):
         "config": config,
         # 记录本次实际被排除的敏感键（cfg 里存在的那些；白名单才是真防线）
         "excluded": [k for k in SENSITIVE_KEYS if k in cfg],
-        "alarms": None,  # 预留：闹钟系统（v2.0.5）上线后回填
+        # v2.0.5：闹钟设置（铃声文件不随包，导入侧明确提示换默认音）
+        "alarms": list(alarms) if isinstance(alarms, list) else None,
     }
     return manifest, ""
 
 
-def export_bundle(role_lib, behaviors_svc, cfg, out_path):
+def export_bundle(role_lib, behaviors_svc, cfg, out_path, alarms_getter=None):
     """导出角色包到 out_path（zip）。返回 (ok, err)。
 
     收集 role_lib 当前角色的全部素材文件进 roles/ 子目录；缺文件明确报错。
+    alarms_getter（可选）：返回闹钟 dict 列表，随包导出设置（不含铃声文件）。
     """
     rid = str((cfg or {}).get("role") or "")
     role = role_lib.get(rid) if rid else None
@@ -146,7 +149,8 @@ def export_bundle(role_lib, behaviors_svc, cfg, out_path):
                 return False, "角色素材缺失，无法导出：%s" % ref
             entries.append((ref, p))
         _behaviors = behaviors_svc.list() if behaviors_svc is not None else []
-        manifest, err = build_manifest(role, _behaviors, cfg or {})
+        _alarms = alarms_getter() if alarms_getter is not None else None
+        manifest, err = build_manifest(role, _behaviors, cfg or {}, _alarms)
         if manifest is None:
             return False, err
         tmp = out_path + ".tmp"
@@ -217,10 +221,12 @@ def validate_bundle(zip_path):
         return None, "打开失败：%s" % e
 
 
-def import_bundle(role_lib, behaviors_svc, cfg, zip_path):
+def import_bundle(role_lib, behaviors_svc, cfg, zip_path, alarms_apply=None):
     """导入角色包：解包素材（换新文件名防覆盖）、注册角色与行为（新 id）、
-    应用可分享配置。返回 (result|None, err)；任何缺资源/坏结构明确报错。
+    应用可分享配置与闹钟设置。返回 (result|None, err)；任何缺资源/坏结构明确报错。
 
+    alarms_apply（可选）：接收包内闹钟设置列表、返回警告列表的回调
+    （v2.0.5 起启用；未提供则按旧口径提示「尚未支持」）。
     result = {"role_id", "behavior_map": {旧id: 新id}, "warnings": [...]}
     """
     manifest, err = validate_bundle(zip_path)
@@ -283,8 +289,6 @@ def import_bundle(role_lib, behaviors_svc, cfg, zip_path):
             for k in EXPORT_CONFIG_KEYS:
                 if k in _cfg:
                     cfg[k] = _cfg[k]
-            if manifest.get("alarms") is not None:
-                warnings.append("包内含闹钟设置，当前版本尚未支持，已忽略")
             try:
                 _ver = int(manifest.get("version") or BUNDLE_VERSION)
             except (TypeError, ValueError):
@@ -309,6 +313,19 @@ def import_bundle(role_lib, behaviors_svc, cfg, zip_path):
                     except Exception:
                         pass  # 有意忽略：回滚清理尽力而为
                 return None, "保存角色失败：%s" % _serr
+            # 闹钟设置最后应用：角色入库成功才落地（导入事务性）；
+            # 应用回调异常转警告，不撤销已成功的角色导入
+            _alarms = manifest.get("alarms")
+            if _alarms is not None:
+                if not isinstance(_alarms, list):
+                    warnings.append("包内闹钟设置格式非法，已跳过")
+                elif alarms_apply is not None:
+                    try:
+                        warnings.extend(alarms_apply(list(_alarms)))
+                    except Exception as e:
+                        warnings.append("闹钟设置应用失败，已跳过：%s" % e)
+                else:
+                    warnings.append("包内含闹钟设置，当前版本尚未支持，已忽略")
             return {"role_id": role["id"], "behavior_map": behavior_map,
                     "warnings": warnings}, ""
     except Exception as e:
