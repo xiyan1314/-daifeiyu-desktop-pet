@@ -126,6 +126,7 @@ def load_frame_set(dir_path, prefix, count):
 
 
 if __name__ == "__main__":
+    # P0-2：以下 print 为命令行冒烟工具输出（python pet_anim.py 运行可见），保留不改为日志
     import sys
 
     # QPixmap 在 Qt6 下需要 QGuiApplication（只建 QCoreApplication 会崩溃）。

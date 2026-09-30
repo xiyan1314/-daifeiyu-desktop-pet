@@ -38,8 +38,8 @@
 
 实现要点：
 - 纯标准库（os/json/time/uuid/shutil/wave），不依赖 PySide6，无 GUI 可运行。
-- 全部文件 IO 走「写临时文件 + os.replace」原子替换；任何异常静默降级，
-  以错误字符串返回，绝不向调用方抛异常。
+- 全部文件 IO 走「写临时文件 + os.replace」原子替换；任何异常降级，
+  以错误字符串返回，绝不向调用方抛异常（索引损坏/读取失败记入 error.log）。
 - import_file 只校验扩展名与文件大小，不校验音频/图片内容（PNG 可加载性与
   透明通道由 pet_dialogs 用 QPixmap 把关）。
 - 槽位三态：None（默认，走内置音效）/ ""（静音）/ 片段 id（自定义音）。
@@ -57,7 +57,13 @@ import time
 import uuid
 import wave
 
-# ---------------- 通用 IO 助手（原子替换，静默降级） ----------------
+import pet_log
+
+# P3-5+：帧动画上限（读侧与导入管线共用；由 桌宠 启动时按 cfg["role_frame_max"] 同步，
+# 用户可在「设置… → 帧数上限…」里改，范围 2~60）
+FRAME_MAX = 24
+
+# ---------------- 通用 IO 助手（原子替换，降级不抛） ----------------
 def _read_json(path, factory=dict):
     """读 JSON；文件缺失 / 损坏 / 结构非法时返回 factory() 默认值，绝不抛出。"""
     try:
@@ -65,8 +71,10 @@ def _read_json(path, factory=dict):
             data = json.load(f)
         if isinstance(data, dict):
             return data
-    except Exception:
-        pass
+    except Exception as e:
+        # 首次运行无文件=正常（静默）；文件存在但读取失败=真实故障，记日志
+        if os.path.exists(path):
+            pet_log.log_error("pet_resources._read_json 读取失败（按默认值重建）: %r" % (e,))
     return factory()
 
 
@@ -86,7 +94,7 @@ def _write_json(path, data):
             if os.path.exists(tmp):
                 os.remove(tmp)
         except Exception:
-            pass
+            pass  # 有意忽略：临时文件清理尽力而为，失败不影响主流程
         return str(e)
 
 
@@ -131,7 +139,7 @@ def _wav_duration(path):
         if framerate and nframes > 0:
             return round(nframes / float(framerate), 2)
     except Exception:
-        pass
+        pass  # 有意忽略：时长探测失败按无时长处理（导入校验另有 _probe_wav_ok 把关）
     return None
 
 
@@ -167,8 +175,9 @@ class RoleLibrary:
             frames = r.get("frames")
             if not isinstance(frames, list):
                 frames = []
-            # P3-5：读侧上限与导入管线（≤24 帧）口径统一，避免「能存读不全」
-            frames = [str(x) for x in frames if str(x).lower().endswith(".png")][:24]
+            # P3-5+：读侧上限与导入管线口径统一（上限由用户配置 role_frame_max，
+            # 见模块级 FRAME_MAX，桌宠启动时同步），避免「能存读不全」
+            frames = [str(x) for x in frames if str(x).lower().endswith(".png")][:FRAME_MAX]
             # forms 归一化（v1.4 多形态）：新结构直接采用；旧 file/file_full 自动转换
             raw_forms = r.get("forms")
             if isinstance(raw_forms, list) and raw_forms:
@@ -241,7 +250,7 @@ class RoleLibrary:
                 if os.path.exists(p):
                     os.remove(p)
             except Exception:
-                pass
+                pass  # 有意忽略：半成品文件清理尽力而为（导入回滚用）
 
     # ---------- 对外 ----------
     def list_roles(self):
@@ -278,7 +287,7 @@ class RoleLibrary:
         try:
             return p if os.path.isfile(p) else None
         except Exception:
-            return None
+            return None  # 有意忽略：isfile 异常按文件不存在处理
 
     def path_for_full(self, role_id):
         """角色第二形态 png 绝对路径（存在才返回）；单形态返回 None。
@@ -293,7 +302,7 @@ class RoleLibrary:
             try:
                 return f if os.path.isfile(f) else None
             except Exception:
-                return None
+                return None  # 有意忽略：isfile 异常按文件不存在处理
         return None
 
     def form_metas(self, role_id):
@@ -375,7 +384,7 @@ class RoleLibrary:
                     if os.path.exists(dst):
                         os.remove(dst)  # 半截文件清理，不留孤儿
                 except Exception:
-                    pass
+                    pass  # 有意忽略：半截文件清理尽力而为，不留孤儿
                 return None, "复制文件失败"
             role = {
                 "id": rid,
@@ -391,7 +400,7 @@ class RoleLibrary:
                 try:
                     os.remove(dst)
                 except Exception:
-                    pass
+                    pass  # 有意忽略：回滚清理尽力而为
                 self._data["roles"].pop()
                 return None, err
             return role, None
@@ -402,7 +411,7 @@ class RoleLibrary:
         """导入已自动处理的角色素材（面板新入口）。
 
         full_src 给路径 → 双形态（旧参数，等价 forms_src 两个形态）。
-        frames_src 给 2~24 张已处理帧 → 帧动画角色：帧存为 <id>_f%02d.png，
+        frames_src 给 2~FRAME_MAX 张已处理帧 → 帧动画角色：帧存为 <id>_f%02d.png，
         base 必须是首帧（"file" 指向 _f00），"frames" 记录全部帧文件名。
         forms_src 给 [(名字, png路径), ...]（1~8 个，v1.4 多形态）→
         形态文件存为 <id>_form%d.png，形态 0 即 base；记录 "forms"。
@@ -424,8 +433,8 @@ class RoleLibrary:
             if frames_src is not None:
                 if not isinstance(frames_src, list) or len(frames_src) < 2:
                     return None, "帧动画至少需要 2 帧"
-                if len(frames_src) > 24:
-                    return None, "帧动画最多 24 帧"
+                if len(frames_src) > FRAME_MAX:
+                    return None, "帧动画最多 %d 帧（可在设置里调整）" % FRAME_MAX
                 for i, src in enumerate(frames_src):
                     if not isinstance(src, str) or not os.path.isfile(src):
                         return None, "第 %d 帧素材不存在" % (i + 1)
@@ -635,7 +644,7 @@ class AudioLibrary:
         try:
             return p if os.path.isfile(p) else None
         except Exception:
-            return None
+            return None  # 有意忽略：isfile 异常按文件不存在处理
 
     def import_file(self, src, name=None):
         """导入音频：复制到 audio/<id>.<ext>。仅 .wav/.mp3、>20MB 拒绝，不校验音频内容。"""
@@ -675,7 +684,7 @@ class AudioLibrary:
                     if os.path.exists(dst):
                         os.remove(dst)  # 半截文件清理，不留孤儿
                 except Exception:
-                    pass
+                    pass  # 有意忽略：半截文件清理尽力而为，不留孤儿
                 return None, "复制文件失败"
             duration = _wav_duration(dst) if ext == ".wav" else None
             frag = {
@@ -692,7 +701,7 @@ class AudioLibrary:
                 try:
                     os.remove(dst)
                 except Exception:
-                    pass
+                    pass  # 有意忽略：回滚清理尽力而为
                 self._data["fragments"].pop()
                 return None, err
             return frag, None
@@ -780,6 +789,7 @@ class AudioLibrary:
 
 # ---------------- 冒烟测试（无 GUI，可直接运行本文件） ----------------
 if __name__ == "__main__":
+    # P0-2：以下 print 为命令行冒烟工具输出（python pet_resources.py 运行可见），保留不改为日志
     import tempfile
 
     tmp = tempfile.mkdtemp(prefix="pet_resources_smoke_")

@@ -42,14 +42,16 @@ Copyright (c) 大肥鱼桌宠项目
   「旧定时器已 deleteLater 但事件循环里仍排队一次 timeout」的边界问题；
   换帧间隔用 setInterval 就地改，开销可忽略。这与 pet_anim.FrameAnim 的既有做法一致。
 - 帧集只保存 QPixmap 引用，不复制像素。
-- 所有异常静默兜底、绝不抛出（含 item / 定时器已被销毁时的 RuntimeError），
-  以免打断主循环。
+- 异常策略：真实异常经 pet_log 记日志后兜底；销毁竞态（item / 定时器已销毁
+  的 RuntimeError）与用户回调异常有意静默（# 有意忽略 注释），绝不抛出打断主循环。
 - 仅依赖 PySide6.QtCore / QtGui 与 pet_anim，模块可在无 GUI 环境 import。
 
 Python 3.8 兼容。
 """
 
 from PySide6.QtCore import QObject, QTimer, Signal
+
+import pet_log
 
 # 复用项目既有帧集加载工具（读 <prefix>_f%02d.png）；同时方便外部 from pet_fx import load_frame_set
 from pet_anim import load_frame_set
@@ -159,8 +161,8 @@ class AnimatedEmote(QObject):
         try:
             if self._frames:
                 return self._frames[self._index]
-        except Exception:
-            pass
+        except Exception as e:
+            pet_log.log_error("pet_fx.current: %r" % (e,))
         return None
 
     # ---------------- 内部 ----------------
@@ -195,23 +197,21 @@ class AnimatedEmote(QObject):
             cb = self._on_finish  # 先取回调：stop() 会清空 _on_finish
             self.stop()
             self._finishing = False  # 回调期间允许重入 play
-            try:
-                self.finished.emit()
-            except Exception:
-                pass
+            self.finished.emit()  # 注：Qt 信号槽内异常由 Qt 捕获打印，emit 侧 try 捕获不到（不包）
             if cb:
                 try:
                     cb(self)
                 except Exception:
                     pass  # 回调里出错不影响播放器状态
-        except Exception:
-            pass
+        except Exception as e:
+            pet_log.log_error("pet_fx._finish 兜底: %r" % (e,))
         finally:
             self._finishing = False
 
 
 # ---------------- 冒烟测试（无显示器环境，可直接运行本文件） ----------------
 if __name__ == "__main__":
+    # P0-2：以下 print 为命令行冒烟工具输出（python pet_fx.py 运行可见），保留不改为日志
     import os
     import sys
 

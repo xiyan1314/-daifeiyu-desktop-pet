@@ -5,8 +5,8 @@
 
 ## 📢 版本公告
 > 不喜欢新版本？可以下载怀旧版：
-> [v1.4.2（行走降速 + 跟随伴飞）](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.4.2) ·
-> [v1.4.1（跟随/散步降速）](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.4.1)
+> [v1.4.2（行走降速 + 跟随伴飞）](https://github.com/xiyan1314/daifeiyu-desktop-pet/releases/tag/v1.4.2) ·
+> [v1.4.1（跟随/散步降速）](https://github.com/xiyan1314/daifeiyu-desktop-pet/releases/tag/v1.4.1)
 > 解压后双击「启动桌宠.vbs」即可，与新版互不干扰（同一时间只跑一个）。
 
 Windows 桌面宠物，基于 **PySide6（Qt6）+ Python 3.10** 开发，MIT 开源。
@@ -42,14 +42,14 @@ Windows 桌面宠物，基于 **PySide6（Qt6）+ Python 3.10** 开发，MIT 开
 
 **方式一：免安装绿色版（推荐，无需 Python）**
 
-到 [Releases](../../releases) 下载附件 `daifeiyu-desktop-pet.zip`（解压后是 `大肥鱼桌宠_绿色版` 文件夹）→ 双击 `启动桌宠.vbs`。
+到 [Releases](https://github.com/xiyan1314/daifeiyu-desktop-pet/releases) 下载附件 `daifeiyu-desktop-pet.zip`（解压后是 `大肥鱼桌宠_绿色版` 文件夹）→ 双击 `启动桌宠.vbs`。
 （绿色版使用微软签名的 pythonw.exe + 完整运行库，不含易被杀软误报的自解压 exe。）
 
 **方式二：源码运行**
 
 ```bash
 pip install -r requirements.txt
-python 桌宠.py        # 或双击 启动桌宠.bat
+python main.py        # 规范入口（桌宠.py 为兼容壳）；或双击 启动桌宠.bat
 ```
 
 ## 🎮 玩法

@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QSlider, QLabel, QHBoxLayout, QVBoxLayout, QWidgetAction,
 )
 
+import pet_log
 import pet_anim
 import pet_fx
 import pet_mood
@@ -48,7 +49,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.5.5"
+VERSION = "1.5.6"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -104,7 +105,7 @@ def _data_dir():
         os.remove(probe)
         return d
     except Exception:
-        pass
+        pass  # 有意忽略：探针失败=目录不可写，按规则回退 APPDATA
     alt = os.path.join(os.environ.get("APPDATA", d), "大肥鱼桌宠")
     try:
         os.makedirs(alt, exist_ok=True)
@@ -114,6 +115,7 @@ def _data_dir():
 
 
 DATA_DIR = _data_dir()
+pet_log.set_data_dir(DATA_DIR)
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 DEFAULT_CONFIG = {
     "scale": 1.0,
@@ -140,6 +142,7 @@ DEFAULT_CONFIG = {
     "ai_reply_len": 25,
     "ai_persona": "default",  # P1-10+：人设预设 id（default/sheshe/tsundere/custom）
     "click_through": False,   # P3-1：透明区点击穿透（只命中身体，默认关闭）
+    "role_frame_max": 24,     # P3-5+：帧动画帧数上限（2~60，用户可调）
 }
 
 # P1-3：config.json schema 版本（1=旧版全量存储；2=diff 只存改动项）
@@ -205,74 +208,22 @@ def _to_bool(v):
 # 脱敏 key 缓存（未设置 = None，设置后为空串表示「无 key」）
 _redact_key = None
 
-# P0-2：DEBUG 开关——DFY_DEBUG=1 时 _log_error 同时打到 stderr，便于排障
-DEBUG = os.environ.get("DFY_DEBUG") == "1"
-
 
 def set_redact_key(key):
-    """由 PetWindow 在 key 载入 / 修改 / 清除后同步，避免 _redact 每次重读并解密 config。"""
+    """由 PetWindow 在 key 载入 / 修改 / 清除后同步，并同步给 pet_log 的脱敏缓存。"""
     global _redact_key
     _redact_key = str(key or "")
+    pet_log.set_redact_key(_redact_key)
 
 
 def _redact(msg):
-    """日志脱敏：API Key（缓存优先，未同步时兜底读一次配置）与 sk-/Bearer 形态。"""
-    try:
-        key = _redact_key
-        if key is None:
-            key = load_config().get("api_key", "")  # 尚未同步时兜底读取一次
-        if key:
-            msg = msg.replace(key, "***APIKEY***")
-    except Exception:
-        pass
-    msg = re.sub(r"(sk-[A-Za-z0-9_-]{6,})", "sk-***", msg)
-    msg = re.sub(r"(Bearer\s+)[A-Za-z0-9._-]+", r"\1***", msg)
-    # P2-1：覆盖 api_key= 字段形态（阈值 6、含 URL 编码字符）与裸 ?key= 查询参数形态
-    msg = re.sub(r"(api[_-]?key\s*[=:]\s*[\"']?)[A-Za-z0-9._\-%/+]{6,}", r"\1***", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"([?&]key\s*=\s*[\"']?)[^\s&\"']{6,}", r"\1***", msg, flags=re.IGNORECASE)
-    return msg
-
-
-_logging_error = False  # P0-2：_log_error 重入标志（防 日志→_redact→load_config→日志 套环）
+    """日志脱敏（P0-2：实现迁至 pet_log，保留函数名供全仓/tests 调用）。"""
+    return pet_log.redact(msg)
 
 
 def _log_error(msg):
-    global _logging_error
-    if _logging_error:
-        # 重入：直写 stderr 立即返回，阻断套环；外层调用会正常走完整脱敏+落盘
-        try:
-            sys.stderr.write("[DFY] %s\n" % msg)
-        except Exception:
-            pass
-        return
-    _logging_error = True
-    try:
-        msg = _redact(msg)
-        path = os.path.join(DATA_DIR, "error.log")
-        try:
-            if os.path.getsize(path) > 512 * 1024:  # 512KB 轮转，防无限累积
-                os.replace(path, path + ".old")
-        except Exception:
-            pass
-        try:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(msg + "\n")
-        except Exception:
-            # 写盘失败（只读目录等）：回退 stderr，日志坏了也不能静默（P0-2）
-            try:
-                sys.stderr.write("[DFY] %s\n" % msg)
-                sys.stderr.flush()
-            except Exception:
-                pass
-    except Exception:
-        if DEBUG:
-            raise  # 调试模式：异常直抛，方便定位
-        try:
-            sys.stderr.write("[DFY] log error: %s\n" % msg)
-        except Exception:
-            pass
-    finally:
-        _logging_error = False
+    """统一日志（P0-2：实现迁至 pet_log，保留函数名供全仓调用）。"""
+    pet_log.log_error(msg, data_dir=DATA_DIR)
 
 
 def _remove_files(paths):
@@ -284,7 +235,7 @@ def _remove_files(paths):
                 os.remove(p)
                 removed += 1
         except Exception:
-            pass
+            pass  # 有意忽略：运行时文件清理尽力而为（幂等清理）
     return removed
 
 
@@ -444,6 +395,10 @@ def load_config():
     if cfg["ai_persona"] not in PERSONA_PRESETS and cfg["ai_persona"] != "custom":
         cfg["ai_persona"] = "default"  # 未知预设 id：回退内置人设
     cfg["click_through"] = _to_bool(cfg.get("click_through", False))
+    try:
+        cfg["role_frame_max"] = max(2, min(60, int(cfg.get("role_frame_max", 24) or 24)))
+    except (TypeError, ValueError):
+        cfg["role_frame_max"] = 24
     cfg["sound_group"] = "custom" if cfg.get("sound_group") == "custom" else "default"
     try:
         bs = cfg.get("bubble_style")
@@ -1250,6 +1205,7 @@ class PetWindow(QWidget):
             QTimer.singleShot(1500, lambda: self.show_bubble(
                 "配置有 %d 处坏值，已自动修正：%s" % (n, detail)))
         # ---- v1.3：角色库 / 音频库 / 记账账本 ----
+        pet_resources.FRAME_MAX = int(self.cfg.get("role_frame_max", 24) or 24)  # P3-5+：帧上限用户可调
         self.role_lib = pet_resources.RoleLibrary(DATA_DIR)
         self.audio_lib = pet_resources.AudioLibrary(DATA_DIR)
         self.role_lib.set_active(self.cfg.get("role", ""))  # roles.json 与 config 同步
@@ -1272,7 +1228,7 @@ class PetWindow(QWidget):
             try:
                 _w.winId()
             except Exception:
-                pass
+                pass  # 有意忽略：预热 winId 尽力而为，失败窗口仍可用
         self._dragging_food = None
         self._balance_timer = None
         self._fetching_balance = False
@@ -1412,7 +1368,7 @@ class PetWindow(QWidget):
                 if scr is not None:
                     scale = max(0.25, min(1.0, round(scr.availableGeometry().height() * 0.18 / self.base_h, 2)))
             except Exception:
-                pass
+                pass  # 有意忽略：无屏/首屏不可用时按默认缩放
         self.set_scale(scale)
         self.cfg["scale"] = self.scale
         self._play_idle()
@@ -1425,7 +1381,7 @@ class PetWindow(QWidget):
                 self.move(ag.right() - self.width() - SCREEN_EDGE_MARGIN_X,
                           ag.bottom() - self.height() - SCREEN_EDGE_MARGIN_Y)
         except Exception:
-            pass
+            pass  # 有意忽略：无屏极端场景留原地
 
         # 拖动状态
         self._drag_offset = None
@@ -1456,7 +1412,7 @@ class PetWindow(QWidget):
         try:
             psutil.cpu_percent(interval=None)
         except Exception:
-            pass
+            pass  # 有意忽略：首次采样失败不影响后续定时采样
 
         # 跨线程信号
         signals.weather.connect(self.show_bubble)
@@ -1504,7 +1460,7 @@ class PetWindow(QWidget):
             if not self._fx_money:
                 self._fx_money = pet_anim.load_frame_set(self._fx_money_dir, "money", 86)
         except Exception:
-            pass
+            pass  # 有意忽略：预加载失败不碍事，撒钱时 _fx_money 为空会走完整检查并记日志
 
     # ---------- 角色加载 ----------
     def _load_img(self, names):
@@ -1595,7 +1551,7 @@ class PetWindow(QWidget):
                 self.cfg["scale_compensated_role"] = mark
                 save_config(self.cfg)
         except Exception:
-            pass
+            pass  # 有意忽略：补偿计算失败按原图缩放处理；save_config 自身已记日志
         return pix.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio,
                           Qt.TransformationMode.SmoothTransformation)
 
@@ -1612,7 +1568,8 @@ class PetWindow(QWidget):
                 return None
             # 文件存在但解码失败（损坏/占位文件）：必须回退默认角色而非返回 null
             return self._cap_role_pix(QPixmap(path), path) or None
-        except Exception:
+        except Exception as e:
+            _log_error("_role_pix: %r" % (e,))
             return None
 
     def _role_frames(self):
@@ -1676,7 +1633,7 @@ class PetWindow(QWidget):
         try:
             self.tray.setIcon(QIcon(self.sprites[self.form_keys[0]]["front"]))
         except Exception:
-            pass
+            pass  # 有意忽略：托盘图标更新失败不影响主窗口显示
         if self.emote_item.isVisible() and getattr(self, "_last_emote_kind", None):
             self._show_emote(self._last_emote_kind)  # 头顶表情随新窗口尺寸重排
 
@@ -1998,7 +1955,7 @@ class PetWindow(QWidget):
                 self.move(ag.right() - self.width() - SCREEN_EDGE_MARGIN_X,
                           ag.bottom() - self.height() - SCREEN_EDGE_MARGIN_Y)
         except Exception:
-            pass
+            pass  # 有意忽略：掉屏回收失败保持原位，下个 tick 再试
 
     def _reset_squash(self):
         self.squash_x = 1.0
@@ -2115,7 +2072,7 @@ class PetWindow(QWidget):
                     try:
                         self._fly_timer.deleteLater()
                     except RuntimeError:
-                        pass
+                        pass  # 有意忽略：定时器可能已被销毁（幂等清理）
                     self._fly_timer = None
                 self.food_flyer.hide()
                 self.busy = False
@@ -2130,7 +2087,7 @@ class PetWindow(QWidget):
             try:
                 self._fly_timer.deleteLater()
             except RuntimeError:
-                pass
+                pass  # 有意忽略：定时器可能已被销毁（幂等清理）
         self._fly_timer = QTimer(self)
         self._fly_timer.timeout.connect(tick)
         self._fly_timer.start(30)
@@ -2295,7 +2252,7 @@ class PetWindow(QWidget):
                 self._tween_anim.stop()
                 self._tween_anim.deleteLater()
             except RuntimeError:
-                pass
+                pass  # 有意忽略：动画可能已被销毁（幂等清理）
             self._tween_anim = None
             self._finish_tween(self._tween_finish_cb)
         cb = on_finished if on_finished is not None else self._reset_squash
@@ -2373,7 +2330,7 @@ class PetWindow(QWidget):
             try:
                 self._digest_timer.deleteLater()
             except RuntimeError:
-                pass
+                pass  # 有意忽略：定时器可能已被销毁（幂等清理）
         self._digest_timer = QTimer(self)
         self._digest_timer.setSingleShot(True)
         self._digest_timer.timeout.connect(self._digest)
@@ -2507,7 +2464,7 @@ class PetWindow(QWidget):
                 self._show_emote("exclaim")
                 self.show_bubble("CPU %.0f%% 啦！我要被烤熟了！" % cpu)
         except Exception:
-            pass
+            pass  # 有意忽略：采样失败下个周期再试（6s 周期高频，不刷日志）
 
     def _show_system_status(self):
         try:
@@ -3053,6 +3010,9 @@ class PetWindow(QWidget):
         ct_act.setCheckable(True)
         ct_act.setChecked(self.cfg.get("click_through", False))
         ct_act.toggled.connect(self._set_click_through)
+        # P3-5+：帧数上限用户可调（导入与加载共用）
+        fm_act = set_menu.addAction("🎞️ 帧数上限…")
+        fm_act.triggered.connect(self._set_frame_max)
         snd_set = set_menu.addMenu("🎵 音效设置")
         grp_group = QActionGroup(menu)
         grp_group.setExclusive(True)  # 单选互斥：勾选状态不残留
@@ -3166,6 +3126,34 @@ class PetWindow(QWidget):
         save_config(self.cfg)
         self._update_click_mask()
 
+    def _set_frame_max(self):
+        """P3-5+：帧动画帧数上限（读侧与导入管线共用，改完立即生效）。"""
+        cur = int(self.cfg.get("role_frame_max", 24) or 24)
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("帧数上限")
+        dlg.setLabelText("帧动画角色最多多少帧？（2~60，对导入与加载立即生效）")
+        dlg.setInputMode(QInputDialog.InputMode.IntInput)
+        dlg.setIntRange(2, 60)
+        dlg.setIntValue(cur)
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.setFocus()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        val = dlg.intValue()
+        self.cfg["role_frame_max"] = val
+        save_config(self.cfg)
+        pet_resources.FRAME_MAX = val
+        # 已载入角色立即按新上限重建（调小立即截断生效；调大下次导入即用）
+        try:
+            self.role_lib._load()
+            self.apply_role(self.cfg.get("role", ""))
+        except Exception:
+            pass  # 有意忽略：重建失败下次启动自愈，不影响上限已落盘
+        self.show_bubble("帧上限改为 %d 帧啦~" % val)
+
     def _update_click_mask(self):
         """P3-1：重建「变换后身体」的逐像素命中画布（与 _apply_transform 严格同变换）。
 
@@ -3226,7 +3214,7 @@ class PetWindow(QWidget):
             if canvas.pixelColor(lp.x(), lp.y()).alpha() < 8:
                 return True, -1  # HTTRANSPARENT：点击落到桌面
         except Exception:
-            pass
+            pass  # 有意忽略：命中画布失败按常规命中处理（每条鼠标消息都走这里，不刷日志）
         return False, 0
 
     def _set_autostart(self, on):
@@ -3305,7 +3293,7 @@ class PetWindow(QWidget):
                 v = int(style.get(k))
                 st[k] = max(8 if k == "font_size" else 0, min(18 if k == "font_size" else 30, v))
             except (TypeError, ValueError):
-                pass
+                pass  # 有意忽略：非数字样式值保持原值
         self.cfg["bubble_style"] = st
         save_config(self.cfg)
         BUBBLE_STYLE.update(st)
@@ -3492,8 +3480,8 @@ class PetWindow(QWidget):
         box.setTextFormat(Qt.TextFormat.RichText)
         box.setText("%s v%s<br>PySide6 桌宠 · MIT License<br>喜欢的，就咬住不放~<br><br>"
                     "📢 不喜欢新版？怀旧版下载："
-                    "<a href='https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.4.2'>v1.4.2</a> · "
-                    "<a href='https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.4.1'>v1.4.1</a>"
+                    "<a href='https://github.com/xiyan1314/daifeiyu-desktop-pet/releases/tag/v1.4.2'>v1.4.2</a> · "
+                    "<a href='https://github.com/xiyan1314/daifeiyu-desktop-pet/releases/tag/v1.4.1'>v1.4.1</a>"
                     % (APP_NAME, VERSION))
         box.setWindowFlags(box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         box.show()
@@ -3517,7 +3505,7 @@ class PetWindow(QWidget):
                 self.fx.stop()
                 self.fx_money.stop()
             except Exception:
-                pass
+                pass  # 有意忽略：退出清理尽力而为
             self.mood.stop_all()
             for t in (self.idle_timer, self.walk_timer, self.cpu_timer, self.mood_timer,
                       self._state_timer, self._drag_timer, self._balance_timer, self._digest_timer,
@@ -3535,12 +3523,12 @@ class PetWindow(QWidget):
                         a.stop()
                         a.deleteLater()
                     except RuntimeError:
-                        pass
+                        pass  # 有意忽略：动画可能已被销毁（退出清理尽力而为）
             try:
                 if self._preview_player is not None:
                     self._preview_player.stop()
             except Exception:
-                pass
+                pass  # 有意忽略：退出时停预览播放器尽力而为
             _remove_files((CONFIG_PATH + ".tmp", USAGE_PATH + ".tmp",
                            os.path.join(DATA_DIR, "ledger.json.tmp"),
                            os.path.join(DATA_DIR, "ledger_archive.json.tmp"),
@@ -3548,7 +3536,7 @@ class PetWindow(QWidget):
                            os.path.join(DATA_DIR, "audio.json.tmp"),
                            MEMORY_PATH + ".tmp"))  # P1-6：退出清记忆原子写残留
         except Exception:
-            pass
+            pass  # 有意忽略：退出清理环节任何失败都不阻塞退出
         QApplication.quit()  # 事件循环退出后主线程结束，daemon 线程随进程回收
 
 
@@ -3556,11 +3544,9 @@ def _excepthook(exc_type, exc_value, tb):
     import traceback
     try:
         msg = "".join(traceback.format_exception(exc_type, exc_value, tb))
-        msg = _redact(msg)
-        with open(os.path.join(DATA_DIR, "error.log"), "a", encoding="utf-8") as f:
-            f.write(msg)
+        _log_error("未捕获异常: " + msg)  # P0-2：走统一日志出口（脱敏+轮转+重入守卫）
     except Exception:
-        pass
+        pass  # 有意忽略：异常钩子自身写盘失败，无处可记（尽力而为）
     try:
         if threading.current_thread() is threading.main_thread():
             # 父窗口优先取桌宠本体（顶层可见窗口顺序不契约，可能先匹配到气泡等小窗）
@@ -3582,7 +3568,7 @@ def _excepthook(exc_type, exc_value, tb):
             box.setText("发生了未处理的错误，详情见 error.log")
             box.exec()
     except Exception:
-        pass
+        pass  # 有意忽略：错误弹框失败不阻塞（已处于异常路径）
 
 
 def _check_memory():
@@ -3595,7 +3581,7 @@ def _check_memory():
             if os.path.getsize(path) > 512 * 1024:  # 与 error.log 同口径：512KB 轮转
                 os.replace(path, path + ".old")
         except Exception:
-            pass
+            pass  # 有意忽略：体积检查失败直接追加
         with open(path, "a", encoding="utf-8") as fp:
             fp.write("memory check: %.1f MB, %s\n" % (rss_mb, "OK" if ok else "OVER 1GB"))
         return ok
@@ -3634,9 +3620,9 @@ def _cleanup_stale_mei():
                     if os.path.exists(os.path.join(p, "大肥鱼桌宠.exe")) and _has_pyinstaller_signature(p):
                         shutil.rmtree(p, ignore_errors=True)
             except Exception:
-                pass
+                pass  # 有意忽略：单条目清理失败跳过（保守策略）
     except Exception:
-        pass
+        pass  # 有意忽略：残留清理是尽力而为的后台动作，失败不影响启动
 
 
 def _has_pyinstaller_signature(dir_path):
@@ -3728,7 +3714,7 @@ def set_autostart(on):
             try:
                 winreg.DeleteValue(key, AUTOSTART_NAME)
             except FileNotFoundError:
-                pass
+                pass  # 有意忽略：值不存在=已是关闭状态（幂等删除）
         winreg.CloseKey(key)
         return True, ""
     except Exception as e:

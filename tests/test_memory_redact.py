@@ -66,6 +66,7 @@ def test_redact_sk_and_bearer_still_work():
 def mem_path(tmp_path):
     p = str(tmp_path / "memory.json")
     main.MEMORY_PATH = p
+    main.pet_log.set_data_dir(str(tmp_path))
     yield p
     main.MEMORY_PATH = os.path.join(main.DATA_DIR, "memory.json")
 

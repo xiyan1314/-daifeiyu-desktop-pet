@@ -60,6 +60,8 @@ import shutil
 import tempfile
 import time
 
+import pet_log
+
 from PySide6.QtCore import QEventLoop, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import (
@@ -91,6 +93,7 @@ from PySide6.QtWidgets import (
 )
 
 import pet_audio
+import pet_resources  # P3-5+：FRAME_MAX（帧上限用户可调）
 
 # ---------------- 主题 ----------------
 DIALOG_QSS = """
@@ -197,7 +200,7 @@ def _get(pet, name):
     try:
         return getattr(pet, name, None)
     except Exception:
-        return None
+        return None  # 有意忽略：防御性取属性，异常按缺失处理（缺省不崩）
 
 
 def _call(pet, name, *args):
@@ -207,7 +210,7 @@ def _call(pet, name, *args):
         if callable(fn):
             return fn(*args)
     except Exception:
-        pass
+        pass  # 有意忽略：防御性调用，缺失/异常按失败处理（缺省不崩）
     return None
 
 
@@ -248,7 +251,7 @@ def _preview_audio(pet, path):
         if pet_audio.preview_file(path):
             return True
     except Exception:
-        pass
+        pass  # 有意忽略：本地试听失败继续尝试 mp3 兜底
     if os.path.splitext(str(path))[1].lower() == ".mp3":
         try:
             from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -263,10 +266,10 @@ def _preview_audio(pet, path):
                 try:
                     old_p.stop()  # 先停再释放，避免正在播放的兜底音被 GC 掐断
                 except Exception:
-                    pass
+                    pass  # 有意忽略：停旧播放器失败直接丢弃（尽力而为）
             return True
-        except Exception:
-            pass
+        except Exception as e:
+            pet_log.log_error("pet_dialogs._preview_audio: mp3 兜底播放失败 %r" % (e,))
     return False
 
 
@@ -322,7 +325,7 @@ def _remove_background(img, cancel=None):
     try:
         raw = bytearray(img.bits())
     except Exception:
-        return None
+        return None  # 有意忽略：像素读取失败按处理失败返回（调用方保留原图并提示）
     bpl = img.bytesPerLine()
     n = w * h
     visited = bytearray(n)
@@ -383,7 +386,7 @@ def _content_bbox(img, cancel=None):
     try:
         raw = bytearray(img.bits())
     except Exception:
-        return None
+        return None  # 有意忽略：像素读取失败按包围盒计算失败返回（调用方保留原图）
     bpl = img.bytesPerLine()
     minx, miny, maxx, maxy = w, h, -1, -1
     for y in range(h):
@@ -571,7 +574,8 @@ def _pump_events(ms=10):
 
 
 def _extract_video_frames(src, out_dir, cancel=None, progress=None):
-    """从视频（mp4/webm/mov/avi 等）或 GIF 均匀抽帧（视频 3~20 帧、GIF 3~24 帧）。
+    """从视频（mp4/webm/mov/avi 等）或 GIF 均匀抽帧（视频 3~20 帧、GIF 3~FRAME_MAX 帧；
+    上限随用户配置 role_frame_max，抽帧时即按上限采样，不会白处理后再被导入拒绝）。
 
     视频走 QtMultimedia（QMediaPlayer + QVideoSink，绿色版自带 ffmpeg 后端），
     GIF 走 QImageReader（同步逐帧读，无事件循环依赖）。返回
@@ -603,7 +607,7 @@ def _extract_video_frames(src, out_dir, cancel=None, progress=None):
                 return None, "GIF 只有 %d 帧，帧动画至少需要 2 帧" % n
             if n > 120:
                 return None, "GIF 帧数太多（%d 帧），建议改用视频或减少帧数" % n
-            take = min(24, n)
+            take = min(int(pet_resources.FRAME_MAX or 24), n)  # P3-5+：上限用户可调
             idxs = [int(round(i * (n - 1) / float(take - 1))) for i in range(take)]
             need = set(idxs)
             # 顺序读帧并只保留采样点：部分 GIF 插件 jumpToImage 返回 False
@@ -639,7 +643,8 @@ def _extract_video_frames(src, out_dir, cancel=None, progress=None):
             if not player.hasVideo():
                 player.stop()
                 return None, "该文件没有视频画面（纯音频？）"
-            take = max(3, min(20, int(dur / 400)))  # 每约 0.4s 一帧
+            # 每约 0.4s 一帧；视频自身 ≤20 与用户配置上限取更小者（P3-5+）
+            take = max(3, min(20, int(pet_resources.FRAME_MAX or 24), int(dur / 400)))
             got = []
 
             def _on_frame(frame):
@@ -1035,14 +1040,14 @@ class RoleImportDialog(QDialog):
             try:
                 sig.disconnect()
             except (RuntimeError, TypeError):
-                pass
+                pass  # 有意忽略：信号未连接/已断开时 disconnect 抛错（幂等断开）
         if not w.wait(3000):
             try:
                 w.terminate()  # 极端兜底：管线卡死时强杀，防退出卡住
                 w.wait(1000)
                 w.deleteLater()  # terminate 不发射 finished，手动释放防泄漏
             except Exception:
-                pass
+                pass  # 有意忽略：极端兜底强杀失败不阻塞退出（已尽力收敛线程）
         self._worker = None
         self._worker_kind = None
 
@@ -1139,8 +1144,10 @@ class RoleImportDialog(QDialog):
             if files:
                 self._apply_static_form(files[0])  # 单文件：同套校验（L9）
             return
-        if len(files) > 24:
-            _warn(self, "多帧动画", "最多 24 帧，当前选了 %d 张" % len(files))
+        _max_frames = int(pet_resources.FRAME_MAX or 24)  # P3-5+：上限用户可调
+        if len(files) > _max_frames:
+            _warn(self, "多帧动画", "最多 %d 帧（可在设置里调整），当前选了 %d 张"
+                  % (_max_frames, len(files)))
             return
         files = sorted(files)
         self._set_frames(files, "已选 %d 帧（多选图片，按文件名排序）" % len(files),
@@ -1157,7 +1164,7 @@ class RoleImportDialog(QDialog):
                 _warn(self, "抽帧", "文件超过 200MB，太大啦")
                 return
         except Exception:
-            pass
+            pass  # 有意忽略：体积检查失败不拦抽帧（200MB 只是软上限）
         # P1-1：每次抽帧前重建临时目录——重试成功后旧 raw_fXX.png 不残留
         if self._rawdir:
             shutil.rmtree(self._rawdir, ignore_errors=True)
@@ -1220,7 +1227,7 @@ class RoleImportDialog(QDialog):
         try:
             QApplication.instance().aboutToQuit.disconnect(self._shutdown_worker)
         except Exception:
-            pass
+            pass  # 有意忽略：未连接/已断开时 disconnect 抛错（幂等断开）
         self._cleanup()
         super().closeEvent(event)
 
@@ -1394,7 +1401,7 @@ class RolePanel(QWidget):
                     if not pix.isNull():
                         size_text = "%dx%d" % (pix.width(), pix.height())
                 except Exception:
-                    pass
+                    pass  # 有意忽略：尺寸探测失败显示 ?x?（预览信息尽力而为）
             mark = " [当前]" if role["id"] == active else ""
             nf = len(role.get("forms") or [])
             form_text = ("%d形态" % nf) if nf >= 2 else "单形态"
@@ -1959,7 +1966,7 @@ class BubbleStyleDialog(QDialog):
                     if v is not None:
                         self._style[k] = v
         except Exception:
-            pass
+            pass  # 有意忽略：样式配置异常回退默认（防御性）
 
         root = QVBoxLayout(self)
         grid = QGridLayout()

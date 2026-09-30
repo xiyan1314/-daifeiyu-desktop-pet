@@ -180,7 +180,7 @@ def _rebuild_effects():
             try:
                 old.stop()  # 停掉旧效果器再替换，避免掐断瞬间的残余播放
             except Exception:
-                pass
+                pass  # 有意忽略：停旧效果器失败（对象可能已销毁），替换照常（尽力而为）
         try:
             eff = _QSoundEffect()
             eff.setSource(QUrl.fromLocalFile(path))
@@ -366,6 +366,7 @@ def play(kind):
 
 # ---------------- 冒烟测试（无需 GUI，可直接运行本文件） ----------------
 if __name__ == "__main__":
+    # P0-2：以下 print 为命令行冒烟工具输出（python pet_audio.py 运行可见），保留不改为日志
     SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "sounds")
 
     print("=== 冒烟 1：真实素材目录（无 GUI → 不建效果器，走 winsound 文件路径） ===")

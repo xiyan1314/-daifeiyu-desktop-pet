@@ -192,6 +192,7 @@ class Mood(QObject):
 
 
 if __name__ == "__main__":
+    # P0-2：以下 print 为命令行冒烟工具输出（python pet_mood.py 运行可见），保留不改为日志
     # 冒烟测试：只需 QCoreApplication（模块顶层无 GUI import），
     # 用 QTimer 分步异步驱动，避免同步连续调用受 2.5s 戳链阈值干扰。
     import sys

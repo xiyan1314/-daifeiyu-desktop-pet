@@ -44,7 +44,7 @@ Download `daifeiyu-desktop-pet.zip` from [Releases](../../releases) → extract 
 
 ```bash
 pip install -r requirements.txt
-python 桌宠.py
+python main.py   # canonical entry (桌宠.py kept as compat shim)
 ```
 
 ## 🎮 Controls

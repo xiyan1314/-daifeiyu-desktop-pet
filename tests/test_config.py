@@ -17,6 +17,7 @@ def cfg_path(tmp_path, monkeypatch):
     # 同时隔离 DATA_DIR：load_config 的日志（_log_error）也落在临时目录，不污染真实 error.log
     monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(main, "MEMORY_PATH", str(tmp_path / "memory.json"))
+    main.pet_log.set_data_dir(str(tmp_path))  # pet_* 直连日志同样隔离
     p = str(tmp_path / "config.json")
     monkeypatch.setattr(main, "CONFIG_PATH", p)
     yield p
@@ -208,4 +209,41 @@ def test_api_key_clear_persists(cfg_path):
         data = json.load(f)
     assert data["api_key"] == ""
     assert main.load_config()["api_key"] == ""
+
+
+# ---------------- P3-5+：帧上限用户可调 ----------------
+
+def test_role_frame_max_normalized(cfg_path):
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 2, "role_frame_max": 999}, f, ensure_ascii=False)
+    assert main.load_config()["role_frame_max"] == 60  # 越界钳到上限
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 2, "role_frame_max": "abc"}, f, ensure_ascii=False)
+    assert main.load_config()["role_frame_max"] == 24  # 非法值回退默认
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 2, "role_frame_max": 1}, f, ensure_ascii=False)
+    assert main.load_config()["role_frame_max"] == 2  # 下限 2 帧
+
+
+def test_pet_resources_frame_max_default():
+    import pet_resources
+    assert pet_resources.FRAME_MAX == 24  # 默认值；桌宠启动时按 cfg 同步
+
+
+def test_frame_max_read_and_import_side(tmp_path, monkeypatch):
+    """FRAME_MAX 读侧截断与导入侧拒绝口径一致（monkeypatch 由 pytest 自动还原）。"""
+    import pet_resources
+    monkeypatch.setattr(pet_resources, "FRAME_MAX", 5)
+    rid = "r1"
+    frames = ["%s_f%02d.png" % (rid, i) for i in range(8)]
+    with open(tmp_path / "roles.json", "w", encoding="utf-8") as f:
+        json.dump({"roles": [{"id": rid, "name": "x", "file": "r1.png",
+                              "frames": frames}], "active": ""},
+                  f, ensure_ascii=False)
+    lib = pet_resources.RoleLibrary(str(tmp_path))
+    role = next((r for r in lib._data["roles"] if r.get("id") == rid), None)
+    assert role is not None and len(role["frames"]) == 5  # 读侧截断到上限
+    r2, e2 = lib.import_processed(None, None, "y",
+                                  frames_src=["f%02d.png" % i for i in range(6)])
+    assert r2 is None and "5" in (e2 or "")  # 导入侧拒绝且文案带当前上限
 

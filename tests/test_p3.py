@@ -16,6 +16,7 @@ import 桌宠 as main  # noqa: E402
 def cfg_path(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(main, "MEMORY_PATH", str(tmp_path / "memory.json"))
+    main.pet_log.set_data_dir(str(tmp_path))
     p = str(tmp_path / "config.json")
     monkeypatch.setattr(main, "CONFIG_PATH", p)
     yield p

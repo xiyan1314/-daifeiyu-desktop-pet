@@ -37,8 +37,8 @@
 
 实现要点：
 - 纯标准库（json/os/time/datetime），不依赖 PySide6，无 GUI 可运行。
-- 全部文件 IO 走「写临时文件 + os.replace」原子替换；任何异常静默降级，
-  绝不向调用方抛异常。
+- 全部文件 IO 走「写临时文件 + os.replace」原子替换；任何异常降级，
+  绝不向调用方抛异常（数据文件损坏/读写失败记入 error.log）。
 - 金额统一 float 并四舍五入到分（round(x, 2)）。
 
 Python 3.8+ 兼容。
@@ -52,12 +52,14 @@ import json
 import os
 import time
 
+import pet_log
+
 # 归档保留策略
 _ARCHIVE_MAX_DAYS = 365
 _DAY_MAX_RECORDS = 20000
 
 
-# ---------------- 通用 IO 助手（原子替换，静默降级） ----------------
+# ---------------- 通用 IO 助手（原子替换，降级不抛） ----------------
 def _read_json(path, factory=dict):
     """读 JSON；文件缺失 / 损坏时返回 factory() 默认值，绝不抛出。"""
     try:
@@ -65,8 +67,10 @@ def _read_json(path, factory=dict):
             data = json.load(f)
         if isinstance(data, dict):
             return data
-    except Exception:
-        pass
+    except Exception as e:
+        # 首次运行无文件=正常（静默）；文件存在但读取失败=真实故障，记日志
+        if os.path.exists(path):
+            pet_log.log_error("pet_book._read_json 读取失败（按默认值重建）: %r" % (e,))
     return factory()
 
 
@@ -86,7 +90,7 @@ def _write_json(path, data):
             if os.path.exists(tmp):
                 os.remove(tmp)
         except Exception:
-            pass
+            pass  # 有意忽略：临时文件清理尽力而为，失败不影响主流程
         return str(e)
 
 
@@ -261,8 +265,8 @@ class Book:
                 self._archive_day(date, [rec])  # 历史日期：入归档，不污染今日
         try:
             os.replace(usage_path, usage_path + ".migrated")  # 迁移后改名，防止 ledger 重建时重复迁移
-        except Exception:
-            pass
+        except Exception as e:
+            pet_log.log_error("pet_book._migrate_usage: usage.json 改名失败（下次启动可能重复迁移）: %r" % (e,))
 
     def _ensure_today(self):
         """跨天处理：先落盘归档，成功后才清 ledger 昨日记录（防写序丢数据）。"""
@@ -316,7 +320,7 @@ class Book:
         try:
             total = round(float(total), 2)
         except Exception:
-            return None
+            return None  # 有意忽略：非法余额输入放弃本次观测（防御性）
         self._ensure_today()
         last = self._ledger.get("last_balance")
         note = None
@@ -336,7 +340,7 @@ class Book:
         try:
             amount = round(float(amount), 2)
         except Exception:
-            return
+            return  # 有意忽略：非法金额静默忽略（docstring 约定）
         if amount <= 0:
             return
         self._ensure_today()
@@ -478,7 +482,7 @@ class Book:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             except Exception:
-                pass
+                pass  # 有意忽略：导出失败后的临时文件清理尽力而为
             return False, str(e)
 
     def reset_balance_baseline(self):
@@ -500,6 +504,7 @@ class Book:
 
 # ---------------- 冒烟测试（无 GUI，可直接运行本文件） ----------------
 if __name__ == "__main__":
+    # P0-2：以下 print 为命令行冒烟工具输出（python pet_book.py 运行可见），保留不改为日志
     import tempfile
     import shutil
 
