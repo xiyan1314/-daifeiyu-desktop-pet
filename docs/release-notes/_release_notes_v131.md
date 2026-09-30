@@ -22,4 +22,4 @@
 
 **下载**：下方附件 `daifeiyu-desktop-pet.zip`（绿色版，解压后双击 `启动桌宠.vbs`）
 **源码**：本仓库 main 分支；MIT License
-**v1.3.0 新功能**（角色库/音效导入/资源管理/记账/菜单美化）见 [v1.3.0 Release](../../releases/tag/v1.3.0)
+**v1.3.0 新功能**（角色库/音效导入/资源管理/记账/菜单美化）见 [v1.3.0 Release](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.3.0)

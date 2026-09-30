@@ -26,7 +26,7 @@
 
 ## 🎞️ 历史
 
-[v1.3.3 程序化表情图](../../releases/tag/v1.3.3) · [v1.3.2 帧动画角色](../../releases/tag/v1.3.2) · [v1.3.1 单双形态与菜单](../../releases/tag/v1.3.1) · [v1.3.0 角色/音效/记账](../../releases/tag/v1.3.0)
+[v1.3.3 程序化表情图](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.3.3) · [v1.3.2 帧动画角色](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.3.2) · [v1.3.1 单双形态与菜单](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.3.1) · [v1.3.0 角色/音效/记账](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.3.0)
 
 ---
 

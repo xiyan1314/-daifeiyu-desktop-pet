@@ -19,4 +19,4 @@
 ---
 
 **下载**：下方附件 `daifeiyu-desktop-pet.zip`（绿色版，解压后双击 `启动桌宠.vbs`）
-**完整功能**（多形态/开机自启/帧动画/记账等）见 [v1.4.0](../../releases/tag/v1.4.0)；v1.5.0 起各批见 [v1.5.0](../../releases/tag/v1.5.0)
+**完整功能**（多形态/开机自启/帧动画/记账等）见 [v1.4.0](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.4.0)；v1.5.0 起各批见 [v1.5.0](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.5.0)

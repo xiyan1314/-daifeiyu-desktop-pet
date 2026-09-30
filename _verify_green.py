@@ -43,7 +43,7 @@ main.CONFIG_PATH = os.path.join(_tmp, "config.json")
 main.USAGE_PATH = os.path.join(_tmp, "usage.json")
 main.MEMORY_PATH = os.path.join(_tmp, "memory.json")  # P1-6：记忆文件同样隔离到临时目录
 
-check("green version", main.VERSION == "1.5.3", main.VERSION)
+check("green version", main.VERSION == "1.5.4", main.VERSION)
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
