@@ -167,7 +167,8 @@ class RoleLibrary:
             frames = r.get("frames")
             if not isinstance(frames, list):
                 frames = []
-            frames = [str(x) for x in frames if str(x).lower().endswith(".png")][:60]
+            # P3-5：读侧上限与导入管线（≤24 帧）口径统一，避免「能存读不全」
+            frames = [str(x) for x in frames if str(x).lower().endswith(".png")][:24]
             # forms 归一化（v1.4 多形态）：新结构直接采用；旧 file/file_full 自动转换
             raw_forms = r.get("forms")
             if isinstance(raw_forms, list) and raw_forms:

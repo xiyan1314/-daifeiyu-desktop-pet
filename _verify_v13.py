@@ -535,6 +535,30 @@ def main_flow():
     finally:
         main.AUTOSTART_KEY = _real_key
 
+    # ---- P3 可选项 + 人设自定义：表情解析 / 人设预设 / 点击穿透遮罩 ----
+    check("persona presets", set(main.PERSONA_PRESETS) == {"default", "sheshe", "tsundere"},
+          sorted(main.PERSONA_PRESETS))
+    _mode, _kind, _rest = main.parse_emote_tag("【happy】hi~")
+    check("ai emote parse", _mode == "emote" and _kind == "heart" and _rest == "hi~",
+          "mode=%r kind=%r rest=%r" % (_mode, _kind, _rest))
+    try:
+        pet.cfg["click_through"] = True
+        pet._update_click_mask()
+        _cv = getattr(pet, "_click_composite", None)
+        _ok = _cv is not None and _cv.width() == pet.width() and _cv.height() == pet.height()
+        if _ok:
+            # 中心（身体）不透明、角落透明：命中画布与渲染变换对齐的抽样验证
+            _center = _cv.pixelColor(_cv.width() // 2, _cv.height() // 2)
+            _corner = _cv.pixelColor(1, 1)
+            _ok = _center.alpha() > 8 and _corner.alpha() < 8
+        pet.cfg["click_through"] = False
+        pet._update_click_mask()
+        _cleared = getattr(pet, "_click_composite", None) is None
+        check("click through composite", _ok and _cleared,
+              "ok=%s cleared=%s" % (_ok, _cleared))
+    except Exception as e:
+        check("click through composite", False, repr(e))
+
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
     make_test_wav(wav)

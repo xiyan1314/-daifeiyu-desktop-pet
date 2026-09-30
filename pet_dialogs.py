@@ -1248,11 +1248,24 @@ class AISettingsDialog(QDialog):
         root.addWidget(QLabel("模型名（本地 Ollama 可填 qwen2.5 之类）"))
         self._model = QLineEdit(cfg.get("ai_model", "deepseek-chat"))
         root.addWidget(self._model)
-        root.addWidget(QLabel("人设提示词（留空 = 内置大肥鱼人设）"))
+        root.addWidget(QLabel("人设预设（选「自定义」可完全自己写）"))
+        self._persona = QComboBox()
+        self._persona.addItem("内置大肥鱼（又娇又赖，默认）", "default")
+        self._persona.addItem("啥子蛇（毒舌腹黑「本专员」）", "sheshe")
+        self._persona.addItem("傲娇系（嘴硬心软）", "tsundere")
+        self._persona.addItem("自定义（自己写人设）", "custom")
+        root.addWidget(self._persona)
+        self._persona.currentIndexChanged.connect(self._on_persona_changed)
+        cur_persona = str(cfg.get("ai_persona", "default") or "default")
+        _pi = self._persona.findData(cur_persona)
+        if _pi >= 0:
+            self._persona.setCurrentIndex(_pi)
+        root.addWidget(QLabel("自定义人设（选「自定义」预设后生效；留空 = 内置大肥鱼人设）"))
         self._prompt = QPlainTextEdit()
         self._prompt.setPlainText(cfg.get("ai_system_prompt", ""))
-        self._prompt.setPlaceholderText("留空使用内置人设")
+        self._prompt.setPlaceholderText("例：你是一只高冷的猫猫桌宠，只对绳匠一个人温柔……")
         root.addWidget(self._prompt, 1)
+        self._on_persona_changed(self._persona.currentIndex())
         row = QHBoxLayout()
         row.addWidget(QLabel("回复字数上限"))
         self._reply = QSpinBox()
@@ -1277,10 +1290,15 @@ class AISettingsDialog(QDialog):
         btns.addWidget(cancel)
         root.addLayout(btns)
 
+    def _on_persona_changed(self, _idx):
+        """预设选择：仅「自定义」时启用人设编辑框。"""
+        self._prompt.setEnabled(self._persona.currentData() == "custom")
+
     def _save(self):
         data = {
             "ai_base_url": self._base.text().strip().rstrip("/"),
             "ai_model": self._model.text().strip() or "deepseek-chat",
+            "ai_persona": self._persona.currentData() or "default",
             "ai_system_prompt": self._prompt.toPlainText().strip(),
             "ai_reply_len": self._reply.value(),
             "ai_max_tokens": self._tokens.value(),

@@ -3,6 +3,12 @@
 > 一只又娇又耍赖、贪吃、被吓到就浑身发抖的大肥鱼，会叫你「绳匠」~
 > 名台词：**喜欢的，就咬住不放~**
 
+## 📢 版本公告
+> 不喜欢新版本？可以下载怀旧版：
+> [v1.4.2（行走降速 + 跟随伴飞）](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.4.2) ·
+> [v1.4.1（跟随/散步降速）](https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.4.1)
+> 解压后双击「启动桌宠.vbs」即可，与新版互不干扰（同一时间只跑一个）。
+
 Windows 桌面宠物，基于 **PySide6（Qt6）+ Python 3.10** 开发，MIT 开源。
 [English](README.en.md)
 透明无边框窗口、常驻置顶，可拖动、可投喂、可聊天、可查余额，陪你写代码摸鱼两不误。

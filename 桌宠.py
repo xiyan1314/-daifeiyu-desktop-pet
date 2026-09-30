@@ -29,7 +29,7 @@ from PySide6.QtCore import (
     Qt, QTimer, QPoint, QPointF, QRectF, QVariantAnimation, QEasingCurve, QObject, Signal,
 )
 from PySide6.QtGui import (
-    QPixmap, QTransform, QFont, QColor, QPainter, QCursor, QPolygonF,
+    QPixmap, QImage, QTransform, QFont, QColor, QPainter, QCursor, QPolygonF,
     QFontMetrics, QPen, QPainterPath, QIcon, QActionGroup,
 )
 from PySide6.QtWidgets import (
@@ -48,7 +48,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.5.4"
+VERSION = "1.5.5"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -138,6 +138,8 @@ DEFAULT_CONFIG = {
     "ai_system_prompt": "",   # P1-10：人设（空=内置大肥鱼人设）
     "ai_max_tokens": 60,
     "ai_reply_len": 25,
+    "ai_persona": "default",  # P1-10+：人设预设 id（default/sheshe/tsundere/custom）
+    "click_through": False,   # P3-1：透明区点击穿透（只命中身体，默认关闭）
 }
 
 # P1-3：config.json schema 版本（1=旧版全量存储；2=diff 只存改动项）
@@ -148,7 +150,8 @@ CONFIG_FIXES = []
 # 静默重存但不弹修正提示；其余键的改动才算「坏值已修正」
 _SOFT_FIX_KEYS = {"always_on_top", "ai_enabled", "follow_mouse", "wander", "sound", "badge",
                   "ai_base_url", "ai_model", "ai_system_prompt", "lines_extra",
-                  "sound_group", "role", "scale_compensated_role"}
+                  "sound_group", "role", "scale_compensated_role",
+                  "ai_persona", "click_through"}
 
 
 def _fix_entry(k, a, b):
@@ -437,6 +440,10 @@ def load_config():
     cfg["ai_base_url"] = str(cfg.get("ai_base_url", "") or "").strip().rstrip("/")
     cfg["ai_model"] = str(cfg.get("ai_model", "deepseek-chat") or "deepseek-chat").strip()
     cfg["ai_system_prompt"] = str(cfg.get("ai_system_prompt", "") or "")
+    cfg["ai_persona"] = str(cfg.get("ai_persona", "default") or "default")
+    if cfg["ai_persona"] not in PERSONA_PRESETS and cfg["ai_persona"] != "custom":
+        cfg["ai_persona"] = "default"  # 未知预设 id：回退内置人设
+    cfg["click_through"] = _to_bool(cfg.get("click_through", False))
     cfg["sound_group"] = "custom" if cfg.get("sound_group") == "custom" else "default"
     try:
         bs = cfg.get("bubble_style")
@@ -691,6 +698,81 @@ SYSTEM_PROMPT = (
     "喜欢说：喜欢的，就咬住不放~"
 ) % MAX_REPLY_LEN
 
+# P1-10+：人设预设库——用户可在「AI设置」里换人设，或选「自定义」完全自己写。
+# 注：定义在 load_config 之后但只在其运行时引用（模块加载完成后才调用），无 NameError。
+PERSONA_PRESETS = {
+    "default": SYSTEM_PROMPT,
+    "sheshe": (
+        "你是一只叫「啥子蛇」的蛇系桌宠，本体是绝区零希希芙那种坏蛋蛇。"
+        "自称「本专员」，嘴上冷血毒舌、贪吃耍赖，其实心软护短；经常「嘶~」吐蛇信子。"
+        "把贪吃包装成案件调查（小鱼干失踪案、蛋糕失窃案），把用户称呼为「绳匠」。"
+        "回答必须中文、毒舌又贱萌、不超过%d个字。"
+    ) % MAX_REPLY_LEN,
+    "tsundere": (
+        "你是一只叫大肥鱼的傲娇桌宠，典型傲娇：嘴上嫌弃（才不是关心你呢），"
+        "行为上偷偷护着主人。爱吃小鱼干、爱面子，被戳破心事会「哼！」一声别过头。"
+        "把用户称呼为「绳匠」。回答必须中文、傲娇可爱、不超过%d个字。"
+    ) % MAX_REPLY_LEN,
+}
+
+# P3-3：AI 回复可带出的表情标记（回复开头【xxx】，解析后剥除，不进记忆）
+# 值 = (模式, 表情)：state → _show_state（状态图），emote → _show_emote（程序化表情）
+AI_EMOTE_TAGS = {
+    "happy": ("emote", "heart"),
+    "laugh": ("state", "laugh"),
+    "angry": ("state", "angry"),
+    "blush": ("state", "blush"),
+    "cry": ("state", "cry"),
+    "smug": ("state", "smug"),
+    "puzzled": ("state", "puzzled"),
+    "note": ("emote", "note"),
+    "sparkle": ("emote", "sparkle"),
+}
+
+_EMOTE_INSTRUCTION = (
+    "回复可在开头用【表情】标记当前心情（可选：%s），例如【happy】今天心情不错~；"
+    "不标记也可以。"
+) % "、".join(sorted(AI_EMOTE_TAGS))
+
+
+def parse_emote_tag(text):
+    """P3-3：解析回复开头的【表情】标记。返回 (emote_kind, 剥除后的文本)。
+
+    无合法标记时 emote_kind 为 None、原样返回文本。"""
+    m = re.match(r"^【([^】]+)】\s*(.*)$", text or "")
+    if not m:
+        return None, None, (text or "")
+    tag = m.group(1).strip()
+    pair = AI_EMOTE_TAGS.get(tag)
+    if pair is None:
+        return None, None, (text or "")
+    rest = m.group(2).strip()
+    return pair[0], pair[1], rest
+
+
+# P3-2：闲逛动作目录（名称, 参数, 权重）——_idle_tick 加权随机，右键「动作」点播复用
+# 权重刻意保留「大约 65% 有动作」（与旧 0.35/0.65 节奏相当），新动作从无事占比中拆出
+IDLE_ACTIONS = [
+    ("none", None, 35),        # 安静待着（保持旧节奏）
+    ("emote", "zzz", 30),      # 打盹气泡
+    ("jump", None, 25),        # 原地小跳
+    ("emote", "note", 4),      # 音符
+    ("emote", "sparkle", 3),   # 星光
+    ("emote", "heart", 3),     # 爱心
+]
+
+
+def pick_idle_action(rnd=None):
+    """P3-2：按权重随机挑一个闲逛动作（纯函数，供测试与 _idle_tick 共用）。"""
+    r = (rnd or random.random)()
+    total = sum(w for _, _, w in IDLE_ACTIONS)
+    acc = 0.0
+    for name, arg, w in IDLE_ACTIONS:
+        acc += w / total
+        if r < acc:
+            return name, arg
+    return IDLE_ACTIONS[0][0], IDLE_ACTIONS[0][1]
+
 
 # ---------------- 程序化表情绘制（头顶 emote 与自定义角色状态图共用） ----------------
 def _emote_mark(kind, size):
@@ -806,6 +888,7 @@ def _walk_step(d, cap=None):
 class Signals(QObject):
     reply = Signal(str)
     reply_ok = Signal()  # AI 回复成功（主线程播任务完成音）
+    ai_emote = Signal(str, str)  # P3-3：AI 回复带出表情（mode=state/emote, kind）
     weather = Signal(str)
     weather_done = Signal()
     ai_done = Signal()
@@ -1314,6 +1397,8 @@ class PetWindow(QWidget):
         self.walk_phase = 0
         self._walk_interval = WALK_INTERVAL_MS
         self._wander_target = None
+        self._click_composite = None  # P3-1：点击穿透命中画布（关闭/未启用时 None）
+        self._click_cache_key = None
         self._tween_anim = None
         self._tween_finish_cb = None  # P1-2：当前动画的收尾回调（被顶替时手动执行）
         self._mem_epoch = 0  # P1-6：记忆代次（清理记忆后 +1，在途 AI 回复据此判断是否入记忆）
@@ -1376,6 +1461,7 @@ class PetWindow(QWidget):
         # 跨线程信号
         signals.weather.connect(self.show_bubble)
         signals.reply.connect(self.show_bubble)
+        signals.ai_emote.connect(self._on_ai_emote)  # P3-3：AI 回复带出的表情
         signals.reply_ok.connect(self._on_reply_ok)  # 任务完成音回主线程播
         signals.balance_updated.connect(self._on_balance_updated)
         signals.balance_err.connect(self._on_balance_err)
@@ -1730,6 +1816,15 @@ class PetWindow(QWidget):
         if self.cfg.get("sound", True):
             play_sound("reply")
 
+    def _on_ai_emote(self, mode, kind):
+        """P3-3：AI 回复带出的表情（主线程播放，data 驱动）。busy/睡眠中跳过，避免打断动作。"""
+        if self.busy or self._sleeping or self._petting:
+            return
+        if mode == "state":
+            self._show_state(kind, 2600)
+        else:
+            self._show_emote(kind)
+
     def _mood_emote(self, kind):
         if not self.busy and not self._petting:  # 摸摸头期间抑制 heart 等（S3 修复）
             self._show_emote(kind)
@@ -1863,6 +1958,7 @@ class PetWindow(QWidget):
             self.item.setPos(0, -dy)
         else:
             self.item.setPos(0, 0)
+        self._update_click_mask()  # P3-1：缩放/贴图变化后重建穿透遮罩（关闭时清遮罩，开销可忽略）
 
     def set_scale(self, s):
         self.scale = max(0.2, min(4.0, float(s)))
@@ -2586,7 +2682,13 @@ class PetWindow(QWidget):
             base_url = (self.cfg.get("ai_base_url") or "").strip().rstrip("/")
             url = (base_url + "/chat/completions") if base_url else "https://api.deepseek.com/chat/completions"
             model = (self.cfg.get("ai_model") or "").strip() or "deepseek-chat"
-            sys_prompt = (self.cfg.get("ai_system_prompt") or "").strip() or SYSTEM_PROMPT
+            # P1-10+：人设预设（default/sheshe/tsundere）或用户自定义（custom → ai_system_prompt）
+            persona = self.cfg.get("ai_persona", "default")
+            if persona == "custom":
+                sys_prompt = (self.cfg.get("ai_system_prompt") or "").strip() or SYSTEM_PROMPT
+            else:
+                sys_prompt = PERSONA_PRESETS.get(persona, SYSTEM_PROMPT)
+            sys_prompt = sys_prompt + "\n" + _EMOTE_INSTRUCTION  # P3-3：表情标记指令
             max_tokens = int(self.cfg.get("ai_max_tokens", 60) or 60)
             reply_len = int(self.cfg.get("ai_reply_len", MAX_REPLY_LEN) or MAX_REPLY_LEN)
             rounds = int(self.cfg.get("chat_memory_rounds", 3) or 3)
@@ -2622,8 +2724,14 @@ class PetWindow(QWidget):
             resp.raise_for_status()
             data = resp.json()
             text = data["choices"][0]["message"]["content"].strip().replace("\n", " ")
+            # P3-3：先剥表情标记再截断——截断永远不会切进标记；标记剥除后才展示/入记忆
+            mode, kind, text = parse_emote_tag(text)
+            if mode:
+                signals.ai_emote.emit(mode, kind)
             if len(text) > reply_len:
                 text = text[:reply_len]
+            if not text:
+                text = "…"  # 纯表情回复：气泡兜底
             with self._history_lock:
                 # Key 已被清除 / 记忆被清理（代次变化）时丢弃本次对话记忆，
                 # 清除语义不可被在途请求撤销。
@@ -2695,6 +2803,21 @@ class PetWindow(QWidget):
             signals.balance_err.emit()
 
     # ---------- 定时 / 闲逛 ----------
+    def play_action(self, name, arg=None):
+        """P3-2：按名称点播动作（闲逛加权随机与右键「动作」菜单共用同一实现）。
+
+        与 _idle_tick 同款门控：busy/摸摸头/跟随/散步中不播；睡眠中先醒来再表演。"""
+        if name == "none":
+            return
+        if self.busy or self._petting or self.cfg.get("follow_mouse") or self.cfg.get("wander"):
+            return
+        if self._sleeping:
+            self._wake()
+        if name == "jump":
+            self._do_jump()
+        elif name == "emote":
+            self._show_emote(arg or "note")
+
     def _idle_tick(self):
         if self.busy or self._petting or self.cfg.get("follow_mouse") or self.cfg.get("wander"):
             return  # 摸摸头期间不跳不发 zzz（S3 修复）
@@ -2704,12 +2827,13 @@ class PetWindow(QWidget):
             self._show_sleep()
             self.show_bubble(random.choice(["呼……呼……", "zzZ……睡得好香~", "睡着了……别吵~"]))
             return
-        r = random.random()
-        if r < 0.35:
-            self._show_emote("zzz")
+        # P3-2：加权动作目录替代 0.35/0.65 魔法数（可扩展、可点播，共用 play_action）
+        name, arg = pick_idle_action()
+        if name == "none":
+            return
+        self.play_action(name, arg)
+        if name == "emote" and arg == "zzz":
             self.show_bubble(random.choice(self.lines_pools["idle"] + self.lines_pools["greedy"]))
-        elif r < 0.65:
-            self._do_jump()
 
     def _screen_geo(self, pt):
         """pt 所在屏（间隙/屏外取最近屏）的 availableGeometry；无屏返回 None（调用方守卫）。"""
@@ -2924,6 +3048,11 @@ class PetWindow(QWidget):
         set_menu.addSeparator()
         bubble_style_act = set_menu.addAction("🎨 气泡样式…")
         bubble_style_act.triggered.connect(self._open_bubble_style)
+        # P3-1：透明区点击穿透（只命中身体，默认关闭保持旧行为）
+        ct_act = set_menu.addAction("🖱️ 透明区穿透")
+        ct_act.setCheckable(True)
+        ct_act.setChecked(self.cfg.get("click_through", False))
+        ct_act.toggled.connect(self._set_click_through)
         snd_set = set_menu.addMenu("🎵 音效设置")
         grp_group = QActionGroup(menu)
         grp_group.setExclusive(True)  # 单选互斥：勾选状态不残留
@@ -2959,6 +3088,14 @@ class PetWindow(QWidget):
         clear_logs_act = set_menu.addAction("🧹 清理日志…")  # P2-1：日志/记忆卫生
         clear_logs_act.triggered.connect(self._clear_logs)
         menu.addSeparator()
+
+        # P3-2：右键点播任意动画（与闲逛加权目录共用 play_action）
+        act_menu = menu.addMenu("🎭 动作")
+        jump_act = act_menu.addAction("原地小跳")
+        jump_act.triggered.connect(lambda checked=False: self.play_action("jump"))
+        for _label, _arg in (("打盹 zzz", "zzz"), ("音符", "note"), ("星光", "sparkle"), ("爱心", "heart")):
+            a = act_menu.addAction(_label)
+            a.triggered.connect(lambda checked=False, k=_arg: self.play_action("emote", k))
 
         praise_act = menu.addAction("❤️ 夸夸她")
         praise_act.triggered.connect(lambda checked=False: self.mood.blush())
@@ -3022,6 +3159,75 @@ class PetWindow(QWidget):
     def _set_sound(self, on):
         self.cfg["sound"] = bool(on)
         save_config(self.cfg)
+
+    def _set_click_through(self, on):
+        """P3-1：透明区点击穿透开关（立即生效；命中画布按当前贴图重建）。"""
+        self.cfg["click_through"] = bool(on)
+        save_config(self.cfg)
+        self._update_click_mask()
+
+    def _update_click_mask(self):
+        """P3-1：重建「变换后身体」的逐像素命中画布（与 _apply_transform 严格同变换）。
+
+        不用 setMask：setMask 会按窗口形状裁剪绘制（表情被裁、身体错位）。
+        改为 nativeEvent 里对 WM_NCHITTEST 按本画布 alpha 判定，透明像素返回
+        HTTRANSPARENT（点击落到桌面），身体像素正常——无视觉裁剪、命中与所见一致。
+        关闭时清空画布（缓存键守卫，动画帧高频调用开销可忽略）。"""
+        try:
+            if not self.cfg.get("click_through"):
+                self._click_composite = None
+                self._click_cache_key = None
+                return
+            item = getattr(self, "item", None)
+            pix = item.pixmap() if item is not None else None
+            if pix is None or pix.isNull():
+                self._click_composite = None
+                self._click_cache_key = None
+                return
+            key = (pix.cacheKey(), self.width(), self.height(),
+                   self.scale, self.squash_x, self.squash_y, self.flip, item.pos())
+            if key == getattr(self, "_click_cache_key", None) and self._click_composite is not None:
+                return
+            canvas = QImage(self.width(), self.height(), QImage.Format.Format_ARGB32)
+            canvas.fill(QColor(0, 0, 0, 0))
+            painter = QPainter(canvas)
+            painter.setTransform(item.transform())
+            painter.translate(item.pos())
+            painter.drawPixmap(0, 0, pix)
+            painter.end()
+            self._click_composite = canvas
+            self._click_cache_key = key
+        except Exception as e:
+            _log_error("click composite: %r" % (e,))
+            self._click_composite = None
+
+    def nativeEvent(self, eventType, message):
+        """P3-1：WM_NCHITTEST 逐像素命中判定——命中画布透明处返回 HTTRANSPARENT。
+
+        （无 setMask，渲染不被裁剪；关闭穿透时完全走 Qt 默认路径，行为与旧版一致。）"""
+        try:
+            if eventType != b"windows_generic_MSG" or not self.cfg.get("click_through"):
+                return False, 0
+            canvas = getattr(self, "_click_composite", None)
+            if canvas is None:
+                return False, 0
+            msg = ctypes.wintypes.MSG.from_address(int(message))
+            if int(msg.message) != 0x0084:  # WM_NCHITTEST
+                return False, 0
+            sx = int(msg.lParam) & 0xFFFF
+            sy = (int(msg.lParam) >> 16) & 0xFFFF
+            if sx > 32767:
+                sx -= 65536  # 有符号虚拟屏坐标（多屏负坐标副屏）
+            if sy > 32767:
+                sy -= 65536
+            lp = self.mapFromGlobal(QPoint(sx, sy))
+            if lp.x() < 0 or lp.y() < 0 or lp.x() >= canvas.width() or lp.y() >= canvas.height():
+                return False, 0
+            if canvas.pixelColor(lp.x(), lp.y()).alpha() < 8:
+                return True, -1  # HTTRANSPARENT：点击落到桌面
+        except Exception:
+            pass
+        return False, 0
 
     def _set_autostart(self, on):
         """开机自启开关（默认关闭）：写入/删除 HKCU Run 键。
@@ -3283,7 +3489,12 @@ class PetWindow(QWidget):
     def _about(self):
         box = QMessageBox(self)
         box.setWindowTitle("关于")
-        box.setText("%s v%s\nPySide6 桌宠 · MIT License\n喜欢的，就咬住不放~" % (APP_NAME, VERSION))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText("%s v%s<br>PySide6 桌宠 · MIT License<br>喜欢的，就咬住不放~<br><br>"
+                    "📢 不喜欢新版？怀旧版下载："
+                    "<a href='https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.4.2'>v1.4.2</a> · "
+                    "<a href='https://github.com/xiyan1314/-daifeiyu-desktop-pet/releases/tag/v1.4.1'>v1.4.1</a>"
+                    % (APP_NAME, VERSION))
         box.setWindowFlags(box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         box.show()
         box.raise_()
