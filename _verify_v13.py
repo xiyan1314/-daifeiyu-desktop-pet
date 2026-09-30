@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 
 FAILS = []
 CHECKS = []
-EXPECT_CHECKS = 180  # v2.0.2：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
+EXPECT_CHECKS = 189  # v2.0.3：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
 
 
 def check(name, cond, extra=""):
@@ -857,6 +857,78 @@ def main_flow():
     pet.role_lib.delete("cb1")
     pet.behaviors.delete(_bhv["id"])
 
+    # ---- v2.0.3：角色导出/导入（分享包） ----
+    import pet_export  # noqa: E402
+    _mexp, _eexp = pet_export.build_manifest(
+        {"id": "x1", "name": "x", "file": "a.png", "form": "single",
+         "frames": ["a.png"], "added": ""},
+        [], {"api_key": "TOPSECRET", "voice": {"enabled": True}, "city": "上海"})
+    check("export manifest excludes secrets",
+          _mexp is not None and "TOPSECRET" not in main.json.dumps(_mexp, ensure_ascii=False)
+          and "api_key" not in _mexp["config"] and "voice" in _mexp["config"]
+          and "city" not in _mexp["config"], "err=%r" % (_eexp,))
+    check("export rejects default role",
+          pet_export.export_bundle(pet.role_lib, pet.behaviors, pet.cfg,
+                                   os.path.join(_tmp, "nope.zip"))[0] is False)
+    # 构造可导出角色 + 行为 → 导出 → 导入到本库（真实 handler 数据路径）
+    _exp_dir = os.path.join(_tmp, "roles")
+    os.makedirs(_exp_dir, exist_ok=True)
+    for _fn in ("ex_a.png", "ex_b.png"):
+        make_test_png(os.path.join(_exp_dir, _fn), 96, 96)
+    pet.role_lib._data["roles"].append({
+        "id": "ex1", "name": "导出角色", "file": "ex_a.png",
+        "form": "dual", "file_full": "", "frames": ["ex_a.png"], "added": "",
+        "forms": [{"name": "常态", "file": "ex_a.png"},
+                  {"name": "吃饱", "file": "ex_b.png"}],
+    })
+    pet.role_lib._save()
+    pet.apply_role("ex1")
+    _eb, _ = pet.behaviors.add("bundlebhv", [{"act": "say", "text": "分享行为"}])
+    _zip_path = os.path.join(_tmp, "share.dfypet.zip")
+    _okx, _errx = pet_export.export_bundle(pet.role_lib, pet.behaviors, pet.cfg, _zip_path)
+    check("bundle export ok", _okx, "err=%r" % (_errx,))
+    import zipfile as _zf
+    _namesx = []
+    if _okx:
+        with _zf.ZipFile(_zip_path) as _z:
+            _namesx = _z.namelist()
+    check("bundle contains assets",
+          "manifest.json" in _namesx and any(n.startswith("roles/ex_") for n in _namesx),
+          "names=%r" % (_namesx[:6],))
+    # 导入到本库（新 id 不覆盖）：素材/行为/配置落地
+    _cfg_before = dict(pet.cfg)
+    pet.cfg["api_key"] = "KEEP-SECRET"
+    _resx, _errx = pet_export.import_bundle(pet.role_lib, pet.behaviors, pet.cfg, _zip_path)
+    check("bundle import ok", _resx is not None and not _errx and _resx["role_id"] != "ex1",
+          "err=%r" % (_errx,))
+    if _resx is not None:
+        _r2 = pet.role_lib.get(_resx["role_id"])
+        check("imported role files exist",
+              _r2 is not None and os.path.isfile(pet.role_lib.resolve(_r2["file"])),
+              "file=%r" % (_r2.get("file") if _r2 else None,))
+        check("import applies cfg and keeps secrets",
+              pet.cfg.get("api_key") == "KEEP-SECRET"
+              and any(b["name"] == "bundlebhv" for b in pet.behaviors.list()),
+              "cfg_keys=%r" % (sorted(pet.cfg.keys()),))
+    pet.cfg["api_key"] = _cfg_before.get("api_key", "")
+    # 缺素材包明确拒绝
+    _badzip = os.path.join(_tmp, "bad.dfypet.zip")
+    with _zf.ZipFile(_badzip, "w") as _z:
+        _z.writestr("manifest.json", main.json.dumps(
+            {"format": pet_export.BUNDLE_FORMAT,
+             "role": {"id": "bb", "file": "gone.png"}}, ensure_ascii=False))
+    _rb, _eb2 = pet_export.import_bundle(pet.role_lib, pet.behaviors, pet.cfg, _badzip)
+    check("bundle missing asset rejects", _rb is None and "缺失" in (_eb2 or ""),
+          "err=%r" % (_eb2,))
+    # 清理
+    pet.apply_role("")
+    pet.role_lib.delete("ex1")
+    if _resx is not None:
+        pet.role_lib.delete(_resx["role_id"])
+        for _bid in _resx.get("behavior_map", {}).values():
+            pet.behaviors.delete(_bid)  # 导入的行为副本同样清掉，防脏状态干扰后续检查
+    pet.behaviors.delete(_eb["id"])
+
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
     make_test_wav(wav)
@@ -959,6 +1031,8 @@ def main_flow():
         check("menu resource item", any("资源管理" in t for t in texts))
         check("menu behavior entry", any("行为设置" in t for t in texts))
         check("menu transform hidden default", not any(t == "🐡 变身" for t in texts))
+        check("menu bundle entries", any("导出角色包" in t for t in texts)
+              and any("导入角色包" in t for t in texts))
         check("menu role item", any("角色" in t for t in texts))
         check("menu has size slider", any(isinstance(a, main.QWidgetAction) for a in captured._captured))
         check("menu city item", any("天气城市" in t for t in texts))

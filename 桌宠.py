@@ -31,7 +31,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMenu, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QInputDialog, QMessageBox, QFrame,
-    QSystemTrayIcon, QDialog, QWidgetAction,
+    QSystemTrayIcon, QDialog, QWidgetAction, QFileDialog,
 )
 
 import pet_log
@@ -57,6 +57,7 @@ import pet_ai
 import pet_actions
 import pet_main
 import pet_behaviors
+import pet_export
 
 
 APP_NAME = "大肥鱼桌宠"
@@ -1113,6 +1114,44 @@ class PetWindow(QWidget):
             pet_dialogs.BehaviorDialog(self, self.behaviors, save_config).exec()
         except Exception as e:
             _log_error("behavior dialog: %r" % (e,))
+
+    # ---------- v2.0.3：角色导出/导入（分享包） ----------
+    def _export_role(self):
+        """导出当前自定义角色（素材+行为+可分享配置）为 .dfypet.zip。"""
+        if not self._custom_role:
+            self.show_bubble("默认角色不能导出，先在「角色」里选一个自定义角色吧~")
+            return
+        _path, _f = QFileDialog.getSaveFileName(
+            self, "导出角色包", os.path.join(DATA_DIR, "角色包.dfypet.zip"),
+            "角色包 (*.dfypet.zip)")
+        if not _path:
+            return
+        _ok, _err = pet_export.export_bundle(self.role_lib, self.behaviors, self.cfg, _path)
+        if _ok:
+            self.show_bubble("角色包已导出，可以分享给朋友啦~")
+        else:
+            self.show_bubble("导出失败：%s" % _err)
+
+    def _import_role_bundle(self):
+        """导入角色包：素材/行为/可分享配置落地，缺资源明确提示，成功即切换展示。"""
+        _path, _f = QFileDialog.getOpenFileName(self, "导入角色包", "", "角色包 (*.dfypet.zip)")
+        if not _path:
+            return
+        _res, _err = pet_export.import_bundle(self.role_lib, self.behaviors, self.cfg, _path)
+        if _res is None:
+            self.show_bubble("导入失败：%s" % _err)
+            return
+        save_config(self.cfg)  # 可分享配置（语音开关等）已应用 → 持久化
+        # 立即生效（不必重启）：气泡样式/音效组走现成应用入口
+        if "bubble_style" in self.cfg:
+            self.apply_bubble_style(self.cfg["bubble_style"])
+        if "sound_group" in self.cfg:
+            self._set_sound_group(self.cfg["sound_group"])
+        self.apply_role(_res["role_id"])  # 导入即切换展示
+        _msg = "角色包导入成功！"
+        if _res["warnings"]:
+            _msg += "（%s）" % "；".join(_res["warnings"][:2])
+        self.show_bubble(_msg)
 
     def _compute_base_size(self):
         """P1-7：窗口基准尺寸。旧角色 = 各形态侧图最大尺寸（现行为）；

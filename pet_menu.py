@@ -95,6 +95,11 @@ class MenuBuilder:
         role_menu.addSeparator()
         role_import_act = role_menu.addAction("导入角色…")
         role_import_act.triggered.connect(lambda: pet_dialogs.open_resource_manager(pet, 0))
+        # v2.0.3：角色包导出/导入（分享含素材/行为/可分享配置，敏感键默认不导出）
+        role_export_act = role_menu.addAction("📦 导出角色包…")
+        role_export_act.triggered.connect(lambda checked=False: pet._export_role())
+        bundle_import_act = role_menu.addAction("📦 导入角色包…")
+        bundle_import_act.triggered.connect(lambda checked=False: pet._import_role_bundle())
 
         book_menu = menu.addMenu("💰 记账")
         balance_act = book_menu.addAction("查询余额")
