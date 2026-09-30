@@ -57,7 +57,7 @@ import pet_main
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -615,9 +615,8 @@ class PetWindow(QWidget):
         self._build_sprites()
         self.form = self.form_keys[0]
         self._digest_timer = None
-        # 各形态尺寸可能不同：窗口按较大者定，避免溢出/不居中
-        self.base_w = max(self.sprites[k]["side"].width() for k in self.form_keys)
-        self.base_h = max(self.sprites[k]["side"].height() for k in self.form_keys)
+        # P1-7：各形态尺寸可能不同：窗口按较大者定（v2 角色计入形态 scale），避免溢出/不居中
+        self.base_w, self.base_h = self._compute_base_size()
         self.item.setPixmap(self.sprites[self.form]["front"])
         self._using_front = True
 
@@ -814,12 +813,58 @@ class PetWindow(QWidget):
             self.form_keys = ["normal", "full"]
             self.form_names = {"normal": "常态", "full": "吃饱"}
 
+    # ---------- P1-7：形态渲染参数 / 动画查表 ----------
+    def _role_render_params(self):
+        """逐形态渲染参数（与 form_keys 对齐）：[{"anchor": (x, y), "scale": s|None,
+        "offset": (x, y)}, ...]；纯计算用 pet_resources.form_render 同一口径。
+        仅新结构（v2）角色调用。"""
+        if not self._custom_role or not self.role_lib:
+            return None
+        rid = self.cfg.get("role", "")
+        role = self.role_lib.get(rid) or {}
+        out = []
+        for i in range(len(self._role_metas or [])):
+            out.append(pet_resources.form_render(role, i))
+        return out
+
+    def _cur_form_anim(self):
+        """P1-7：当前形态的动画元信息 {"idle": [...], "eat": [...], "interval_ms": N|None}；
+        默认角色/无动画返回 {}。"""
+        if not self._custom_role:
+            return {}
+        idx = self.form_keys.index(self.form) if self.form in self.form_keys else 0
+        anims = self._role_anims or []
+        return anims[idx] if 0 <= idx < len(anims) else {}
+
+    def _compute_base_size(self):
+        """P1-7：窗口基准尺寸。旧角色 = 各形态侧图最大尺寸（现行为）；
+        v2 角色 = 各形态 (宽×形态scale, 高×形态scale) 的最大值，保证
+        anchor 对齐在窗口坐标系里一致。"""
+        if self._role_render:
+            sizes = []
+            for k, rp in zip(self.form_keys, self._role_render):
+                sp = self.sprites[k]["side"]
+                fs = rp["scale"] or 1.0
+                sizes.append((max(1, int(round(sp.width() * fs))),
+                              max(1, int(round(sp.height() * fs)))))
+            return max(s[0] for s in sizes), max(s[1] for s in sizes)
+        return (max(self.sprites[k]["side"].width() for k in self.form_keys),
+                max(self.sprites[k]["side"].height() for k in self.form_keys))
+
     def _build_sprites(self):
         role_pix = self._role_pix()
         if role_pix is not None:
             self._custom_role = True
+            rid = self.cfg.get("role", "")
             # M2：用 form_paths（与 form_metas 逐项对齐）装配，保证 form_keys 与 sprites 键集一致
-            paths = self.role_lib.form_paths(self.cfg.get("role", ""))
+            paths = self.role_lib.form_paths(rid)
+            # P1-7 断点#7 side/front：forms[i].front 可选正面图，缺省与 side 同图
+            front_paths = self.role_lib.form_front_paths(rid)
+            # P1-7：形态元信息（渲染参数）与逐形态动画帧（与 form_keys 对齐，
+            # 供 _apply_transform 装配与 _wire_anim_sets 按「形态×动作」查表）
+            self._role_metas = self.role_lib.form_metas(rid)
+            self._role_anims = self.role_lib.form_animations(rid)
+            self._role_render = self._role_render_params() if self.role_lib.is_v2(rid) else None
             if not paths:
                 paths = [None]  # 兜底：全部形态缺失时退化成单形态 base
             self.sprites = {}
@@ -828,10 +873,22 @@ class PetWindow(QWidget):
                     pix = self._cap_role_pix(QPixmap(p), p) or role_pix
                 else:
                     pix = role_pix  # 该形态文件缺失：回退 base，键集仍完整
-                self.sprites["f%d" % i] = {"side": pix, "front": pix}
+                front_pix = pix
+                if i < len(front_paths) and front_paths[i]:
+                    try:
+                        fp = self._cap_role_pix(QPixmap(front_paths[i]), front_paths[i])
+                        if fp is not None and not fp.isNull():
+                            front_pix = fp
+                    except Exception:
+                        pass  # 有意忽略：front 图加载失败回退 side（缺省行为）
+                self.sprites["f%d" % i] = {"side": pix, "front": front_pix}
             self._build_form_meta()
             return
         self._custom_role = False
+        # P1-7：回默认角色时清空自定义角色的逐形态元信息（防旧值泄漏）
+        self._role_metas = []
+        self._role_anims = []
+        self._role_render = None
         normal_side = self._load_img(["character.png", "assets/character.png"]) or self._fallback_pix()
         normal_front = self._load_img(["character_front.png", "assets/character_front.png"]) or normal_side
         full_side = self._load_img(["character_full.png", "assets/character_full.png"]) or normal_side
@@ -848,6 +905,10 @@ class PetWindow(QWidget):
         防状态图生成时的内存峰值（v1.3.0 旧角色可能 2048px+，10 状态 × 2 形态
         每张全尺寸副本可达数百 MB）。为防升级后桌宠窗口突然缩小，对超大素材
         一次性按比例补偿 cfg scale 并落盘（标记键防重复补偿）。
+
+        P1-7 断点#11：全局 scale 补偿是旧角色兼容路径——新结构角色（v2，
+        带 anchor/scale/offset/front/states 等）跳过补偿，仅截断尺寸，
+        渲染交给 anchor/scale/offset 正常装配。
         """
         if pix is None or pix.isNull():
             return pix
@@ -857,7 +918,8 @@ class PetWindow(QWidget):
         try:
             # 标记按角色 id 记：多形态角色各形态都超大时只补偿一次（L1）
             mark = self.cfg.get("role", "")
-            if path and self.cfg.get("scale_compensated_role") != mark:
+            v2 = bool(mark) and self.role_lib and self.role_lib.is_v2(mark)
+            if path and not v2 and self.cfg.get("scale_compensated_role") != mark:
                 factor = min(max(w, h) / 512.0, 4.0 / max(self.cfg.get("scale", 1.0), 0.2))
                 self.cfg["scale"] = min(4.0, round(self.cfg.get("scale", 1.0) * factor, 2))
                 self.cfg["scale_compensated_role"] = mark
@@ -884,6 +946,23 @@ class PetWindow(QWidget):
             _log_error("_role_pix: %r" % (e,))
             return None
 
+    def _pix_frames(self, paths):
+        """P1-7：动画帧路径列表 → [QPixmap]（经 _cap_role_pix 统一尺寸口径）。
+
+        任一帧加载失败返回 []（整动作回退静态，不播残缺动画）。"""
+        if not paths:
+            return []
+        frames = []
+        try:
+            for p in paths:
+                pix = QPixmap(p)
+                if pix.isNull():
+                    return []
+                frames.append(self._cap_role_pix(pix, p))
+        except Exception:
+            return []
+        return frames
+
     def _role_frames(self):
         """自定义角色的动画帧 [QPixmap]；无帧动画角色返回 []。"""
         rid = self.cfg.get("role", "")
@@ -904,9 +983,25 @@ class PetWindow(QWidget):
     def _wire_anim_sets(self):
         """把当前角色对应的帧集注册进 FrameAnim（init 与角色切换共用）。
 
-        自定义角色有帧素材 → idle 集用角色帧；默认角色用内置 idle 帧。
-        eat 集仅默认角色注册（自定义角色吃帧走 squash 路径）。
+        P1-7：自定义角色按「形态×动作」查表（forms[i].animations.{idle,eat,poke,sleep}，
+        RoleLibrary.form_animations 已解析为绝对路径）；旧角色级 frames 已由
+        RoleLibrary._load 迁移为 forms[0].animations.idle（兼容路径，行为不变）。
+        默认角色用内置 idle 帧；eat 集仅默认角色注册（自定义角色吃帧按形态查表）。
         """
+        if self._custom_role:
+            cur = self._cur_form_anim()
+            # S1 修复：form_animations 返回的是绝对路径，必须转 QPixmap 再进 FrameAnim；
+            # 任一帧损坏 → 整动作空集（回退静态），与 form_animations 的 isfile 语义一致
+            idle = self._pix_frames(cur.get("idle") or [])
+            eat = self._pix_frames(cur.get("eat") or [])
+            poke = self._pix_frames(cur.get("poke") or [])
+            sleep = self._pix_frames(cur.get("sleep") or [])
+            self.has_frames = bool(idle)
+            self.anim.add_set("idle", idle)
+            self.anim.add_set("eat", eat)
+            self.anim.add_set("poke", poke)
+            self.anim.add_set("sleep", sleep)
+            return
         role_frames = self._role_frames() if self._custom_role else []
         self.has_frames = bool(role_frames) or (bool(self._idle_frames) and not self._custom_role)
         if self.has_frames:
@@ -929,9 +1024,8 @@ class PetWindow(QWidget):
             self._digest_timer.stop()  # 切换角色：作废旧角色的消化定时器（L1）
         self._build_sprites()
         self._build_state_pix()  # 自定义角色：程序化表情图随底图重建
-        # 各形态尺寸可能不同：窗口按较大者定，避免溢出/不居中
-        self.base_w = max(self.sprites[k]["side"].width() for k in self.form_keys)
-        self.base_h = max(self.sprites[k]["side"].height() for k in self.form_keys)
+        # P1-7：各形态尺寸可能不同：窗口按较大者定（v2 角色计入形态 scale），避免溢出/不居中
+        self.base_w, self.base_h = self._compute_base_size()
         if self.form not in self.sprites:
             self.form = self.form_keys[0]  # 角色形态数变少：回第一形态
         self._wire_anim_sets()
@@ -952,7 +1046,8 @@ class PetWindow(QWidget):
     # ---------- 阶段1：帧动画与状态 ----------
     def _on_frame_changed(self, _idx):
         # 帧下标由信号携带，但直接以 current() 为唯一取帧入口（单一事实来源）
-        if self.anim_mode in ("idle", "eat"):
+        # P1-7：state/sleep 也纳入（poke 动画/睡眠动画走帧播放；静态展示时 anim 已停不发帧）
+        if self.anim_mode in ("idle", "eat", "state", "sleep"):
             pix = self.anim.current()
             if pix is not None and not pix.isNull():
                 self.item.setPixmap(pix)
@@ -960,18 +1055,26 @@ class PetWindow(QWidget):
     def _play_idle(self):
         self._sleeping = False
         self._cur_state = None  # 离开表情/睡眠展示
-        if self.form != self.form_keys[0]:
-            # 非首形态待机显示该形态静态图（吃帧/待机帧都是首形态形象，会顶掉当前形态）
+        if self._custom_role:
+            self._wire_anim_sets()  # P1-7：待机前按当前形态重查「形态×动作」帧集
+        idle_frames = self.anim._sets.get("idle") or []
+        # P1-7：帧间隔——自定义角色 forms[i].anim_interval_ms 优先，缺省沿用 IDLE_FRAME_MS
+        interval = IDLE_FRAME_MS
+        if self._custom_role:
+            interval = self._cur_form_anim().get("interval_ms") or IDLE_FRAME_MS
+        if self.form != self.form_keys[0] and not idle_frames:
+            # 非首形态且该形态无待机帧：显示该形态静态图（P1-7 之前非首形态永远静态；
+            # 现在 forms[i].animations.idle 存在时走下方帧动画分支）
             if self.anim_mode != "form_idle":
                 self.anim.stop()
                 self.anim_mode = "form_idle"
             # H1：setPixmap 必须在守卫外——f1→f2 时 anim_mode 已是 form_idle，否则旧形态滞留
             self.item.setPixmap(self.sprites[self.form]["side"])
             self._using_front = False
-        elif self.has_frames:
+        elif idle_frames:
             if self.anim_mode != "idle":
                 self.anim_mode = "idle"
-                self.anim.play("idle", IDLE_FRAME_MS, loops=-1)
+                self.anim.play("idle", interval, loops=-1)
         else:
             if self.anim_mode != "idle":
                 self.anim.stop()
@@ -987,8 +1090,12 @@ class PetWindow(QWidget):
 
     def _play_eat(self):
         self.anim_mode = "eat"
-        # 若 "eat" 帧集未注册，play() 会立即回调 on_finish 并返回 False，无需兜底分支
-        self.anim.play("eat", EAT_FRAME_MS, loops=2, on_finish=self._eat_done)
+        # P1-7：帧间隔——自定义角色 forms[i].anim_interval_ms 优先，缺省沿用 EAT_FRAME_MS
+        interval = EAT_FRAME_MS
+        if self._custom_role:
+            interval = self._cur_form_anim().get("interval_ms") or EAT_FRAME_MS
+        # 若 "eat" 帧集未注册（空集），play() 会立即回调 on_finish 并返回 False，无需兜底分支
+        self.anim.play("eat", interval, loops=2, on_finish=self._eat_done)
 
     def _eat_done(self, _name):
         self.busy = False
@@ -998,13 +1105,24 @@ class PetWindow(QWidget):
     FULL_STATE_ALIAS = {"hiss": "angry", "drool": "laugh", "surprised": "puzzled"}
 
     def _build_state_pix(self):
-        """构建状态图：默认角色加载内置表情素材；自定义角色生成程序化表情图。"""
+        """构建状态图：默认角色加载内置表情素材；自定义角色生成程序化表情图。
+
+        P2-5 状态图优先级（P1-7 可选状态图，本方法与 _custom_state_pix 为合并点）：
+        1) forms[i].states[state] 资源图（用户配置，优先）；
+        2) 程序化叠图 _make_custom_state_pix 兜底（未配置/加载失败时，向后兼容）。
+        吃饱版缺图回退常态版同名的 R2-5 语义仍在 _state_pix 的 alias 逻辑里保留。
+        """
         names = tuple(_STATE_MARK_MAP)  # 状态名单一来源，避免双处维护
         if self._custom_role:
             self.state_pix = {}
-            for k in self.form_keys:
+            rid = self.cfg.get("role", "")
+            states_paths = self.role_lib.form_state_paths(rid) if self.role_lib else []
+            for i, k in enumerate(self.form_keys):
                 base = self.sprites[k]["side"]
-                self.state_pix[k] = {s: _make_custom_state_pix(base, s) for s in names}
+                res = states_paths[i] if i < len(states_paths) else {}
+                self.state_pix[k] = {
+                    s: self._custom_state_pix(res.get(s), base, s) for s in names
+                }
             return
         self.state_pix = {"normal": {}, "full": {}}
         for form in ("normal", "full"):
@@ -1012,6 +1130,18 @@ class PetWindow(QWidget):
                 pix = self._load_img(["assets/%s_%s.png" % (form[0], s)])
                 if pix is not None:
                     self.state_pix[form][s] = pix
+
+    def _custom_state_pix(self, res_path, base, state):
+        """P2-5 状态图合并点：资源图（forms[i].states[state]）优先；
+        缺失/加载失败 → 程序化叠图 _make_custom_state_pix 兜底（向后兼容）。"""
+        if res_path:
+            try:
+                pix = QPixmap(res_path)
+                if not pix.isNull():
+                    return self._cap_role_pix(pix, res_path) or pix
+            except Exception:
+                pass  # 有意忽略：资源图加载失败走程序化叠图兜底
+        return _make_custom_state_pix(base, state)
 
     def _state_pix(self, state):
         pix = self.state_pix.get(self.form, {}).get(state)
@@ -1023,7 +1153,20 @@ class PetWindow(QWidget):
             pix = self.state_pix.get(self.form_keys[0], {}).get(state)
         return pix
 
+    POKE_STATES = ("puzzled", "angry", "hiss")
+
     def _show_state(self, state, duration_ms=STATE_DURATION_MS):
+        # P1-7：戳戳状态优先播「poke 动画帧」（一次），无配置则回退静态状态图
+        if state in self.POKE_STATES and self._custom_role:
+            poke_frames = self.anim._sets.get("poke") or []
+            if poke_frames:
+                self.anim.stop()
+                self.anim_mode = "state"
+                self._cur_state = state
+                self._state_timer.stop()
+                interval = self._cur_form_anim().get("interval_ms") or EAT_FRAME_MS
+                self.anim.play("poke", interval, loops=1, on_finish=self._state_done)
+                return
         pix = self._state_pix(state)
         if pix is None:
             _log_error("state image missing: %s" % state)
@@ -1044,9 +1187,15 @@ class PetWindow(QWidget):
         self.anim_mode = "sleep"
         self._cur_state = "sleep"
         self._sleeping = True
-        pix = self._state_pix("sleep")
-        if pix is not None:
-            self.item.setPixmap(pix)
+        # P1-7：睡眠优先播「sleep 动画帧」（循环），无配置回退静态睡眠图
+        sleep_frames = (self.anim._sets.get("sleep") or []) if self._custom_role else []
+        if sleep_frames:
+            interval = self._cur_form_anim().get("interval_ms") or IDLE_FRAME_MS
+            self.anim.play("sleep", interval, loops=-1)
+        else:
+            pix = self._state_pix("sleep")
+            if pix is not None:
+                self.item.setPixmap(pix)
         self._show_emote("zzz")
 
     def _wake(self):
@@ -1204,9 +1353,28 @@ class PetWindow(QWidget):
         w = self.width()
         h = self.height()
         t = QTransform()
-        t.translate(w / 2.0, h / 2.0)
-        t.scale(sx, sy)
-        t.translate(-self.base_w / 2.0, -self.base_h / 2.0)
+        # P1-7 断点#11：新结构角色按形态渲染参数（anchor/scale/offset）装配，
+        # 解决多形态切换跳变；旧角色走原变换（行为完全不变）
+        render = self._role_render[self.form_keys.index(self.form)]             if (self._role_render and self.form in self.form_keys) else None
+        if render is not None:
+            ax, ay = render["anchor"]
+            fs = render["scale"] or 1.0
+            ox, oy = render["offset"]
+            sx *= fs
+            sy *= fs
+            # 锚点取当前贴图自身尺寸（状态图/动画帧尺寸可能与底图不同，仍按锚点对齐）
+            pm = self.item.pixmap()
+            if pm is None or pm.isNull():
+                pw, ph = self.sprites[self.form]["side"].width(), self.sprites[self.form]["side"].height()
+            else:
+                pw, ph = pm.width(), pm.height()
+            t.translate(w / 2.0 + ox * self.scale, h / 2.0 + oy * self.scale)
+            t.scale(sx, sy)
+            t.translate(-pw * ax, -ph * ay)
+        else:
+            t.translate(w / 2.0, h / 2.0)
+            t.scale(sx, sy)
+            t.translate(-self.base_w / 2.0, -self.base_h / 2.0)
         self.item.setTransform(t)
         if getattr(self, "_anchor_bottom", False):
             dy = self.base_h * self.scale * (self.squash_y - 1.0) / 2.0
@@ -1492,6 +1660,14 @@ class PetWindow(QWidget):
         if form == self.form:
             return  # 同形态重选：什么都不做，避免待机动画重启造成的帧跳/卡顿
         self.form = form
+        if self._custom_role:
+            # P1-7：形态切换后帧集按「形态×动作」重查；若正在播待机帧，
+            # 先停掉旧帧引用（FrameAnim 正在播放的帧集是旧列表），
+            # 让 refresh 分支的 _play_idle 用新帧集重启
+            self._wire_anim_sets()
+            if self.anim_mode == "idle":
+                self.anim.stop()
+                self.anim_mode = "form_idle"
         if refresh:
             if self.anim_mode in ("idle", "form_idle"):
                 self._play_idle()

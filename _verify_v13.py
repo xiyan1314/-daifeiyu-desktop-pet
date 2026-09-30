@@ -271,9 +271,11 @@ def main_flow():
         lib3 = main.pet_resources.RoleLibrary(_tmp)
         check("reload keeps frames", len(lib3.frames_for(frole["id"])) == 3)
         pet.apply_role(frole["id"])
+        # S1 回归：_wire_anim_sets 注册的必须是 QPixmap 帧集（曾误传路径字符串致帧动画全灭）
+        _idle_set = pet.anim._sets.get("idle") or []
         check("frames role animates", pet._custom_role and pet.has_frames
-              and pet.anim._sets.get("idle") is not None
-              and len(pet.anim._sets["idle"]) == 3)
+              and len(_idle_set) == 3
+              and all(isinstance(f, main.QPixmap) and not f.isNull() for f in _idle_set))
         # 中-4：帧动画角色 × 程序化表情组合（状态结束/唤醒后恢复帧循环）
         pet._show_state("cry", 100)
         check("frames role state shown", pet.anim_mode == "state"

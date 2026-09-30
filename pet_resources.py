@@ -18,8 +18,16 @@
     path_for_full(role_id) -> str|None                     # 吃饱形态 png；单形态返回 None
     import_file(src, name=None) -> (role|None, err|None)   # 旧版单图导入（v1.3.0 兼容，单形态）
     import_processed(base_src, full_src=None, name=None,  # 单/双形态导入（面板新入口）
-                      frames_src=None)                      #   full_src=None → form="single"；
-                                                           #   frames_src=2~24 帧 → 帧动画角色
+                      frames_src=None,                     #   full_src=None → form="single"；
+                      forms_src=None,                      #   frames_src=2~24 帧 → 帧动画角色
+                      interval_ms=None, render=None,       # P1-7 新参数（全可选，旧调用兼容）
+                      states=None, keep_source=False,      #   render={anchor/scale/offset}、
+                      source_files=None)                   #   states={状态:png}、原图保留 source/
+    update(role_id, patch) -> (bool, str)                  # P1-7 就地编辑（改名/换图/调序/渲染
+                                                           #   参数/动画/状态图，id 不变，只改索引）
+    form_animations(role_id) -> [{idle/eat/poke/sleep+interval_ms}...]  # P1-7 逐形态动画路径
+    form_state_paths(role_id) / form_front_paths(role_id)  # P1-7 状态资源图/front 路径（逐形态对齐）
+    is_v2(role_id) -> bool                                 # P1-7 新结构角色标记
     delete(role_id) -> (bool, str)                         # 删全部素材文件+索引；active 则重置 ""
     get(role_id) -> dict|None
 - class AudioLibrary(data_dir)
@@ -61,7 +69,116 @@ import pet_log
 
 # P3-5+：帧动画上限（读侧与导入管线共用；由 桌宠 启动时按 cfg["role_frame_max"] 同步，
 # 用户可在「设置… → 帧数上限…」里改，范围 2~60）
+# P1-7：上限同样作用于每个动画动作（animations 各动作读侧截断与导入/编辑拒绝）
 FRAME_MAX = 24
+
+# P1-7：动画动作全集（forms[i].animations 的合法键；帧动画播放按「形态×动作」查表）
+ANIM_ACTIONS = ("idle", "eat", "poke", "sleep")
+
+# P1-7：状态名全集（forms[i].states 资源图合法键；与 pet_widgets._STATE_MARK_MAP
+# 同源——未配置的状态走程序化叠图兜底，向后兼容）。pet_resources 保持 Qt-free，
+# 故状态名在此以常量维护，桌宠/测试引用同一口径。
+STATE_NAMES = ("sleep", "puzzled", "angry", "hiss", "cry",
+               "laugh", "smug", "surprised", "drool", "blush")
+
+# P1-7：形态渲染参数默认值（anchor 缺省 0.5/0.5 = 旧版居中行为；scale 缺省 None
+# = 不额外缩放；offset 缺省 (0, 0)）
+DEFAULT_ANCHOR = {"x": 0.5, "y": 0.5}
+
+
+def _clamp01(v, default=0.5):
+    """数值夹到 0~1；非数值给 default。"""
+    try:
+        return min(1.0, max(0.0, float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _norm_anchor(v):
+    """P1-7：anchor 归一化 {"x","y"}（0~1 相对锚点）；非法输入回默认 (0.5, 0.5)。"""
+    if isinstance(v, dict):
+        return {"x": _clamp01(v.get("x"), 0.5), "y": _clamp01(v.get("y"), 0.5)}
+    return dict(DEFAULT_ANCHOR)
+
+
+def _norm_offset(v):
+    """P1-7：offset 归一化 {"x","y"}（px 整数）；非法输入回 (0, 0)。"""
+    out = {"x": 0, "y": 0}
+    if isinstance(v, dict):
+        for k in ("x", "y"):
+            try:
+                out[k] = int(round(float(v.get(k, 0))))
+            except (TypeError, ValueError):
+                out[k] = 0
+    return out
+
+
+def _norm_animations(v):
+    """P1-7：animations 归一化 dict[str, list[str]]（每动作 png 文件名列表）。
+
+    非法结构丢弃；每个动作的帧数截断到 FRAME_MAX（读侧上限，与导入拒绝同口径）。
+    """
+    if not isinstance(v, dict):
+        return {}
+    out = {}
+    for act in ANIM_ACTIONS:
+        lst = v.get(act)
+        if not isinstance(lst, list):
+            continue
+        files = [str(x) for x in lst if str(x).lower().endswith(".png")][:FRAME_MAX]
+        if files:
+            out[act] = files
+    return out
+
+
+def _norm_states(v):
+    """P1-7：states 归一化 {状态名: png 文件名}；未在 STATE_NAMES 的键丢弃。"""
+    if not isinstance(v, dict):
+        return {}
+    out = {}
+    for k, val in v.items():
+        if k in STATE_NAMES and isinstance(val, str) and val.lower().endswith(".png"):
+            out[k] = val
+    return out
+
+
+def animation_frames(role, form_idx=0, action="idle"):
+    """P1-7 纯函数：按「形态×动作」查动画帧文件名（读侧视角，不含文件 IO）。
+
+    role 为归一化角色 dict（RoleLibrary.get / list_roles 返回）；
+    form_idx 越界或该形态未配置该动作返回 []。
+    """
+    forms = role.get("forms") or []
+    if not (isinstance(form_idx, int) and 0 <= form_idx < len(forms)):
+        return []
+    return list((forms[form_idx].get("animations") or {}).get(action, []) or [])
+
+
+def form_render(role, form_idx=0):
+    """P1-7 纯函数：形态渲染参数（含默认值）。
+
+    返回 {"anchor": (x, y), "scale": float|None, "offset": (x, y)}；
+    缺省 = 旧行为（居中、不额外缩放、无位移）。form_idx 越界返回默认值。
+    """
+    forms = role.get("forms") or []
+    fm = forms[form_idx] if (isinstance(form_idx, int) and 0 <= form_idx < len(forms)) else {}
+    anchor = _norm_anchor(fm.get("anchor"))
+    sc = fm.get("scale")
+    scale = float(sc) if isinstance(sc, (int, float)) and sc > 0 else None
+    off = _norm_offset(fm.get("offset"))
+    return {"anchor": (anchor["x"], anchor["y"]), "scale": scale, "offset": (off["x"], off["y"])}
+
+
+def state_resource(role, form_idx, state):
+    """P1-7 纯函数：forms[form_idx].states[state] 文件名（资源图优先查询）；无返回 None。
+
+    显示侧优先级（P2-5）：资源图 → 程序化叠图；本函数只负责资源图查表，
+    兜底叠图在 桌宠._build_state_pix 合并处实现。
+    """
+    forms = role.get("forms") or []
+    if not (isinstance(form_idx, int) and 0 <= form_idx < len(forms)):
+        return None
+    return (forms[form_idx].get("states") or {}).get(state)
 
 # ---------------- 通用 IO 助手（原子替换，降级不抛） ----------------
 def _read_json(path, factory=dict):
@@ -156,58 +273,143 @@ class RoleLibrary:
         self._load()
 
     # ---------- 内部 ----------
+    @staticmethod
+    def _normalize_form(fm, fallback_name):
+        """P1-7：单个形态归一化。返回 dict 或 None（无有效 png 文件）。
+
+        结构（file 即 still 图，保留历史字段名；其余键可选）：
+        {"name", "file", "front"?, "anchor", "scale"?, "offset"?,
+         "animations"?, "anim_interval_ms"?, "states"?}
+        """
+        if not isinstance(fm, dict):
+            return None
+        fn = str(fm.get("file") or "")
+        if not fn.lower().endswith(".png"):
+            return None
+        out = {
+            "name": str(fm.get("name") or "").strip()[:12] or fallback_name,
+            "file": fn,
+        }
+        # P1-7 断点#7 side/front：可选正面图，缺省沿用现状（side/front 同图）
+        front = str(fm.get("front") or "")
+        if front and front.lower().endswith(".png"):
+            out["front"] = front
+        # P1-7 形态渲染参数：anchor 常驻（默认 0.5/0.5 = 旧居中行为）；
+        # scale/offset 仅在显式配置时落盘（缺省 = 现行为等价）
+        out["anchor"] = _norm_anchor(fm.get("anchor"))
+        sc = fm.get("scale")
+        if isinstance(sc, (int, float)) and sc > 0:
+            out["scale"] = float(sc)
+        off = _norm_offset(fm.get("offset"))
+        if off["x"] or off["y"]:
+            out["offset"] = off
+        # P1-7 动画按形态分组：dict[str, list[str]]；每动作截断 FRAME_MAX
+        anims = _norm_animations(fm.get("animations"))
+        if anims:
+            out["animations"] = anims
+        # P1-7 帧间隔：可选全局间隔（缺省沿用 IDLE_FRAME_MS/EAT_FRAME_MS）
+        aiv = fm.get("anim_interval_ms")
+        if isinstance(aiv, (int, float)) and aiv > 0:
+            out["anim_interval_ms"] = int(aiv)
+        # P1-7 可选状态图：资源图优先、程序化叠图兜底（P2-5 合并点在显示侧）
+        states = _norm_states(fm.get("states"))
+        if states:
+            out["states"] = states
+        return out
+
+    def _normalize_role(self, r):
+        """P1-7：角色记录归一化（旧 file/file_full/frames → 新 forms 结构 + 兼容字段）。
+
+        返回 dict 或 None（非法条目：无 id / 无有效 png）。迁移规则：
+        - 旧角色级 frames 升级为 forms[0].animations.idle（若 forms[0] 已有
+          显式 animations.idle 则以新结构为准）；
+        - 旧 forms[].file 保留为 still 字段名（file 即 still，结构统一）；
+        - 顶层 file/frames 保留为兼容视图（file=forms[0].file，
+          frames=forms[0].animations.idle，v13/老调用方依赖）。
+        """
+        if not isinstance(r, dict):
+            return None
+        rid = str(r.get("id") or "")
+        fname = str(r.get("file") or "")
+        # 过滤非法条目：无 id / 无文件名 / 非 .png（否则 delete 会误删目录）
+        if not rid or not fname or not fname.lower().endswith(".png"):
+            return None
+        file_full = str(r.get("file_full") or "")
+        # form 归一化：只有带 file_full 的 dual 才算双形态；multi 需 ≥2 形态，
+        # 否则自愈回退 single（M2 修复：损坏/半截数据不留 form 与内容不一致）
+        form_raw = str(r.get("form") or "")
+        if form_raw in ("single", "dual", "multi"):
+            form = form_raw
+        else:
+            form = "dual" if file_full else "single"
+        raw_forms = r.get("forms")
+        if form == "dual" and not file_full:
+            form = "single"
+        if form == "multi" and (not isinstance(raw_forms, list) or len(raw_forms) < 2):
+            form = "single"
+        frames = r.get("frames")
+        if not isinstance(frames, list):
+            frames = []
+        # P3-5+：读侧上限与导入管线口径统一（上限由用户配置 role_frame_max，
+        # 见模块级 FRAME_MAX，桌宠启动时同步），避免「能存读不全」
+        frames = [str(x) for x in frames if str(x).lower().endswith(".png")][:FRAME_MAX]
+        # forms 归一化（v1.4 多形态 + P1-7 渲染/动画/状态字段）：
+        # 新结构直接采用；旧 file/file_full 自动转换
+        raw_forms = r.get("forms")
+        if isinstance(raw_forms, list) and raw_forms:
+            forms = []
+            for fm in raw_forms[:8]:
+                nf = self._normalize_form(fm, "形态%d" % (len(forms) + 1))
+                if nf is not None:
+                    forms.append(nf)
+            if not forms:
+                forms = [self._normalize_form({"name": "常态", "file": fname}, "常态")]
+        else:
+            forms = [self._normalize_form({"name": "常态", "file": fname}, "常态")]
+            if file_full:
+                nf2 = self._normalize_form({"name": "吃饱", "file": file_full}, "吃饱")
+                if nf2 is not None:
+                    forms.append(nf2)
+        # P1-7 迁移：旧角色级 frames → forms[0].animations.idle
+        # （forms[0] 已有显式 animations.idle 时以新结构为准，旧字段仅兜底）
+        if frames:
+            anims = dict(forms[0].get("animations") or {})
+            anims.setdefault("idle", frames)
+            forms[0]["animations"] = anims
+        # 兼容视图：顶层 frames = forms[0].animations.idle（v13/旧调用方依赖）
+        idle_view = list((forms[0].get("animations") or {}).get("idle") or [])
+        # P1-7：v2 标记——任一形态带新渲染参数（front/scale/offset/states/
+        # anim_interval_ms/非默认 anchor/非 idle 动画动作）即为新结构角色；
+        # 桌宠据此区分「旧角色全局 scale 补偿」与「新角色 anchor/scale/offset 装配」。
+        # 注意：仅 idle 动画不算 v2（旧角色级 frames 迁移也落 idle，需保持旧补偿路径）
+        v2 = any(
+            ("front" in fm) or ("scale" in fm) or ("offset" in fm)
+            or ("states" in fm) or ("anim_interval_ms" in fm)
+            or (fm.get("anchor") != DEFAULT_ANCHOR)
+            or (set(fm.get("animations") or {}) - {"idle"})
+            for fm in forms
+        )
+        return {
+            "id": rid,
+            "name": str(r.get("name") or "") or "未命名",
+            "file": forms[0]["file"],
+            "form": form,
+            "file_full": (forms[1]["file"] if len(forms) >= 2 else ""),
+            "forms": forms,
+            "frames": idle_view,
+            "added": str(r.get("added") or ""),
+            "v2": bool(v2),
+        }
+
     def _load(self):
         """读索引并归一化；active 指向已不存在的角色时重置为默认。"""
         data = _read_json(self._index)
         roles = data.get("roles") if isinstance(data.get("roles"), list) else []
         clean = []
         for r in roles:
-            if not isinstance(r, dict):
-                continue
-            rid = str(r.get("id") or "")
-            fname = str(r.get("file") or "")
-            # 过滤非法条目：无 id / 无文件名 / 非 .png（否则 delete 会误删目录）
-            if not rid or not fname or not fname.lower().endswith(".png"):
-                continue
-            file_full = str(r.get("file_full") or "")
-            # form 归一化：只有带 file_full 的 dual 才算双形态，其余一律 single
-            form = "dual" if (str(r.get("form") or "") == "dual" and file_full) else "single"
-            frames = r.get("frames")
-            if not isinstance(frames, list):
-                frames = []
-            # P3-5+：读侧上限与导入管线口径统一（上限由用户配置 role_frame_max，
-            # 见模块级 FRAME_MAX，桌宠启动时同步），避免「能存读不全」
-            frames = [str(x) for x in frames if str(x).lower().endswith(".png")][:FRAME_MAX]
-            # forms 归一化（v1.4 多形态）：新结构直接采用；旧 file/file_full 自动转换
-            raw_forms = r.get("forms")
-            if isinstance(raw_forms, list) and raw_forms:
-                forms = []
-                for fm in raw_forms[:8]:
-                    if not isinstance(fm, dict):
-                        continue
-                    fn = str(fm.get("file") or "")
-                    if not fn.lower().endswith(".png"):
-                        continue
-                    forms.append({
-                        "name": str(fm.get("name") or "").strip()[:12] or "形态%d" % (len(forms) + 1),
-                        "file": fn,
-                    })
-                if not forms:
-                    forms = [{"name": "常态", "file": fname}]
-            else:
-                forms = [{"name": "常态", "file": fname}]
-                if file_full:
-                    forms.append({"name": "吃饱", "file": file_full})
-            clean.append({
-                "id": rid,
-                "name": str(r.get("name") or "") or "未命名",
-                "file": fname,
-                "form": form,
-                "file_full": file_full,
-                "forms": forms,
-                "frames": frames,
-                "added": str(r.get("added") or ""),
-            })
+            nr = self._normalize_role(r)
+            if nr is not None:
+                clean.append(nr)
         active = str(data.get("active") or "")
         if active and not any(r["id"] == active for r in clean):
             active = ""
@@ -227,15 +429,21 @@ class RoleLibrary:
         return p
 
     def _role_paths(self, role):
-        """角色全部素材文件绝对路径（base + 各形态 + 动画帧，去重）。"""
+        """角色全部素材文件绝对路径（base + 各形态 side/front + 动画帧 +
+        状态资源图，去重；P1-7 起覆盖新结构引用的全部文件）。"""
         seen = set()
+        names = [role.get("file"), role.get("file_full")]
+        for fm in role.get("forms") or []:
+            names.append(fm.get("file"))
+            names.append(fm.get("front"))
+            for act in ANIM_ACTIONS:
+                names.extend((fm.get("animations") or {}).get(act, []) or [])
+            names.extend((fm.get("states") or {}).values())
         out = []
-        for p in [self._path(role)] + [
-            (f if os.path.isabs(f) else os.path.join(self._dir, f))
-            for f in [m.get("file") for m in role.get("forms") or []]
-            + [role.get("file_full"), *[x for x in role.get("frames") or []]]
-            if f
-        ]:
+        for f in names:
+            if not f:
+                continue
+            p = f if os.path.isabs(f) else os.path.join(self._dir, f)
             ap = os.path.abspath(p)
             if ap not in seen:
                 seen.add(ap)
@@ -333,21 +541,127 @@ class RoleLibrary:
         return out
 
     def frames_for(self, role_id):
-        """角色动画帧 png 绝对路径列表（都存在才返回）；无帧动画返回 []。"""
+        """角色动画帧 png 绝对路径列表（都存在才返回）；无帧动画返回 []。
+
+        P1-7：等价 forms[0].animations.idle（旧接口保留，兼容 v13/老调用方）。
+        """
+        anims = self.form_animations(role_id)
+        if not anims:
+            return []
+        return list(anims[0].get("idle") or [])
+
+    def form_animations(self, role_id):
+        """P1-7：逐形态动画帧绝对路径（与 form_metas 逐项对齐）。
+
+        返回 [{"idle": [paths], "eat": [...], "poke": [...], "sleep": [...],
+               "interval_ms": int|None}, ...]；
+        无动画的形态给空 dict；某动作帧文件缺失时该动作整体视为无动画
+        （回退静态，与旧 frames_for 语义一致）。角色不存在返回 []。
+        """
         r = self.get(str(role_id or ""))
         if r is None:
             return []
         out = []
-        for fn in r.get("frames") or []:
-            p = fn if os.path.isabs(fn) else os.path.join(self._dir, fn)
-            try:
-                if os.path.isfile(p):
-                    out.append(p)
-                else:
-                    return []  # 帧文件缺失：整体视为无帧动画（回退静态）
-            except Exception:
-                return []
+        for fm in r.get("forms") or []:
+            item = {}
+            for act in ANIM_ACTIONS:
+                paths = []
+                ok = True
+                for fn in (fm.get("animations") or {}).get(act, []) or []:
+                    p = fn if os.path.isabs(fn) else os.path.join(self._dir, fn)
+                    try:
+                        if os.path.isfile(p):
+                            paths.append(p)
+                        else:
+                            ok = False
+                            break  # 帧文件缺失：该动作整体视为无动画（回退静态）
+                    except Exception:
+                        ok = False
+                        break
+                if paths and ok:
+                    item[act] = paths
+            aiv = fm.get("anim_interval_ms")
+            if isinstance(aiv, (int, float)) and aiv > 0:
+                item["interval_ms"] = int(aiv)
+            out.append(item)
         return out
+
+    def form_state_paths(self, role_id):
+        """P1-7：逐形态状态资源图绝对路径（与 form_metas 逐项对齐）。
+
+        返回 [{state: path}...]；未配置/文件缺失的状态不出现（显示侧走
+        程序化叠图兜底，P2-5 资源图优先）。角色不存在返回 []。
+        """
+        r = self.get(str(role_id or ""))
+        if r is None:
+            return []
+        out = []
+        for fm in r.get("forms") or []:
+            item = {}
+            for st, fn in (fm.get("states") or {}).items():
+                p = fn if os.path.isabs(fn) else os.path.join(self._dir, fn)
+                try:
+                    if os.path.isfile(p):
+                        item[st] = p
+                except Exception:
+                    pass  # 有意忽略：isfile 异常按文件缺失处理（走叠图兜底）
+            out.append(item)
+        return out
+
+    def form_front_paths(self, role_id):
+        """P1-7 断点#7：逐形态 front 图绝对路径（与 form_metas 逐项对齐）。
+
+        未配置 front 或文件缺失 → 回退该形态 side 路径（缺省 side/front 同图）；
+        side 也缺失 → None。角色不存在返回 []。
+        """
+        metas = self.form_metas(role_id)
+        out = []
+        for m in metas:
+            fp = m.get("front") or ""
+            if fp:
+                p = fp if os.path.isabs(fp) else os.path.join(self._dir, fp)
+                try:
+                    if os.path.isfile(p):
+                        out.append(p)
+                        continue
+                except Exception:
+                    pass  # 有意忽略：isfile 异常按缺失处理（回退 side）
+            side = m.get("file") or ""
+            sp = side if os.path.isabs(side) else os.path.join(self._dir, side)
+            try:
+                out.append(sp if os.path.isfile(sp) else None)
+            except Exception:
+                out.append(None)
+        return out
+
+    def resolve(self, fname):
+        """P1-7 编辑辅助：把索引里的相对文件名解析为绝对路径（不检查存在性）。"""
+        if not fname:
+            return ""
+        return fname if os.path.isabs(fname) else os.path.join(self._dir, fname)
+
+    def stage_file(self, src):
+        """P1-7 编辑辅助：把处理好的素材复制进 roles/ 目录（不落索引）。
+
+        返回新文件名（<uuid8>_e<时间戳>.png）或 None（失败）。调用方负责：
+        更新索引成功后保留、失败时删除（避免孤儿文件）。
+        """
+        try:
+            if not isinstance(src, str) or not os.path.isfile(src):
+                return None
+            os.makedirs(self._dir, exist_ok=True)
+            fn = "%s_e%s.png" % (uuid.uuid4().hex[:8], str(int(time.time())))
+            shutil.copyfile(src, os.path.join(self._dir, fn))
+            return fn
+        except Exception:
+            return None
+
+    def is_v2(self, role_id):
+        """P1-7：角色是否含新结构渲染/动画参数（front/scale/offset/anchor 非默认/
+        animations/states/anim_interval_ms）。桌宠据此区分旧角色全局 scale
+        补偿路径与新角色 anchor/scale/offset 装配路径。"""
+        r = self.get(str(role_id or ""))
+        return bool(r and r.get("v2"))
 
     def import_file(self, src, name=None):
         """旧版导入（v1.3.0 兼容）：只复制一张图，无「吃饱」变体（单形态）。
@@ -386,13 +700,16 @@ class RoleLibrary:
                 except Exception:
                     pass  # 有意忽略：半截文件清理尽力而为，不留孤儿
                 return None, "复制文件失败"
-            role = {
+            # P1-7：旧版入口也走统一归一化（forms 结构补齐，行为不变）
+            role = self._normalize_role({
                 "id": rid,
                 "name": name,
                 "file": rid + ".png",
                 "form": "single",
                 "added": time.strftime("%Y-%m-%d"),
-            }
+            })
+            if role is None:
+                return None, "角色数据无效"
             self._data["roles"].append(role)
             err = self._save()
             if err:
@@ -407,14 +724,26 @@ class RoleLibrary:
         except Exception as e:
             return None, "导入失败：%s" % e
 
-    def import_processed(self, base_src, full_src=None, name=None, frames_src=None, forms_src=None):
-        """导入已自动处理的角色素材（面板新入口）。
+    def import_processed(self, base_src, full_src=None, name=None, frames_src=None, forms_src=None,
+                         interval_ms=None, render=None, states=None,
+                         keep_source=False, source_files=None):
+        """导入已自动处理的角色素材（面板新入口；旧调用不传新参数仍工作）。
 
         full_src 给路径 → 双形态（旧参数，等价 forms_src 两个形态）。
         frames_src 给 2~FRAME_MAX 张已处理帧 → 帧动画角色：帧存为 <id>_f%02d.png，
-        base 必须是首帧（"file" 指向 _f00），"frames" 记录全部帧文件名。
+        base 必须是首帧（"file" 指向 _f00）；P1-7 起帧写入
+        forms[0].animations.idle，"frames" 保留为兼容视图。
         forms_src 给 [(名字, png路径), ...]（1~8 个，v1.4 多形态）→
         形态文件存为 <id>_form%d.png，形态 0 即 base；记录 "forms"。
+        P1-7 新参数（全部可选，缺省 = 现行为）：
+        - interval_ms：帧间隔 ms（写入各形态 anim_interval_ms；缺省走
+          IDLE_FRAME_MS/EAT_FRAME_MS）
+        - render：渲染参数。单 dict（所有形态同参）或与 forms 对齐的 list：
+          {"anchor": {"x","y"}, "scale": 倍率, "offset": {"x","y"}}（键均可缺省）
+        - states：状态资源图 {state: png路径}（写入 forms[0].states）
+        - keep_source：P2-6 原图保留开关（默认 False）；True 时把 source_files
+          里的原图复制到 roles/<id>/source/（保留失败不影响导入）
+        - source_files：原图路径列表（配合 keep_source）
         成功返回 (role, None)，失败 (None, err)；任何失败都会清理半成品文件。
         """
         try:
@@ -495,6 +824,53 @@ class RoleLibrary:
             except Exception:
                 self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms)
                 return None, "复制文件失败"
+            # ---- P1-7 新参数校验（缺省 = 现行为）----
+            n_forms_total = (len(forms_src) if forms_src is not None
+                             else (2 if full_src else 1))
+            render_specs = None
+            if render is not None:
+                if isinstance(render, dict):
+                    render_specs = [render] * n_forms_total  # 单 dict：所有形态同参
+                elif isinstance(render, list) and len(render) == n_forms_total:
+                    render_specs = [x if isinstance(x, dict) else {} for x in render]
+                else:
+                    self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms)
+                    return None, "渲染参数格式错误"
+                for spec in render_specs:
+                    anchor = spec.get("anchor")
+                    if anchor is not None and not isinstance(anchor, dict):
+                        self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms)
+                        return None, "anchor 必须是 {x,y}"
+            if states is not None:
+                if not isinstance(states, dict):
+                    self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms)
+                    return None, "状态图必须是 {状态: png路径}"
+                _norm_st = _norm_states(states)
+                if _norm_st != states or not all(
+                        isinstance(v, str) and os.path.isfile(v) for v in states.values()):
+                    self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms)
+                    return None, "状态图参数无效"
+                # 状态图按额外素材复制：<id>_st_<state>.png（原图路径由调用方保证有效）
+                dst_states = {}
+                for st, sp in states.items():
+                    dst_states[st] = "%s_st_%s.png" % (rid, st)
+            if interval_ms is not None:
+                try:
+                    interval_ms = int(interval_ms)
+                except (TypeError, ValueError):
+                    interval_ms = None
+                if interval_ms is None or not (10 <= interval_ms <= 10000):
+                    self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms)
+                    return None, "帧间隔必须是 10~10000 之间的整数 ms"
+            # ---- 复制状态资源图（失败回滚整个导入）----
+            if states:
+                try:
+                    for st, sp in states.items():
+                        shutil.copyfile(sp, os.path.join(self._dir, dst_states[st]))
+                except Exception:
+                    self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms,
+                                        *[os.path.join(self._dir, x) for x in dst_states.values()])
+                    return None, "复制状态图失败"
             role = {
                 "id": rid,
                 "name": name,
@@ -519,10 +895,49 @@ class RoleLibrary:
                 role["forms"] = [{"name": "常态", "file": rid + ".png"}]
                 if full_src:
                     role["forms"].append({"name": "吃饱", "file": rid + "_full.png"})
+            # P1-7：高级选项写入 forms（渲染参数/帧间隔/状态图）
+            if render_specs:
+                for fm, spec in zip(role["forms"], render_specs):
+                    if spec.get("anchor") is not None:
+                        fm["anchor"] = _norm_anchor(spec.get("anchor"))
+                    if spec.get("scale") is not None:
+                        fm["scale"] = spec.get("scale")
+                    if spec.get("offset") is not None:
+                        fm["offset"] = spec.get("offset")
+            if interval_ms is not None:
+                for fm in role["forms"]:
+                    fm["anim_interval_ms"] = interval_ms
+            if states:
+                role["forms"][0]["states"] = dst_states
+            # 统一归一化（frames→animations、anchor 默认、v2 标记、兼容视图）
+            role = self._normalize_role(role)
+            if role is None:
+                self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms,
+                                    *[os.path.join(self._dir, x) for x in dst_states.values()])
+                return None, "角色数据无效"
+            # P2-6：保留原图到 roles/<id>/source/（可选，默认关；失败不影响导入）
+            if keep_source and source_files:
+                try:
+                    sdir = os.path.join(self._dir, rid, "source")
+                    os.makedirs(sdir, exist_ok=True)
+                    for sf in source_files:
+                        if not (isinstance(sf, str) and os.path.isfile(sf)):
+                            continue
+                        base = os.path.basename(sf)
+                        target = os.path.join(sdir, base)
+                        j = 1
+                        stem, ext = os.path.splitext(base)
+                        while os.path.exists(target):
+                            target = os.path.join(sdir, "%s_%d%s" % (stem, j, ext))
+                            j += 1
+                        shutil.copyfile(sf, target)
+                except Exception:
+                    pass  # 有意忽略：原图保留失败不影响导入（体积优化开关，尽力而为）
             self._data["roles"].append(role)
             err = self._save()
             if err:
-                self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms)
+                self._cleanup_files(dst_base, dst_full, *dst_frames, *dst_forms,
+                                    *[os.path.join(self._dir, x) for x in dst_states.values()])
                 self._data["roles"].pop()
                 return None, err
             return role, None
@@ -542,6 +957,10 @@ class RoleLibrary:
             for p in self._role_paths(r):
                 if os.path.exists(p):
                     os.remove(p)
+            # P2-6：保留的原图目录（roles/<id>/source/）一并清理，不留孤儿
+            src_dir = os.path.join(self._dir, role_id, "source")
+            if os.path.isdir(src_dir):
+                shutil.rmtree(src_dir, ignore_errors=True)
         except Exception as e:
             return False, "删除文件失败：%s" % e
         self._data["roles"] = [x for x in self._data["roles"] if x["id"] != role_id]
@@ -559,6 +978,95 @@ class RoleLibrary:
             if r["id"] == role_id:
                 return dict(r)
         return None
+
+    def update(self, role_id, patch):
+        """P1-7：就地编辑角色（id 不变）。返回 (bool, err)。
+
+        patch 键（全部可选，只改给出的；未知键忽略）：
+        - name: str 新名字（截断 40，空拒绝）
+        - forms: list[dict] 完整形态列表（1~8 个）整体替换——改名/换图/调序/
+          改渲染参数/改动画/改状态图；每项结构同 _normalize_form
+        - file / file_full: 旧字段快捷改法（写回 forms[0].file / forms[1].file）
+        - frames: list[str] 帧文件名（写回 forms[0].animations.idle；旧兼容；
+          超 FRAME_MAX 拒绝）
+        update 只改索引不搬文件：调用方负责新文件就位（编辑对话框换图时
+        写入新文件再 patch），成功落盘后由调用方清理不再被引用的旧文件。
+        """
+        role_id = str(role_id or "")
+        r = self.get(role_id)
+        if r is None:
+            return False, "角色不存在"
+        if not isinstance(patch, dict):
+            return False, "patch 必须是 dict"
+        new_r = dict(r)
+        if "name" in patch:
+            nm = str(patch.get("name") or "").strip()
+            if not nm:
+                return False, "名字不能为空"
+            new_r["name"] = nm[:40]
+        if "forms" in patch:
+            raw_forms = patch["forms"]
+            if not isinstance(raw_forms, list) or not (1 <= len(raw_forms) <= 8):
+                return False, "形态数量必须在 1~8 之间"
+            forms = []
+            for i, fm in enumerate(raw_forms):
+                if not isinstance(fm, dict):
+                    return False, "第 %d 个形态格式错误" % (i + 1)
+                nf = self._normalize_form(fm, "形态%d" % (len(forms) + 1))
+                if nf is None:
+                    return False, "第 %d 个形态缺少有效的 png 文件" % (i + 1)
+                forms.append(nf)
+            new_r["forms"] = forms
+            new_r["file"] = forms[0]["file"]
+            new_r["file_full"] = forms[1]["file"] if len(forms) >= 2 else ""
+            new_r["frames"] = []  # forms 替换为权威结构：旧兼容视图由归一化重建
+        else:
+            forms = [dict(f) for f in (new_r.get("forms") or [])]
+            if "file" in patch:
+                fv = str(patch.get("file") or "")
+                if not fv.lower().endswith(".png"):
+                    return False, "文件必须是 png"
+                if not forms:
+                    return False, "角色形态数据缺失"
+                forms[0]["file"] = fv
+                new_r["file"] = fv
+            if "file_full" in patch and forms:
+                fv2 = str(patch.get("file_full") or "")
+                if fv2 and not fv2.lower().endswith(".png"):
+                    return False, "文件必须是 png"
+                if len(forms) >= 2:
+                    forms[1]["file"] = fv2
+                    new_r["file_full"] = fv2
+            if "file" in patch or "file_full" in patch:
+                new_r["forms"] = forms
+        if "frames" in patch:
+            fr = patch.get("frames")
+            if not isinstance(fr, list):
+                return False, "frames 必须是列表"
+            frs = [str(x) for x in fr if str(x).lower().endswith(".png")]
+            if len(frs) != len(fr):
+                return False, "帧文件名必须是 png"
+            if len(frs) > FRAME_MAX:
+                return False, "帧动画最多 %d 帧（可在设置里调整）" % FRAME_MAX
+            forms = [dict(f) for f in (new_r.get("forms") or [])]
+            if not forms:
+                return False, "角色形态数据缺失"
+            anims = dict(forms[0].get("animations") or {})
+            anims["idle"] = frs
+            forms[0]["animations"] = anims
+            new_r["forms"] = forms
+        # 统一归一化（兼容视图 frames/file 同步、v2 标记刷新）
+        new_r = self._normalize_role(new_r)
+        if new_r is None:
+            return False, "角色数据无效"
+        for i, x in enumerate(self._data["roles"]):
+            if x["id"] == role_id:
+                self._data["roles"][i] = new_r
+                break
+        err = self._save()
+        if err:
+            return False, err
+        return True, ""
 
 
 # ---------------- 音频库 ----------------
@@ -879,6 +1387,77 @@ if __name__ == "__main__":
     assert rl2.active_id() == ""
     assert [f["ext"] for f in al2.fragments()] == [".mp3"]
     assert al2.group_slots()["custom"]["press"] == ""
+
+    print("=== 冒烟 4：P1-7 schema 迁移 / 动画查表 / update ===")
+    import json as _json
+    fake2 = os.path.join(tmp, "旧角色.png")
+    with open(fake2, "wb") as f:
+        f.write(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="))
+    # 旧结构：角色级 frames + file_full + forms[].file（无 animations/anchor）
+    old_index = {
+        "roles": [{
+            "id": "old1", "name": "旧帧角色", "file": "old1.png",
+            "form": "dual", "file_full": "old1_full.png",
+            "frames": ["old1_f00.png", "old1_f01.png", "old1_f02.png"],
+            "forms": [{"name": "常态", "file": "old1.png"},
+                      {"name": "吃饱", "file": "old1_full.png"}],
+            "added": "",
+        }],
+        "active": "",
+    }
+    with open(os.path.join(tmp, "roles.json"), "w", encoding="utf-8") as f:
+        _json.dump(old_index, f, ensure_ascii=False)
+    rl3 = RoleLibrary(tmp)
+    migrated = rl3.get("old1")
+    assert migrated is not None
+    # 迁移：frames → forms[0].animations.idle；顶层 frames 保留兼容视图
+    assert animation_frames(migrated, 0, "idle") == ["old1_f00.png", "old1_f01.png", "old1_f02.png"]
+    assert migrated["frames"] == animation_frames(migrated, 0, "idle")
+    # file 保留作 still；file_full 仍可用（v13 语义）
+    assert migrated["forms"][0]["file"] == "old1.png"
+    assert migrated["file_full"] == "old1_full.png"
+    assert migrated.get("v2") is False  # 纯旧结构不算 v2（保留全局 scale 补偿路径）
+    # 新结构：forms[0].animations.idle + states + render，v2 标记生效
+    new_index = {
+        "roles": [{
+            "id": "new1", "name": "新角色", "file": "new1.png",
+            "form": "single", "file_full": "",
+            "forms": [{
+                "name": "常态", "file": "new1.png",
+                "anchor": {"x": 0.5, "y": 1.0}, "scale": 1.5, "offset": {"x": 3, "y": -4},
+                "animations": {"idle": ["new1_f00.png", "new1_f01.png"], "eat": []},
+                "anim_interval_ms": 90,
+                "states": {"angry": "new1_angry.png", "hiss": "no.txt"},
+            }],
+            "added": "",
+        }],
+        "active": "",
+    }
+    with open(os.path.join(tmp, "roles.json"), "w", encoding="utf-8") as f:
+        _json.dump(new_index, f, ensure_ascii=False)
+    rl4 = RoleLibrary(tmp)
+    nr = rl4.get("new1")
+    assert nr is not None and nr.get("v2") is True
+    assert animation_frames(nr, 0, "idle") == ["new1_f00.png", "new1_f01.png"]
+    assert animation_frames(nr, 0, "eat") == []  # 空动作不保留
+    assert nr["forms"][0]["anchor"] == {"x": 0.5, "y": 1.0}
+    assert nr["forms"][0]["scale"] == 1.5
+    assert nr["forms"][0]["anim_interval_ms"] == 90
+    assert nr["forms"][0]["states"] == {"angry": "new1_angry.png"}  # 非 png 丢弃
+    # update：改名 + forms 替换 + 兼容视图同步，id 不变
+    ok_up, err_up = rl4.update("new1", {
+        "name": "新角色改",
+        "forms": [{"name": "小形态", "file": "new1.png", "anchor": {"x": 0.5, "y": 0.5}}],
+    })
+    assert ok_up and err_up == "", err_up
+    upr = rl4.get("new1")
+    assert upr["id"] == "new1" and upr["name"] == "新角色改"
+    assert len(upr["forms"]) == 1 and upr["forms"][0]["name"] == "小形态"
+    assert upr["frames"] == [] and upr["file"] == "new1.png"
+    # update：frames 超上限拒绝（FRAME_MAX=24）
+    ok_up2, err_up2 = rl4.update("new1", {"frames": ["f%02d.png" % i for i in range(25)]})
+    assert ok_up2 is False and "24" in err_up2, err_up2
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("RESOURCES SMOKE OK")

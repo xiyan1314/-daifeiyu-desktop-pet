@@ -55,6 +55,7 @@ MIT License
 Copyright (c) 大肥鱼桌宠项目
 """
 
+import copy
 import os
 import shutil
 import tempfile
@@ -67,12 +68,14 @@ from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -409,10 +412,11 @@ def _content_bbox(img, cancel=None):
     return (minx, miny, maxx - minx + 1, maxy - miny + 1)
 
 
-def _load_prepared(src, max_px=None, cancel=None):
-    """加载素材并做通用预处理：预缩放 → 无透明通道自动去背景。
+def _load_prepared(src, max_px=None, cancel=None, remove_bg=True):
+    """加载素材并做通用预处理：预缩放 → 无透明通道自动去背景（P1-7 可关）。
 
     max_px=None 用全局 _IMG_MAX_PROCESS_PX（2048）；帧动画可传 1024 控制峰值。
+    remove_bg=False 跳过自动去背景（P1-7 高级选项；默认 True = 现行为）。
     返回 (img, notes) 或 (None, None)。notes 为这一阶段的说明列表。
     cancel 为可调用的取消检测（工作线程内周期询问），取消时抛 ImportCancelled。
     """
@@ -430,30 +434,38 @@ def _load_prepared(src, max_px=None, cancel=None):
                          Qt.TransformationMode.SmoothTransformation)
         notes.append("超大图已预缩放")
     if not had_alpha:
-        removed = _remove_background(img, cancel=cancel)
-        if removed is None:
-            notes.append("背景与主体相连，保留原图")
+        if remove_bg:
+            removed = _remove_background(img, cancel=cancel)
+            if removed is None:
+                notes.append("背景与主体相连，保留原图")
+            else:
+                img = removed
+                notes.append("已自动去背景")
         else:
-            img = removed
-            notes.append("已自动去背景")
+            notes.append("未去背景（高级选项）")
     return img, notes
 
 
-def _prepare_role_png(src, out_path, cancel=None):
+def _prepare_role_png(src, out_path, cancel=None, remove_bg=True, trim=True):
     """导入素材自动处理：无透明通道→去背景；裁剪透明边距；>512px 等比缩小。
 
-    成功返回 (True, notes)；失败返回 (False, err)。notes 为中文说明列表。
+    P1-7 高级选项：remove_bg=False 跳过去背景、trim=False 跳过透明边距裁剪
+    （均默认 True = 现行为）。成功返回 (True, notes)；失败返回 (False, err)。
+    notes 为中文说明列表。
     """
-    img, notes = _load_prepared(src, cancel=cancel)
+    img, notes = _load_prepared(src, cancel=cancel, remove_bg=remove_bg)
     if img is None:
         return False, "无法加载该图片"
-    bbox = _content_bbox(img, cancel=cancel)
-    if bbox is None:
-        return False, "图片没有可见内容"
-    x, y, w, h = bbox
-    if (x, y, w, h) != (0, 0, img.width(), img.height()):
-        img = img.copy(x, y, w, h)
-        notes.append("已裁剪透明边距")
+    if trim:
+        bbox = _content_bbox(img, cancel=cancel)
+        if bbox is None:
+            return False, "图片没有可见内容"
+        x, y, w, h = bbox
+        if (x, y, w, h) != (0, 0, img.width(), img.height()):
+            img = img.copy(x, y, w, h)
+            notes.append("已裁剪透明边距")
+    else:
+        notes.append("未裁剪透明边距（高级选项）")
     if max(img.width(), img.height()) > _IMG_TARGET_MAX_PX:
         img = img.scaled(_IMG_TARGET_MAX_PX, _IMG_TARGET_MAX_PX,
                          Qt.AspectRatioMode.KeepAspectRatio,
@@ -466,13 +478,16 @@ def _prepare_role_png(src, out_path, cancel=None):
     return True, notes
 
 
-def _prepare_role_frames(srcs, out_dir, same_size=True, cancel=None, progress=None):
+def _prepare_role_frames(srcs, out_dir, same_size=True, cancel=None, progress=None,
+                          remove_bg=True):
     """批量处理帧素材到统一画布（帧动画导入用）。
 
     same_size=True（视频/GIF 抽帧，原始尺寸一致）：先算全部帧的内容**并集 bbox**，
     所有帧裁到同一矩形（保留主体平移的动画信息），再统一等比缩放（长边 ≤512）。
     same_size=False（多选图片，尺寸可能不一）：逐帧独立处理（去背景/裁剪/缩放），
     最后把每帧内容居中放进最大帧尺寸的透明画布（尺寸一致、防帧间跳动）。
+    P1-7：remove_bg=False 跳过自动去背景（高级选项，默认 True = 现行为）；
+    帧间对齐依赖统一画布，裁剪恒开（不做 trim 开关）。
     返回 (out_paths, notes) 或 (None, err)。
     cancel 为取消检测回调（工作线程内周期询问）；progress 为进度文本回调。
     """
@@ -483,7 +498,8 @@ def _prepare_role_frames(srcs, out_dir, same_size=True, cancel=None, progress=No
             raise ImportCancelled()
         if progress is not None:
             progress("处理帧 %d/%d…" % (i + 1, n))
-        img, _load_notes = _load_prepared(s, max_px=1024, cancel=cancel)  # 帧序列峰值控制（输出 ≤512）
+        img, _load_notes = _load_prepared(s, max_px=1024, cancel=cancel,
+                                          remove_bg=remove_bg)  # 帧序列峰值控制（输出 ≤512）
         if img is None:
             return None, "第 %d 帧无法加载" % (i + 1)
         imgs.append(img)
@@ -709,18 +725,38 @@ def _extract_video_frames(src, out_dir, cancel=None, progress=None):
 # ---------------- P1-1：导入工作线程 ----------------
 
 
-def _run_import_pipeline(forms, frames_raw, frames_video, tmpdir, cancel=None, progress=None):
+def _run_import_pipeline(forms, frames_raw, frames_video, tmpdir, cancel=None, progress=None,
+                         options=None):
     """角色导入的纯处理部分（无 UI），在工作线程内执行。
 
+    options（P1-7 高级选项，全部可选，缺省 = 现行为）：
+      {"remove_bg": bool, "trim": bool, "interval_ms": int|None,
+       "render": dict|list, "keep_source": bool}
     返回 (result_dict, None) 或 (None, err)。result_dict 与旧 _do_import 一致，
-    但不含 name（由主线程在完成时从控件实时读取，保持旧行为）。
+    但不含 name（由主线程在完成时从控件实时读取，保持旧行为）；P1-7 起附加
+    "options"（interval_ms/render/keep_source 回传落库用）与 "sources"
+    （keep_source 时的原图路径列表）。
     """
+    options = options or {}
+    remove_bg = bool(options.get("remove_bg", True))
+    trim = bool(options.get("trim", True))
+    # P1-7：新选项仅在非默认时透传——保持旧调用签名完全兼容
+    # （v13/绿色版用 stub 替换 _prepare_role_frames 时不接受新关键字参数）
+    frame_kwargs = {}
+    if not remove_bg:
+        frame_kwargs["remove_bg"] = False
+    png_kwargs = {}
+    if not remove_bg:
+        png_kwargs["remove_bg"] = False
+    if not trim:
+        png_kwargs["trim"] = False
     frames_out = []
     if frames_raw:
         if progress is not None:
             progress("帧动画统一画布处理…")
         frames_out, notesf = _prepare_role_frames(
-            frames_raw, tmpdir, same_size=bool(frames_video), cancel=cancel, progress=progress)
+            frames_raw, tmpdir, same_size=bool(frames_video), cancel=cancel,
+            progress=progress, **frame_kwargs)
         if frames_out is None:
             return None, "帧处理失败：%s" % notesf
         base_out = frames_out[0]
@@ -730,7 +766,7 @@ def _run_import_pipeline(forms, frames_raw, frames_video, tmpdir, cancel=None, p
         base_out = os.path.join(tmpdir, "role_base.png")
         if progress is not None:
             progress("处理第 1 形态…")
-        ok1, notes1 = _prepare_role_png(forms[0][1], base_out, cancel=cancel)
+        ok1, notes1 = _prepare_role_png(forms[0][1], base_out, cancel=cancel, **png_kwargs)
         if not ok1:
             return None, "第 1 形态处理失败：%s" % notes1
         notes = ["第 1 形态：%s" % ("、".join(notes1) if notes1 else "无需处理")]
@@ -741,12 +777,26 @@ def _run_import_pipeline(forms, frames_raw, frames_video, tmpdir, cancel=None, p
         if progress is not None:
             progress("处理第 %d 形态（%s）…" % (i + 1, nm))
         fp = os.path.join(tmpdir, "form%d.png" % i)
-        okf, notesf = _prepare_role_png(src, fp, cancel=cancel)
+        okf, notesf = _prepare_role_png(src, fp, cancel=cancel, **png_kwargs)
         if not okf:
             return None, "第 %d 形态处理失败：%s" % (i + 1, notesf)
         forms_out.append((nm, fp))
         notes.append("第 %d 形态（%s）：%s" % (i + 1, nm, "、".join(notesf) if notesf else "无需处理"))
-    return {"base": base_out, "frames": frames_out, "forms": forms_out, "notes": notes}, None
+    result = {"base": base_out, "frames": frames_out, "forms": forms_out, "notes": notes}
+    # P1-7：高级选项回传（RolePanel 落库用；keep_source 时附带原图路径）
+    result["options"] = {
+        "interval_ms": options.get("interval_ms"),
+        "render": options.get("render"),
+        "keep_source": bool(options.get("keep_source")),
+    }
+    if options.get("keep_source"):
+        sources = []
+        for _nm, src in forms:
+            if src and isinstance(src, str) and os.path.isfile(src):
+                sources.append(src)
+        sources.extend(frames_raw or [])
+        result["sources"] = sources
+    return result, None
 
 
 class _ImportWorker(QThread):
@@ -786,7 +836,8 @@ class _ImportWorker(QThread):
             else:
                 res, err = _run_import_pipeline(
                     task["forms"], task.get("frames_raw") or [], task.get("frames_video", False),
-                    task["tmpdir"], cancel=self._is_cancelled, progress=self.progress.emit)
+                    task["tmpdir"], cancel=self._is_cancelled, progress=self.progress.emit,
+                    options=task.get("options"))
                 if err:
                     self.failed.emit(err)
                 else:
@@ -869,6 +920,69 @@ class RoleImportDialog(QDialog):
         self._frames_status.setWordWrap(True)
         root.addWidget(self._frames_status)
         self._mat_btns = (m_btn, v_btn, self._add_form_btn)  # 素材选择按钮：处理期间统一禁用防重入
+
+        # ---- P1-7 高级折叠区（全部可选，默认 = 现行为）----
+        adv = QGroupBox("高级")
+        adv.setCheckable(True)
+        adv.setChecked(False)  # 默认折叠，不打扰常规导入
+        adv_grid = QGridLayout(adv)
+        self._adv_interval_chk = QCheckBox("自定义帧间隔")
+        self._adv_interval = QSpinBox()
+        self._adv_interval.setRange(10, 10000)
+        self._adv_interval.setValue(140)
+        self._adv_interval.setSuffix(" ms/帧")
+        self._adv_interval.setEnabled(False)
+        self._adv_interval_chk.toggled.connect(self._adv_interval.setEnabled)
+        self._adv_rmbg = QCheckBox("自动去背景（无透明通道时）")
+        self._adv_rmbg.setChecked(True)   # 默认开 = 现行为
+        self._adv_trim = QCheckBox("裁剪透明边距")
+        self._adv_trim.setChecked(True)   # 默认开 = 现行为
+        self._adv_keep = QCheckBox("保留原图到角色目录 source/")
+        self._adv_keep.setChecked(False)  # P2-6：默认关以减小体积
+        self._adv_render_chk = QCheckBox("自定义渲染参数（锚点/缩放/偏移）")
+        self._adv_anchor_x = QDoubleSpinBox()
+        self._adv_anchor_x.setRange(0.0, 1.0)
+        self._adv_anchor_x.setSingleStep(0.05)
+        self._adv_anchor_x.setDecimals(2)
+        self._adv_anchor_x.setValue(0.5)
+        self._adv_anchor_y = QDoubleSpinBox()
+        self._adv_anchor_y.setRange(0.0, 1.0)
+        self._adv_anchor_y.setSingleStep(0.05)
+        self._adv_anchor_y.setDecimals(2)
+        self._adv_anchor_y.setValue(0.5)
+        self._adv_scale = QDoubleSpinBox()
+        self._adv_scale.setRange(0.1, 4.0)
+        self._adv_scale.setSingleStep(0.05)
+        self._adv_scale.setDecimals(2)
+        self._adv_scale.setValue(1.0)
+        self._adv_off_x = QSpinBox()
+        self._adv_off_x.setRange(-300, 300)
+        self._adv_off_y = QSpinBox()
+        self._adv_off_y.setRange(-300, 300)
+        self._adv_render_widgets = (
+            self._adv_anchor_x, self._adv_anchor_y, self._adv_scale,
+            self._adv_off_x, self._adv_off_y)
+        for _w in self._adv_render_widgets:
+            _w.setEnabled(False)
+        self._adv_render_chk.toggled.connect(
+            lambda on: [w.setEnabled(on) for w in self._adv_render_widgets])
+        adv_grid.addWidget(self._adv_interval_chk, 0, 0)
+        adv_grid.addWidget(self._adv_interval, 0, 1)
+        adv_grid.addWidget(self._adv_rmbg, 1, 0)
+        adv_grid.addWidget(self._adv_trim, 1, 1)
+        adv_grid.addWidget(self._adv_keep, 2, 0, 1, 2)
+        adv_grid.addWidget(self._adv_render_chk, 3, 0, 1, 2)
+        adv_grid.addWidget(QLabel("锚点 X"), 4, 0)
+        adv_grid.addWidget(self._adv_anchor_x, 4, 1)
+        adv_grid.addWidget(QLabel("锚点 Y"), 5, 0)
+        adv_grid.addWidget(self._adv_anchor_y, 5, 1)
+        adv_grid.addWidget(QLabel("缩放倍率"), 6, 0)
+        adv_grid.addWidget(self._adv_scale, 6, 1)
+        adv_grid.addWidget(QLabel("偏移 X"), 7, 0)
+        adv_grid.addWidget(self._adv_off_x, 7, 1)
+        adv_grid.addWidget(QLabel("偏移 Y"), 8, 0)
+        adv_grid.addWidget(self._adv_off_y, 8, 1)
+        root.addWidget(adv)
 
         prev_row = QHBoxLayout()
         base_lay, self._prev_base = self._make_preview("形态 1（待机/动画）")
@@ -1194,6 +1308,20 @@ class RoleImportDialog(QDialog):
         if not forms:
             _warn(self, "导入角色", "请先添加形态并选图")
             return
+        # P1-7：高级折叠区选项收集（缺省 = 现行为）
+        options = {
+            "remove_bg": self._adv_rmbg.isChecked(),
+            "trim": self._adv_trim.isChecked(),
+            "keep_source": self._adv_keep.isChecked(),
+        }
+        if self._adv_interval_chk.isChecked():
+            options["interval_ms"] = self._adv_interval.value()
+        if self._adv_render_chk.isChecked():
+            options["render"] = {
+                "anchor": {"x": self._adv_anchor_x.value(), "y": self._adv_anchor_y.value()},
+                "scale": self._adv_scale.value(),
+                "offset": {"x": self._adv_off_x.value(), "y": self._adv_off_y.value()},
+            }
         # P1-1：图像管线（去背景/裁剪/缩放，可能数秒）移入工作线程
         self._set_busy(True)
         self._notes.setText("正在自动处理素材（去背景 / 裁剪 / 缩放）……")
@@ -1204,6 +1332,7 @@ class RoleImportDialog(QDialog):
             "frames_raw": list(self._frames_raw),
             "frames_video": bool(self._frames_video),
             "tmpdir": self._tmpdir,
+            "options": options,
         })
 
     def _cleanup_tmp(self):
@@ -1232,8 +1361,493 @@ class RoleImportDialog(QDialog):
         super().closeEvent(event)
 
     def result_data(self):
-        """accepted 后取处理结果：{"name","base","frames","forms","notes"} 或 None。"""
+        """accepted 后取处理结果：{"name","base","frames","forms","notes"} 或 None。
+
+        P1-7 起 result 附加 "options"（interval_ms/render/keep_source）与
+        "sources"（keep_source 时的原图路径）。
+        """
         return self._result
+
+
+class RoleEditDialog(QDialog):
+    """P1-7 轻量角色编辑：改名 / 形态改名+调序 / 换图（重新处理，不换 id）/
+    渲染参数（anchor/scale/offset）/ 帧间隔 / 正面图（front）/ 状态图（states）。
+
+    确认时把新素材经管线处理后写入 roles/ 目录（新文件名），用
+    RoleLibrary.update(rid, patch) 落盘索引；成功后清理不再被引用的旧文件。
+    全部编辑只在当前库的该角色上进行，不新建 id。
+    """
+
+    def __init__(self, parent=None, lib=None, role_id=""):
+        super().__init__(_qt_parent(parent))
+        self._lib = lib
+        self._role_id = str(role_id or "")
+        self._role = (lib.get(self._role_id) if lib else None) or {}
+        self._forms = copy.deepcopy(self._role.get("forms") or [])
+        if not self._forms:
+            self._forms = [{"name": "常态", "file": self._role.get("file", "")}]
+        self._cur_idx = 0
+        self._loading = False
+        self._pending_images = {}    # form_idx -> src（换图，待重新处理）
+        self._pending_front = {}     # form_idx -> src|None（None=清除）
+        self._pending_states = {}    # (form_idx, state) -> src|None（None=删除）
+        self._touched_name = set()
+        self._touched_render = set()
+        self._touched_interval = set()
+        self._staged = []            # 本次写入 roles/ 的新文件名（失败/取消时清理）
+        self._tmpdir = None
+
+        self.setWindowTitle("编辑角色「%s」" % self._role.get("name", ""))
+        self.setStyleSheet(DIALOG_QSS)
+        self.resize(600, 540)
+
+        root = QVBoxLayout(self)
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("角色名"))
+        self._name_edit = QLineEdit(self._role.get("name", ""))
+        name_row.addWidget(self._name_edit, 1)
+        root.addLayout(name_row)
+
+        body = QHBoxLayout()
+        left = QVBoxLayout()
+        left.addWidget(QLabel("形态（选中后编辑；上移/下移调整喂食顺序）"))
+        self._form_list = QListWidget()
+        self._form_list.setMinimumWidth(190)
+        self._form_list.currentRowChanged.connect(self._on_form_selected)
+        left.addWidget(self._form_list, 1)
+        reorder = QHBoxLayout()
+        up_btn = QPushButton("上移")
+        up_btn.clicked.connect(lambda: self._move_form(-1))
+        down_btn = QPushButton("下移")
+        down_btn.clicked.connect(lambda: self._move_form(1))
+        reorder.addWidget(up_btn)
+        reorder.addWidget(down_btn)
+        reorder.addStretch(1)
+        left.addLayout(reorder)
+        body.addLayout(left)
+
+        right = QVBoxLayout()
+        self._preview = QLabel("预览")
+        self._preview.setFixedSize(180, 130)
+        self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview.setStyleSheet(
+            "background-color:#2e3560;border:1px solid #3d477f;"
+            "border-radius:8px;color:#8f97c0;")
+        right.addWidget(self._preview, 0, Qt.AlignmentFlag.AlignCenter)
+
+        fn_row = QHBoxLayout()
+        fn_row.addWidget(QLabel("形态名"))
+        self._form_name = QLineEdit()
+        self._form_name.setMaxLength(12)
+        self._form_name.textChanged.connect(lambda _t: self._mark("name"))
+        fn_row.addWidget(self._form_name, 1)
+        right.addLayout(fn_row)
+
+        img_row = QHBoxLayout()
+        self._img_btn = QPushButton("换图（重新处理）…")
+        self._img_btn.clicked.connect(self._pick_image)
+        self._front_btn = QPushButton("设正面图…")
+        self._front_btn.clicked.connect(self._pick_front)
+        self._front_clear = QPushButton("清正面")
+        self._front_clear.clicked.connect(self._clear_front)
+        img_row.addWidget(self._img_btn)
+        img_row.addWidget(self._front_btn)
+        img_row.addWidget(self._front_clear)
+        right.addLayout(img_row)
+        self._img_status = QLabel("")
+        self._img_status.setWordWrap(True)
+        right.addWidget(self._img_status)
+
+        render_box = QGroupBox("渲染参数（解决多形态切换跳变；默认 = 原行为）")
+        rg = QGridLayout(render_box)
+        self._anchor_x = QDoubleSpinBox()
+        self._anchor_x.setRange(0.0, 1.0)
+        self._anchor_x.setSingleStep(0.05)
+        self._anchor_x.setDecimals(2)
+        self._anchor_y = QDoubleSpinBox()
+        self._anchor_y.setRange(0.0, 1.0)
+        self._anchor_y.setSingleStep(0.05)
+        self._anchor_y.setDecimals(2)
+        self._scale = QDoubleSpinBox()
+        self._scale.setRange(0.1, 4.0)
+        self._scale.setSingleStep(0.05)
+        self._scale.setDecimals(2)
+        self._off_x = QSpinBox()
+        self._off_x.setRange(-300, 300)
+        self._off_y = QSpinBox()
+        self._off_y.setRange(-300, 300)
+        self._interval = QSpinBox()
+        self._interval.setRange(0, 10000)
+        self._interval.setSpecialValueText("默认")
+        self._interval.setSuffix(" ms/帧")
+        for _w in (self._anchor_x, self._anchor_y, self._scale,
+                   self._off_x, self._off_y):
+            _w.valueChanged.connect(lambda _v, _w=_w: self._mark("render"))
+        self._interval.valueChanged.connect(lambda _v: self._mark("interval"))
+        rg.addWidget(QLabel("锚点 X"), 0, 0)
+        rg.addWidget(self._anchor_x, 0, 1)
+        rg.addWidget(QLabel("锚点 Y"), 1, 0)
+        rg.addWidget(self._anchor_y, 1, 1)
+        rg.addWidget(QLabel("缩放倍率"), 2, 0)
+        rg.addWidget(self._scale, 2, 1)
+        rg.addWidget(QLabel("偏移 X"), 3, 0)
+        rg.addWidget(self._off_x, 3, 1)
+        rg.addWidget(QLabel("偏移 Y"), 4, 0)
+        rg.addWidget(self._off_y, 4, 1)
+        rg.addWidget(QLabel("动画帧间隔"), 5, 0)
+        rg.addWidget(self._interval, 5, 1)
+        right.addWidget(render_box)
+
+        st_row = QHBoxLayout()
+        st_row.addWidget(QLabel("状态图"))
+        self._state_combo = QComboBox()
+        self._state_combo.addItems(list(pet_resources.STATE_NAMES))
+        st_pick = QPushButton("选图…")
+        st_pick.clicked.connect(self._pick_state)
+        st_clear = QPushButton("清除")
+        st_clear.clicked.connect(self._clear_state)
+        st_row.addWidget(self._state_combo, 1)
+        st_row.addWidget(st_pick)
+        st_row.addWidget(st_clear)
+        right.addLayout(st_row)
+        self._states_status = QLabel("")
+        self._states_status.setWordWrap(True)
+        right.addWidget(self._states_status)
+        body.addLayout(right, 1)
+        root.addLayout(body)
+
+        btns = QHBoxLayout()
+        self._ok = QPushButton("保存")
+        self._cancel = QPushButton("取消")
+        self._ok.setDefault(True)
+        self._ok.clicked.connect(self._save)
+        self._cancel.clicked.connect(self.reject)
+        btns.addStretch(1)
+        btns.addWidget(self._ok)
+        btns.addWidget(self._cancel)
+        root.addLayout(btns)
+
+        self._refresh_form_list()
+
+    # ---------- 表单同步 ----------
+    def _mark(self, group):
+        """用户改动标记：仅被触碰过的字段组写回索引（未触碰保持原结构）。"""
+        if self._loading or self._cur_idx is None:
+            return
+        getattr(self, "_touched_%s" % group).add(self._cur_idx)
+
+    def _sync_current(self):
+        """把控件值写回 self._forms[self._cur_idx]（切换形态 / 保存前调用）。"""
+        if self._cur_idx is None or self._loading:
+            return
+        fm = self._forms[self._cur_idx]
+        fm["name"] = self._form_name.text().strip()[:12] or ("形态%d" % (self._cur_idx + 1))
+        if self._cur_idx in self._touched_render:
+            fm["anchor"] = {"x": round(self._anchor_x.value(), 2), "y": round(self._anchor_y.value(), 2)}
+            fm["scale"] = round(self._scale.value(), 2)
+            fm["offset"] = {"x": self._off_x.value(), "y": self._off_y.value()}
+        if self._cur_idx in self._touched_interval:
+            v = self._interval.value()
+            if v > 0:
+                fm["anim_interval_ms"] = v
+            else:
+                fm.pop("anim_interval_ms", None)
+
+    def _refresh_form_list(self):
+        self._loading = True
+        try:
+            self._form_list.clear()
+            for i, fm in enumerate(self._forms):
+                self._form_list.addItem("%d. %s" % (i + 1, fm.get("name") or "形态%d" % (i + 1)))
+            self._cur_idx = 0
+            self._form_list.setCurrentRow(0)
+            self._load_form(0)
+        finally:
+            self._loading = False
+
+    def _on_form_selected(self, row):
+        if self._loading:
+            return
+        self._sync_current()
+        self._cur_idx = row if row is not None and 0 <= row < len(self._forms) else None
+        if self._cur_idx is not None:
+            self._load_form(self._cur_idx)
+
+    def _load_form(self, idx):
+        fm = self._forms[idx]
+        self._loading = True
+        try:
+            self._form_name.setText(fm.get("name") or "")
+            anchor = fm.get("anchor") or {"x": 0.5, "y": 0.5}
+            self._anchor_x.setValue(float(anchor.get("x", 0.5)))
+            self._anchor_y.setValue(float(anchor.get("y", 0.5)))
+            self._scale.setValue(float(fm.get("scale") or 1.0))
+            off = fm.get("offset") or {"x": 0, "y": 0}
+            self._off_x.setValue(int(off.get("x", 0)))
+            self._off_y.setValue(int(off.get("y", 0)))
+            aiv = fm.get("anim_interval_ms")
+            self._interval.setValue(int(aiv) if isinstance(aiv, (int, float)) and aiv > 0 else 0)
+        finally:
+            self._loading = False
+        self._update_statuses()
+
+    def _update_statuses(self):
+        idx = self._cur_idx
+        if idx is None:
+            return
+        fm = self._forms[idx]
+        pending_img = self._pending_images.get(idx)
+        pending_front = self._pending_front.get(idx)
+        lines = []
+        if pending_img:
+            lines.append("待处理换图：%s" % os.path.basename(pending_img))
+        if pending_front is not None:
+            lines.append("待处理正面图：%s" % (os.path.basename(pending_front) if pending_front else "清除"))
+        elif fm.get("front"):
+            lines.append("已有正面图")
+        st_lines = []
+        for st in pet_resources.STATE_NAMES:
+            if (idx, st) in self._pending_states:
+                st_lines.append("%s(待%s)" % (st, "处理" if self._pending_states[(idx, st)] else "清除"))
+            elif (fm.get("states") or {}).get(st):
+                st_lines.append(st)
+        self._img_status.setText("；".join(lines) if lines else "未选择新素材")
+        self._states_status.setText(("状态图：%s" % "、".join(st_lines)) if st_lines else "状态图：未配置（走程序化表情）")
+        self._preview.setText("")
+        p = self._lib.resolve(fm.get("file") or "") if self._lib else ""
+        if p and os.path.isfile(p):
+            pix = QPixmap(p)
+            if not pix.isNull():
+                self._preview.setPixmap(pix.scaled(
+                    180, 130, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+                return
+        self._preview.setText("无法预览")
+
+    # ---------- 动作 ----------
+    def _move_form(self, delta):
+        idx = self._cur_idx
+        if idx is None:
+            return
+        j = idx + delta
+        if not (0 <= j < len(self._forms)):
+            return
+        self._sync_current()
+        self._forms[idx], self._forms[j] = self._forms[j], self._forms[idx]
+        # 待处理映射与触碰标记同步换序
+        for table in (self._pending_images, self._pending_front):
+            a, b = table.get(idx), table.get(j)
+            table.pop(idx, None)
+            table.pop(j, None)
+            if b is not None:
+                table[idx] = b
+            if a is not None:
+                table[j] = a
+        new_states = {}
+        for (fi, st), v in self._pending_states.items():
+            fi2 = j if fi == idx else (idx if fi == j else fi)
+            new_states[(fi2, st)] = v
+        self._pending_states = new_states
+        for touched in (self._touched_name, self._touched_render, self._touched_interval):
+            if idx in touched or j in touched:
+                new_t = set()
+                for fi in touched:
+                    new_t.add(j if fi == idx else (idx if fi == j else fi))
+                touched.clear()
+                touched.update(new_t)
+        # 重建列表期间屏蔽 currentRowChanged，避免把旧控件值写回已换序的形态
+        self._loading = True
+        try:
+            self._form_list.clear()
+            for i, fm in enumerate(self._forms):
+                self._form_list.addItem("%d. %s" % (i + 1, fm.get("name") or "形态%d" % (i + 1)))
+            self._cur_idx = j
+            self._form_list.setCurrentRow(j)
+        finally:
+            self._loading = False
+        self._load_form(j)
+
+    def _pick_image(self):
+        if self._cur_idx is None:
+            return
+        src, _f = QFileDialog.getOpenFileName(
+            self, "选择新的形态图", "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not src:
+            return
+        pix, err = self._validate_image(src)
+        if pix is None:
+            _warn(self, "换图", err)
+            return
+        self._pending_images[self._cur_idx] = src
+        self._update_statuses()
+
+    def _pick_front(self):
+        if self._cur_idx is None:
+            return
+        src, _f = QFileDialog.getOpenFileName(
+            self, "选择正面图（缺省与侧面同图）", "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not src:
+            return
+        pix, err = self._validate_image(src)
+        if pix is None:
+            _warn(self, "正面图", err)
+            return
+        self._pending_front[self._cur_idx] = src
+        self._update_statuses()
+
+    def _clear_front(self):
+        if self._cur_idx is None:
+            return
+        self._pending_front[self._cur_idx] = None
+        self._update_statuses()
+
+    def _pick_state(self):
+        if self._cur_idx is None:
+            return
+        st = self._state_combo.currentText()
+        src, _f = QFileDialog.getOpenFileName(
+            self, "选择状态图「%s」（未配置走程序化表情）" % st, "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not src:
+            return
+        pix, err = self._validate_image(src)
+        if pix is None:
+            _warn(self, "状态图", err)
+            return
+        self._pending_states[(self._cur_idx, st)] = src
+        self._update_statuses()
+
+    def _clear_state(self):
+        if self._cur_idx is None:
+            return
+        st = self._state_combo.currentText()
+        self._pending_states[(self._cur_idx, st)] = None
+        self._update_statuses()
+
+    def _validate_image(self, src):
+        try:
+            if os.path.getsize(src) > 10 * 1024 * 1024:
+                return None, "文件超过 10MB，无法使用"
+            pix = QPixmap(src)
+            if pix.isNull():
+                return None, "无法加载该图片"
+        except Exception:
+            return None, "读取图片失败"
+        return pix, None
+
+    def _process_pending(self):
+        """把待处理的换图/正面图/状态图跑默认管线（去背景+裁剪），返回 (ok, err)。"""
+        if not (self._pending_images or any(v for v in self._pending_front.values())
+                or any(v for v in self._pending_states.values())):
+            return True, ""
+        self._tmpdir = tempfile.mkdtemp(prefix="role_edit_")
+        self._process_list = []  # [(kind, idx|(idx,state), tmp_path)]
+        try:
+            n = 0
+            for idx, src in self._pending_images.items():
+                out = os.path.join(self._tmpdir, "img%d.png" % n)
+                okp, notesp = _prepare_role_png(src, out)
+                if not okp:
+                    return False, "形态 %d 换图处理失败：%s" % (idx + 1, notesp)
+                self._process_list.append(("image", idx, out))
+                n += 1
+            for idx, src in self._pending_front.items():
+                if not src:
+                    continue
+                out = os.path.join(self._tmpdir, "img%d.png" % n)
+                okp, notesp = _prepare_role_png(src, out)
+                if not okp:
+                    return False, "形态 %d 正面图处理失败：%s" % (idx + 1, notesp)
+                self._process_list.append(("front", idx, out))
+                n += 1
+            for (idx, st), src in self._pending_states.items():
+                if not src:
+                    continue
+                out = os.path.join(self._tmpdir, "img%d.png" % n)
+                okp, notesp = _prepare_role_png(src, out)
+                if not okp:
+                    return False, "形态 %d 状态图「%s」处理失败：%s" % (idx + 1, st, notesp)
+                self._process_list.append(("state", (idx, st), out))
+                n += 1
+            return True, ""
+        except Exception as e:
+            return False, "处理失败：%s" % e
+
+    def _save(self):
+        if self._lib is None:
+            return
+        self._sync_current()
+        okp, errp = self._process_pending()
+        if not okp:
+            _warn(self, "编辑角色", errp)
+            return
+        name = self._name_edit.text().strip()
+        if not name:
+            _warn(self, "编辑角色", "角色名不能为空")
+            return
+        patch_forms = copy.deepcopy(self._forms)
+        # 处理结果写入 roles/ 目录（新文件名，不换 id）
+        try:
+            for kind, key, tmp_path in getattr(self, "_process_list", []):
+                staged = self._lib.stage_file(tmp_path)
+                if staged is None:
+                    raise RuntimeError("写入角色目录失败")
+                self._staged.append(staged)
+                if kind == "image":
+                    patch_forms[key]["file"] = staged
+                elif kind == "front":
+                    patch_forms[key]["front"] = staged
+                else:
+                    idx, st = key
+                    patch_forms[idx].setdefault("states", {})[st] = staged
+            for idx, src in self._pending_front.items():
+                if src is None:
+                    patch_forms[idx].pop("front", None)
+            for (idx, st), src in self._pending_states.items():
+                if src is None:
+                    patch_forms[idx].setdefault("states", {}).pop(st, None)
+        except Exception:
+            self._cleanup_staged()
+            _warn(self, "编辑角色", "素材写入失败")
+            return
+        # M1 修复：旧引用集合用库的 _role_paths 全量收集（含 animations 帧），
+        # 避免换图后误删仍被 animations.idle 引用的首帧（帧动画静默丢失）
+        old_refs = set(self._lib._role_paths(self._role))
+        ok, err = self._lib.update(self._role_id, {"name": name, "forms": patch_forms})
+        if not ok:
+            self._cleanup_staged()
+            _warn(self, "编辑角色", err or "保存失败")
+            return
+        # 成功：清理不再被引用的旧素材文件
+        new_refs = set(self._lib._role_paths(self._lib.get(self._role_id)))
+        for f in sorted(old_refs - new_refs):
+            if f:
+                p = self._lib.resolve(f)
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass  # 有意忽略：旧文件清理尽力而为（索引已更新，残留仅占空间）
+        self.accept()
+
+    def _cleanup_staged(self):
+        """删除本次写入但未提交（或提交失败）的新文件。"""
+        for fn in self._staged:
+            p = self._lib.resolve(fn)
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                pass  # 有意忽略：孤儿文件清理尽力而为
+        self._staged = []
+
+    def _cleanup(self):
+        if self._tmpdir:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
+
+    def closeEvent(self, event):
+        self._cleanup()
+        super().closeEvent(event)
 
 
 # ---------------- a) 角色面板 ----------------
@@ -1334,12 +1948,15 @@ class RolePanel(QWidget):
         btns = QHBoxLayout()
         self._btn_import = QPushButton("导入角色…")
         self._btn_set = QPushButton("设为当前")
+        self._btn_edit = QPushButton("编辑…")
         self._btn_del = QPushButton("删除")
         self._btn_default = QPushButton("恢复默认")
-        for b in (self._btn_import, self._btn_set, self._btn_del, self._btn_default):
+        for b in (self._btn_import, self._btn_set, self._btn_edit,
+                  self._btn_del, self._btn_default):
             btns.addWidget(b)
         self._btn_import.clicked.connect(self._import)
         self._btn_set.clicked.connect(self._set_active)
+        self._btn_edit.clicked.connect(self._edit)
         self._btn_del.clicked.connect(self._delete)
         self._btn_default.clicked.connect(self._reset_default)
         left.addLayout(btns)
@@ -1379,7 +1996,8 @@ class RolePanel(QWidget):
         self._list.clear()
         if self._lib is None:
             self._list.addItem("角色库不可用")
-            for b in (self._btn_import, self._btn_set, self._btn_del, self._btn_default):
+            for b in (self._btn_import, self._btn_set, self._btn_edit,
+                      self._btn_del, self._btn_default):
                 b.setEnabled(False)
             self._info.setText("当前：默认角色")
             self._preview.setText("角色库不可用")
@@ -1388,7 +2006,8 @@ class RolePanel(QWidget):
             self._preview_full.setPixmap(QPixmap())
             self._meta.setText("")
             return
-        for b in (self._btn_import, self._btn_set, self._btn_del, self._btn_default):
+        for b in (self._btn_import, self._btn_set, self._btn_edit,
+                  self._btn_del, self._btn_default):
             b.setEnabled(True)
         active = self._lib.active_id()
         active_name = ""
@@ -1493,9 +2112,16 @@ class RolePanel(QWidget):
             if not data:
                 return
             forms_src = data.get("forms") or None
-            role, err = self._lib.import_processed(data["base"], None, data["name"],
-                                                   frames_src=data.get("frames") or None,
-                                                   forms_src=forms_src)
+            opts = data.get("options") or {}
+            role, err = self._lib.import_processed(
+                data["base"], None, data["name"],
+                frames_src=data.get("frames") or None,
+                forms_src=forms_src,
+                interval_ms=opts.get("interval_ms"),
+                render=opts.get("render"),
+                keep_source=bool(opts.get("keep_source")),
+                source_files=data.get("sources"),
+            )
             if role is None:
                 _warn(self._parent_widget(), "导入角色", err or "导入失败")
                 return
@@ -1514,6 +2140,31 @@ class RolePanel(QWidget):
                   "导入成功！\n\n· %s\n\n%s" % ("\n· ".join(data["notes"]), tip))
         finally:
             dlg._cleanup()  # 任何路径都清理向导临时文件（含取消/失败）
+
+    def _edit(self):
+        """P1-7：编辑选中角色（改名/换图/调序/渲染参数/状态图，不换 id）。"""
+        if self._lib is None:
+            return
+        it = self._list.currentItem()
+        if it is None:
+            _warn(self._parent_widget(), "编辑角色", "先在列表里选中一个角色")
+            return
+        rid = it.data(Qt.ItemDataRole.UserRole)
+        if not rid:
+            return
+        dlg = RoleEditDialog(self._parent_widget(), self._lib, rid)
+        try:
+            if modal(dlg) != QDialog.DialogCode.Accepted:
+                return
+            role = self._lib.get(rid) or {}
+            self._refresh()
+            # 编辑的是当前角色 → 立即重载贴图（换图/调参实时生效）
+            if self._lib.active_id() == rid:
+                _call(self._pet, "apply_role", rid)
+            _info(self._parent_widget(), "编辑角色",
+                  "已保存「%s」的修改。" % role.get("name", ""))
+        finally:
+            dlg._cleanup()  # 任何路径都清理编辑临时目录
 
     def _set_active(self):
         if self._lib is None:
