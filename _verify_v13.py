@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 
 FAILS = []
 CHECKS = []
-EXPECT_CHECKS = 206  # v2.0.5：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
+EXPECT_CHECKS = 207  # v2.0.7：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
 
 
 def check(name, cond, extra=""):
@@ -1176,6 +1176,7 @@ def main_flow():
         ("Lines", lambda: pet_dialogs.LinesDialog(pet)),
         ("AmountNote", lambda: pet_dialogs.AmountNoteDialog(pet)),
         ("RoleImport", lambda: pet_dialogs.RoleImportDialog(pet)),
+        ("Voice", lambda: pet_dialogs.VoiceDialog(pet)),  # v2.0.7：防回归（曾因布局误传 addWidget 打不开）
     ):
         try:
             dlg = mk()

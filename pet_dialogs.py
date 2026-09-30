@@ -3740,8 +3740,8 @@ class VoiceDialog(QDialog):
         self._mode.addItem("关闭合成（只用片段）", "off")
         self._mode.addItem("本地系统语音（离线，无需 Key）", "sapi")
         self._mode.addItem("API 合成（OpenAI 兼容 /audio/speech）", "api")
-        root.addWidget(row)
-        root.addWidget(self._mode)
+        row.addWidget(self._mode, 1)
+        root.addLayout(row)  # v2.0.7 修复：布局须走 addLayout（此前误传 addWidget 致构造崩溃、对话框打不开）
         _mi = self._mode.findData(cfg.get("tts_mode", "off"))
         if _mi >= 0:
             self._mode.setCurrentIndex(_mi)
