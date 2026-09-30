@@ -48,7 +48,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -283,6 +283,54 @@ def _remove_files(paths):
         except Exception:
             pass
     return removed
+
+
+# ---------------- P1-4：多屏几何（吸附/气泡/漫游/回收共用） ----------------
+# 距屏右下角的默认边距（初始落位与掉屏回收共用）
+SCREEN_EDGE_MARGIN_X = 40
+SCREEN_EDGE_MARGIN_Y = 80  # 纵向留得多：让出任务栏
+
+
+def screen_geometry_at(pt, screens=None):
+    """取全局逻辑坐标点 pt 所在屏幕与其 availableGeometry。
+    pt 为 None 或屏幕为空时返回 (None, None)。
+
+    Qt6 的 QScreen.geometry()/availableGeometry() 本身就是逻辑(DIP)坐标，
+    与 QWidget.move() 同一坐标系——混合 DPI 无需手工 devicePixelRatio 换算，
+    跨 100%/125%/150% 缩放的屏幕吸附与定位天然对齐。
+
+    点在屏幕外或屏幕间隙（双屏缝隙/负坐标副屏/竖屏）时，回退到**中心距离
+    最近的屏幕**（而不是盲目回主屏），保证吸附、气泡、漫游目标不跳错屏。
+
+    screens 参数供测试注入假屏幕；为 None 时取 QApplication.screens()。
+    返回 (QScreen, QRect)；无屏幕时返回 (None, None)。
+    """
+    if pt is None:
+        return None, None
+    if screens is None:
+        try:
+            screens = QApplication.screens()
+        except Exception:
+            screens = []
+    if not screens:
+        return None, None
+    try:
+        scr = QApplication.screenAt(pt) if QApplication.instance() is not None else None
+    except Exception:
+        scr = None
+    if scr is not None and scr in screens:
+        return scr, scr.availableGeometry()
+    best = None
+    best_d = None
+    for s in screens:
+        c = s.availableGeometry().center()
+        d = (pt.x() - c.x()) ** 2 + (pt.y() - c.y()) ** 2
+        if best_d is None or d < best_d:
+            best_d = d
+            best = s
+    if best is None:
+        return None, None
+    return best, best.availableGeometry()
 
 
 # ---------------- P1-3：配置 schema 版本与迁移 ----------------
@@ -1025,6 +1073,10 @@ class Bubble(QWidget):
         self._timer.timeout.connect(self.hide)
 
     def show_text(self, text, anchor_global):
+        # P1-4：先定位屏（间隙取最近屏）；无屏直接放弃，不做半截状态变更
+        scr = screen_geometry_at(anchor_global)[1]
+        if scr is None:
+            return
         self._text = text
         try:
             font_size = max(8, min(18, int(BUBBLE_STYLE.get("font_size", 10) or 10)))
@@ -1035,7 +1087,6 @@ class Bubble(QWidget):
         w = max(88, min(236, r.width() + 60))
         h = max(52, r.height() + 46)
         self.resize(w, h)
-        scr = (QApplication.screenAt(anchor_global) or QApplication.primaryScreen()).availableGeometry()
         x = anchor_global.x() - w // 2
         y = anchor_global.y() - h - 10
         if y < scr.top():
@@ -1271,15 +1322,25 @@ class PetWindow(QWidget):
 
         scale = self.cfg.get("scale", 1.0)
         if not os.path.exists(CONFIG_PATH):
-            scr = QApplication.primaryScreen().availableGeometry()
-            scale = max(0.25, min(1.0, round(scr.height() * 0.18 / self.base_h, 2)))
+            try:
+                scr = QApplication.primaryScreen()
+                if scr is not None:
+                    scale = max(0.25, min(1.0, round(scr.availableGeometry().height() * 0.18 / self.base_h, 2)))
+            except Exception:
+                pass
         self.set_scale(scale)
         self.cfg["scale"] = self.scale
         self._play_idle()
 
-        # 初始位置：屏幕右下
-        scr = QApplication.primaryScreen().availableGeometry()
-        self.move(scr.right() - self.width() - 40, scr.bottom() - self.height() - 80)
+        # 初始位置：主屏右下（P1-4：SCREEN_EDGE_MARGIN 常量；无屏极端场景留原地）
+        try:
+            scr = QApplication.primaryScreen()
+            if scr is not None:
+                ag = scr.availableGeometry()
+                self.move(ag.right() - self.width() - SCREEN_EDGE_MARGIN_X,
+                          ag.bottom() - self.height() - SCREEN_EDGE_MARGIN_Y)
+        except Exception:
+            pass
 
         # 拖动状态
         self._drag_offset = None
@@ -1818,14 +1879,28 @@ class PetWindow(QWidget):
         self._ensure_on_screen()
 
     def _ensure_on_screen(self):
-        """窗口完全离开所有屏幕（分辨率切换/拔显示器）时收回主屏右下角。"""
+        """窗口基本离开所有屏幕（分辨率切换/拔显示器）时收回最近屏右下角。
+
+        P1-4：可见性判据收紧——中心在某屏上，或与某屏完整 geometry 相交面积
+        ≥25%（任意 1px 相交不算可见，避免只剩一条边挂屏上点不到）；判据用
+        完整 geometry() 而非 availableGeometry()：拖到任务栏后方藏大半是合法
+        玩法，不算离屏。回收目标用 availableGeometry 落点（避开任务栏），
+        且回收到**最近屏**（负坐标副屏/竖屏均正确），而不是盲目回主屏。"""
         try:
             geo = self.frameGeometry()
+            center = geo.center()
+            area = max(1, geo.width() * geo.height())
             for scr in QApplication.screens():
-                if scr.availableGeometry().intersects(geo):
+                g = scr.geometry()
+                if g.contains(center):
                     return
-            scr = QApplication.primaryScreen().availableGeometry()
-            self.move(scr.right() - self.width() - 40, scr.bottom() - self.height() - 80)
+                inter = g.intersected(geo)
+                if inter.width() * inter.height() >= area * 0.25:
+                    return
+            _, ag = screen_geometry_at(center)
+            if ag is not None:
+                self.move(ag.right() - self.width() - SCREEN_EDGE_MARGIN_X,
+                          ag.bottom() - self.height() - SCREEN_EDGE_MARGIN_Y)
         except Exception:
             pass
 
@@ -1888,8 +1963,14 @@ class PetWindow(QWidget):
         x = self.x() + self.width() + 8
         y = self.y() + pad_top
         scr = self._screen_geo(self.frameGeometry().center())
+        if scr is None:
+            return  # 无屏（headless 极端场景）：不动托盘
         if x + self.food_tray.width() > scr.right():
             x = self.x() - self.food_tray.width() - 8
+        # P1-4：y 也钳进所在屏——负 y 竖屏副屏顶部不再出屏
+        if y + self.food_tray.height() > scr.bottom():
+            y = max(scr.top(), scr.bottom() - self.food_tray.height() - 4)
+        y = max(scr.top(), y)
         self.food_tray.move(max(scr.left(), x), y)
 
     def _set_food_tray(self, on):
@@ -2280,7 +2361,12 @@ class PetWindow(QWidget):
                 return
         elif self.cfg.get("wander"):
             scr = self._screen_geo(self.frameGeometry().center())
-            if self._wander_target is None or self._reached(self._wander_target):
+            if scr is None:
+                return  # 无屏（headless 极端场景）：本 tick 不漫游
+            # P1-4：换屏后旧目标可能落在上一块屏——目标不在当前屏就重新生成，
+            # 避免被拖到副屏后还执着走回第一屏
+            if (self._wander_target is None or self._reached(self._wander_target)
+                    or not scr.contains(self._wander_target)):
                 xmin = scr.left() + 20
                 xmax = max(xmin, scr.right() - self.width() - 20)
                 ymin = scr.top() + 20
@@ -2626,7 +2712,8 @@ class PetWindow(QWidget):
             self._do_jump()
 
     def _screen_geo(self, pt):
-        return (QApplication.screenAt(pt) or QApplication.primaryScreen()).availableGeometry()
+        """pt 所在屏（间隙/屏外取最近屏）的 availableGeometry；无屏返回 None（调用方守卫）。"""
+        return screen_geometry_at(pt)[1]
 
     def _press_squash(self, pressed):
         if pressed and self.busy:
@@ -2642,7 +2729,10 @@ class PetWindow(QWidget):
         self._apply_transform()
 
     def _snap_to_edge(self):
+        # P1-4：以「所在屏」（间隙取最近屏）吸附，混合 DPI 下用逻辑坐标天然对齐
         scr = self._screen_geo(self.frameGeometry().center())
+        if scr is None:
+            return
         cx = self.pos().x() + self.width() // 2
         cy = self.pos().y() + self.height() // 2
         x, y = self.pos().x(), self.pos().y()
