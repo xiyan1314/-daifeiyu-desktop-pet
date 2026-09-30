@@ -42,6 +42,41 @@ main.CONFIG_PATH = os.path.join(_tmp, "config.json")
 main.USAGE_PATH = os.path.join(_tmp, "usage.json")
 main.MEMORY_PATH = os.path.join(_tmp, "memory.json")  # P1-6：对话记忆同样隔离到临时目录
 
+# ---- P1-3：配置 schema 版本 / diff 存储 / 坏值修正提示 ----
+check("config schema const", main.CONFIG_SCHEMA_VERSION == 2, main.CONFIG_SCHEMA_VERSION)
+_cfg_tmp = main.CONFIG_PATH
+try:
+    _cfg_full = dict(main.DEFAULT_CONFIG)
+    _cfg_full["city"] = "上海"
+    _cfg_full["scale"] = 1.5
+    main.save_config(_cfg_full)
+    with open(_cfg_tmp, "r", encoding="utf-8") as f:
+        _cfg_on_disk = main.json.load(f)
+    check("config diff save", _cfg_on_disk.get("city") == "上海"
+          and _cfg_on_disk.get("scale") == 1.5
+          and "ai_enabled" not in _cfg_on_disk
+          and _cfg_on_disk.get("schema_version") == main.CONFIG_SCHEMA_VERSION,
+          sorted(_cfg_on_disk.keys()))
+    _cfg_back = main.load_config()
+    check("config diff roundtrip", _cfg_back.get("city") == "上海" and _cfg_back.get("ai_model") == "deepseek-chat")
+    with open(_cfg_tmp, "w", encoding="utf-8") as f:
+        main.json.dump({"city": "东京", "scale": 2.0, "legacy_junk": 1}, f, ensure_ascii=False)
+    _cfg_v1 = main.load_config()
+    check("config v1 migrate", _cfg_v1.get("city") == "东京" and _cfg_v1.get("_resave") is True
+          and "legacy_junk" not in _cfg_v1)
+    main.save_config(_cfg_v1)
+    with open(_cfg_tmp, "r", encoding="utf-8") as f:
+        _cfg_on_disk2 = main.json.load(f)
+    check("config v1 resave as v2", _cfg_on_disk2.get("schema_version") == main.CONFIG_SCHEMA_VERSION
+          and "legacy_junk" not in _cfg_on_disk2)
+    with open(_cfg_tmp, "w", encoding="utf-8") as f:
+        main.json.dump({"scale": 99, "chat_memory_rounds": "abc"}, f, ensure_ascii=False)
+    _cfg_bad = main.load_config()
+    check("config bad value fix", _cfg_bad.get("scale") == 4.0 and _cfg_bad.get("_resave") is True
+          and any("scale" in x for x in main.CONFIG_FIXES))
+finally:
+    main.save_config(dict(main.DEFAULT_CONFIG))  # 恢复隔离目录内的干净配置
+
 
 def make_test_png(path, w=256, h=256):
     """生成一张带透明底的测试 PNG（供角色导入用）。"""

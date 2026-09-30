@@ -17,6 +17,7 @@ import threading
 import time
 import base64
 import shutil
+import copy
 import ctypes
 import re
 from ctypes import wintypes
@@ -47,7 +48,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -138,6 +139,26 @@ DEFAULT_CONFIG = {
     "ai_max_tokens": 60,
     "ai_reply_len": 25,
 }
+
+# P1-3：config.json schema 版本（1=旧版全量存储；2=diff 只存改动项）
+CONFIG_SCHEMA_VERSION = 2
+# P1-3：本次加载被自动修正的字段说明（load_config 重置，启动提示一次后不再提示）
+CONFIG_FIXES = []
+# P1-3：软归一化键——合法值的美化（bool 字符串、strip、rstrip 等）不算「坏值」：
+# 静默重存但不弹修正提示；其余键的改动才算「坏值已修正」
+_SOFT_FIX_KEYS = {"always_on_top", "ai_enabled", "follow_mouse", "wander", "sound", "badge",
+                  "ai_base_url", "ai_model", "ai_system_prompt", "lines_extra",
+                  "sound_group", "role", "scale_compensated_role"}
+
+
+def _fix_entry(k, a, b):
+    """单条修正说明：嵌套 dict/list 只报键名，标量报前后值，总长截断防气泡爆炸。"""
+    if isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
+        return "%s 已修正" % k
+    entry = "%s: %r→%r" % (k, a, b)
+    if len(entry) > 30:
+        entry = entry[:27] + "…"
+    return entry
 
 # 气泡样式（配置驱动；apply_bubble_style 更新，Bubble.paintEvent 读取）
 BUBBLE_STYLE = dict(DEFAULT_CONFIG["bubble_style"])
@@ -264,18 +285,85 @@ def _remove_files(paths):
     return removed
 
 
+# ---------------- P1-3：配置 schema 版本与迁移 ----------------
+def _migrate_1_to_2(data):
+    """v1(全量存储、无 schema_version) → v2(diff 存储)：字段名无变化，仅登记版本。
+
+    旧版多余字段由 load_config 的 DEFAULT_CONFIG 白名单自然丢弃；
+    本函数为将来字段重命名/拆分的迁移留位。"""
+
+
+_CONFIG_MIGRATIONS = {1: _migrate_1_to_2}
+
+
+def migrate_config(data, from_ver):
+    """按版本链把旧配置迁移到当前 schema（就地修改 dict）。
+
+    返回 True 表示迁移完整到达当前版本；False 表示某步迁移缺失/失败——
+    此时**不**升级版本号，调用方按「未迁移」处理，避免半成品数据被标成最新版本。"""
+    v = from_ver
+    while v < CONFIG_SCHEMA_VERSION:
+        fn = _CONFIG_MIGRATIONS.get(v)
+        if fn is None:
+            _log_error("migrate_config: 缺少 %d→%d 迁移函数，中止迁移" % (v, v + 1))
+            return False
+        try:
+            fn(data)
+        except Exception as e:
+            _log_error("migrate_config %d→%d 失败: %r" % (v, v + 1, e))
+            return False
+        v += 1
+    data["schema_version"] = CONFIG_SCHEMA_VERSION
+    return True
+
+
+def _parse_schema_version(raw):
+    """schema_version 必须是 1..N 的整数；缺失/非法（浮点/负数/字符串）一律按 v1 处理。"""
+    if isinstance(raw, float):
+        return 1  # int(2.5)=2 会静默截断：显式拒绝
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    if v < 1:
+        return 1
+    return v
+
+
 def load_config():
+    global CONFIG_FIXES
+    CONFIG_FIXES = []
     cfg = dict(DEFAULT_CONFIG)
+    future_cfg = False  # P1-3：读到未来版本配置时禁写回（防降级覆盖未来键）
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
+            ver = _parse_schema_version(data.get("schema_version"))
+            if ver > CONFIG_SCHEMA_VERSION:
+                # 未来版本写出的配置：只合并认识的键，不迁移、不回写（兼容模式只读）
+                future_cfg = True
+                _log_error("load_config: schema v%d 高于当前 v%d，按兼容模式读取"
+                           % (ver, CONFIG_SCHEMA_VERSION))
+            elif ver < CONFIG_SCHEMA_VERSION:
+                if migrate_config(data, ver):
+                    cfg["_resave"] = True  # 旧版配置：迁移成功后立即按新 schema（diff）重存
             for k, v in data.items():
                 if k in DEFAULT_CONFIG:
                     cfg[k] = v
     except Exception as e:
         _log_error("load_config 读取失败（按默认值运行）: %r" % (e,))
         set_redact_key("")  # 配置读不到=没有 key：同步脱敏缓存，阻断 _redact 兜底重读的日志环
+    # 密文 key 解密：放在修正快照之前，避免 dpapi: 前缀被误判为「被修正」
+    raw_key = str(cfg.get("api_key", "") or "")
+    if raw_key and not raw_key.startswith("dpapi:"):
+        if not future_cfg:
+            cfg["_resave"] = True  # 旧版明文 key，立即重加密
+    cfg["api_key"] = decrypt_secret(raw_key)
+    if raw_key.startswith("dpapi:") and not cfg["api_key"]:
+        # DPAPI 解密失败（换用户/换机器）：本次按空 Key 运行，不改写磁盘防密文被误清
+        _log_error("load_config: api_key DPAPI 解密失败，本次按空 Key 运行（不改写磁盘）")
+    before = copy.deepcopy(cfg)  # P1-3：归一化前快照，用于检测「被自动修正的字段」
     try:
         cfg["scale"] = max(0.2, min(4.0, float(cfg.get("scale", 1.0))))
     except (TypeError, ValueError):
@@ -284,10 +372,6 @@ def load_config():
     cfg["ai_enabled"] = _to_bool(cfg.get("ai_enabled", False))
     cfg["follow_mouse"] = _to_bool(cfg.get("follow_mouse", False))
     cfg["wander"] = _to_bool(cfg.get("wander", False))
-    raw_key = str(cfg.get("api_key", "") or "")
-    if raw_key and not raw_key.startswith("dpapi:"):
-        cfg["_resave"] = True  # 旧版明文 key，立即重加密
-    cfg["api_key"] = decrypt_secret(raw_key)
     cfg["city"] = str(cfg.get("city", "北京") or "北京")
     cfg["sound"] = _to_bool(cfg.get("sound", True))
     cfg["badge"] = _to_bool(cfg.get("badge", False))
@@ -343,14 +427,31 @@ def load_config():
         for k in ("sajiao", "greedy", "happy", "idle"):
             norm_le[k] = []
     cfg["lines_extra"] = norm_le
+    # P1-3：坏值修正检测——与快照对比。软归一化（合法值美化）静默重存不弹提示；
+    # 硬修正（越界/类型非法）记入 CONFIG_FIXES 供启动气泡提示一次
+    soft_changed = False
+    for k in tuple(before):
+        if k not in DEFAULT_CONFIG:
+            continue
+        if before[k] != cfg[k]:
+            if k in _SOFT_FIX_KEYS:
+                soft_changed = True
+            else:
+                CONFIG_FIXES.append(_fix_entry(k, before[k], cfg[k]))
+    if (CONFIG_FIXES or soft_changed) and not future_cfg:
+        cfg["_resave"] = True
     return cfg
 
 
 def save_config(cfg):
     try:
-        out = dict(cfg)
+        # P1-3：diff 存储——只落盘与默认值不同的键（api_key 特殊处理），schema 版本随写
+        out = {"schema_version": CONFIG_SCHEMA_VERSION}
+        for k, v in cfg.items():
+            if k in DEFAULT_CONFIG and v != DEFAULT_CONFIG[k]:
+                out[k] = v
         try:
-            out["api_key"] = encrypt_secret(str(out.get("api_key", "") or ""))
+            out["api_key"] = encrypt_secret(str(cfg.get("api_key", "") or ""))
         except Exception:
             # 加密失败：绝不落盘明文。磁盘旧值仅当是 dpapi: 密文时才回写；
             # 旧值是 legacy 明文/缺失则写空串（防把明文重落盘）。
@@ -1007,6 +1108,13 @@ class PetWindow(QWidget):
         set_redact_key(self.cfg.get("api_key", ""))
         if self.cfg.pop("_resave", False):
             save_config(self.cfg)
+        # P1-3：启动提示一次——本次加载被自动修正的坏值（修正后已重存，下次不再提示）
+        if CONFIG_FIXES:
+            n = len(CONFIG_FIXES)
+            fixes = list(CONFIG_FIXES)  # 拷贝进闭包：1.5s 后展示时不被后续 load_config 重置串味
+            detail = "、".join(fixes[:2]) + ("…" if n > 2 else "")
+            QTimer.singleShot(1500, lambda: self.show_bubble(
+                "配置有 %d 处坏值，已自动修正：%s" % (n, detail)))
         # ---- v1.3：角色库 / 音频库 / 记账账本 ----
         self.role_lib = pet_resources.RoleLibrary(DATA_DIR)
         self.audio_lib = pet_resources.AudioLibrary(DATA_DIR)

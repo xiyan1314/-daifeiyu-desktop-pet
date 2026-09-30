@@ -107,8 +107,8 @@ desktop-pet/
 ├── 大肥鱼桌宠.spec      # PyInstaller spec (optional exe build)
 └── docs/                # design docs
 
-> Runtime data (auto-generated, not committed): config.json (DPAPI-encrypted key), ledger.json /
-> ledger_archive.json, roles/ + roles.json, audio/ + audio.json
+> Runtime data (auto-generated, not committed): config.json (since v2: diff-only storage,
+> DPAPI-encrypted key), ledger.json / ledger_archive.json, roles/ + roles.json, audio/ + audio.json
 ```
 
 > Asset note: the petpet/money animations and task-end-a/exp-orb sounds are inspired by the MIT-licensed dsh-whale-widget plugin (DeepSeek-Balance-Whale-Widget series); frame images were converted from GIFs.

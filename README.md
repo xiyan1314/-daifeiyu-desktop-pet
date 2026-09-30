@@ -111,8 +111,8 @@ desktop-pet/
 ├── 大肥鱼桌宠.spec      # PyInstaller 打包配置（可选 exe 版）
 └── docs/                # 需求与设计文档
 
-> 运行时数据（自动生成，请勿提交）：config.json（含 DPAPI 加密 Key）、ledger.json /
-> ledger_archive.json（账本）、roles/ + roles.json（角色库）、audio/ + audio.json（音频库）
+> 运行时数据（自动生成，请勿提交）：config.json（v2 起只存改动项 diff；含 DPAPI 加密 Key）、
+> ledger.json / ledger_archive.json（账本）、roles/ + roles.json（角色库）、audio/ + audio.json（音频库）
 ```
 
 > 素材说明：petpet/money 动图与 task-end-a/exp-orb 音效概念借自 MIT 开源的
