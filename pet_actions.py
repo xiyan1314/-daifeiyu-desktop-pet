@@ -39,7 +39,9 @@ class ActionService:
     def play_action(self, name, arg=None):
         """P3-2：按名称点播动作（闲逛加权随机与右键「动作」菜单共用同一实现）。
 
-        与 idle_tick 同款门控：busy/摸摸头/跟随/散步中不播；睡眠中先醒来再表演。"""
+        与 idle_tick 同款门控：busy/摸摸头/跟随/散步中不播；睡眠中先醒来再表演。
+        分派优先级：内建分支（jump/emote）→ 帧集动作（内建 + v2.0.1 自定义命名帧动作，
+        播一次回待机）→ v2.0.1 程序化合成动作（呼吸/摇摆/点头）。"""
         pet = self.pet
         if name == "none":
             return
@@ -51,6 +53,22 @@ class ActionService:
             self.do_jump()
         elif name == "emote":
             pet._show_emote(arg or "note")
+        elif name in (pet.anim._sets or {}):
+            # v2.0.1：自定义命名帧动作——播放一次后回待机。
+            # 先停合成动作（防振荡叠加/播到一半被 proc 收尾截断）
+            _stop = getattr(pet, "_stop_tween", None)
+            if _stop is not None:
+                _stop()
+            # 帧间隔：forms[i].anim_interval_ms 优先；缺省与戳戳帧同口径（EAT_FRAME_MS）
+            interval = pet._cur_form_anim().get("interval_ms") or pet.EAT_FRAME_MS
+            pet.anim_mode = "state"
+            pet._state_timer.stop()
+            pet.anim.play(name, interval, loops=1, on_finish=pet._play_idle)
+        else:
+            procs = pet._cur_procs()
+            if name in procs:
+                # v2.0.1：程序化合成动作（呼吸/摇摆/点头）
+                pet._play_proc(name, procs[name])
 
     def idle_tick(self):
         pet = self.pet

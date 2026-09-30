@@ -25,7 +25,8 @@
                       source_files=None)                   #   states={状态:png}、原图保留 source/
     update(role_id, patch) -> (bool, str)                  # P1-7 就地编辑（改名/换图/调序/渲染
                                                            #   参数/动画/状态图，id 不变，只改索引）
-    form_animations(role_id) -> [{idle/eat/poke/sleep+interval_ms}...]  # P1-7 逐形态动画路径
+    form_animations(role_id) -> [{动作键: 路径...}+interval_ms...]      # P1-7/v2.0.1 逐形态动画路径
+                                                            #   （内建 + 自定义命名帧动作 + 帧间隔合并键）
     form_state_paths(role_id) / form_front_paths(role_id)  # P1-7 状态资源图/front 路径（逐形态对齐）
     is_v2(role_id) -> bool                                 # P1-7 新结构角色标记
     delete(role_id) -> (bool, str)                         # 删全部素材文件+索引；active 则重置 ""
@@ -60,6 +61,7 @@ Copyright (c) 大肥鱼桌宠项目
 
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -74,6 +76,34 @@ FRAME_MAX = 24
 
 # P1-7：动画动作全集（forms[i].animations 的合法键；帧动画播放按「形态×动作」查表）
 ANIM_ACTIONS = ("idle", "eat", "poke", "sleep")
+
+# v2.0.1：动作自定义——内建动作之外的任意命名帧动作（ASCII 安全名，供文件/菜单/行为引用）
+CUSTOM_ACTION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,23}$")
+
+# v2.0.1：程序化合成动作（从角色贴图本身合成，无需额外素材——「动作合成」路径）
+PROC_KINDS = ("breathe", "sway", "nod")
+DEFAULT_PROC_PARAMS = {
+    "breathe": {"amp": 0.04, "period_ms": 1600},  # 呼吸：整体轻微缩放
+    "sway": {"amp": 0.06, "period_ms": 1800},     # 摇摆：左右轻微晃动
+    "nod": {"amp": 12.0, "period_ms": 1400},      # 点头：上下位移（px）
+}
+# v2.0.1：amp 量纲随 kind 不同——breathe/sway 是缩放系数（0.001~1.0），
+# nod 是位移像素（1~64px）。归一化与编辑对话框共用同一口径，避免默认 12px 被钳成 1px。
+PROC_AMP_BOUNDS = {
+    "breathe": (0.001, 1.0),
+    "sway": (0.001, 1.0),
+    "nod": (1.0, 64.0),
+}
+
+# v2.0.1：动作名保留词——play_action 内建分支（jump/emote/none）先于帧集命中，
+# interval_ms 会被 form_animations 合并键覆盖：这些名字作自定义动作名永远是死条目。
+ACTION_RESERVED = ("jump", "emote", "none", "interval_ms")
+
+
+def is_valid_custom_action(name):
+    """v2.0.1：自定义动作名校验——ASCII 安全名且不与内建动作/保留词重名。"""
+    return (isinstance(name, str) and bool(CUSTOM_ACTION_RE.match(name))
+            and name not in ANIM_ACTIONS and name not in ACTION_RESERVED)
 
 # P1-7：状态名全集（forms[i].states 资源图合法键；与 pet_widgets._STATE_MARK_MAP
 # 同源——未配置的状态走程序化叠图兜底，向后兼容）。pet_resources 保持 Qt-free，
@@ -114,20 +144,55 @@ def _norm_offset(v):
 
 
 def _norm_animations(v):
-    """P1-7：animations 归一化 dict[str, list[str]]（每动作 png 文件名列表）。
+    """P1-7/v2.0.1：animations 归一化 dict[str, list[str]]（每动作 png 文件名列表）。
 
-    非法结构丢弃；每个动作的帧数截断到 FRAME_MAX（读侧上限，与导入拒绝同口径）。
-    """
+    键 = 内建动作（ANIM_ACTIONS）或用户自定义动作（is_valid_custom_action：
+    ASCII 安全名且非保留词 jump/emote/none/interval_ms）；非法结构/非法键丢弃；
+    每个动作的帧数截断到 FRAME_MAX（与导入拒绝同口径）。"""
     if not isinstance(v, dict):
         return {}
     out = {}
-    for act in ANIM_ACTIONS:
-        lst = v.get(act)
+    for act, lst in v.items():
+        if not isinstance(act, str) or not (act in ANIM_ACTIONS or is_valid_custom_action(act)):
+            continue
         if not isinstance(lst, list):
             continue
         files = [str(x) for x in lst if str(x).lower().endswith(".png")][:FRAME_MAX]
         if files:
             out[act] = files
+    return out
+
+
+def _norm_procs(v):
+    """v2.0.1：程序化合成动作归一化 {名字: {kind, amp, period_ms}}。
+
+    kind 白名单 PROC_KINDS；amp 按 kind 钳制（breathe/sway 0.001~1.0 缩放系数，
+    nod 1~64px 位移）；period_ms 钳 200~10000；非法条目丢弃（不崩）。
+    名字须通过 is_valid_custom_action（内建动作名/保留词 jump·emote·none·interval_ms
+    重名条目丢弃）：play_action 先查帧集与内建分支，重名合成动作永远不可达
+    （死条目不保留）。"""
+    if not isinstance(v, dict):
+        return {}
+    out = {}
+    for name, p in v.items():
+        if not is_valid_custom_action(name):
+            continue
+        if not isinstance(p, dict):
+            continue
+        kind = p.get("kind")
+        if kind not in PROC_KINDS:
+            continue
+        d = DEFAULT_PROC_PARAMS[kind]
+        lo, hi = PROC_AMP_BOUNDS.get(kind, (0.001, 1.0))
+        try:
+            amp = min(hi, max(lo, float(p.get("amp", d["amp"]))))
+        except (TypeError, ValueError):
+            amp = d["amp"]
+        try:
+            period = min(10000, max(200, int(p.get("period_ms", d["period_ms"]))))
+        except (TypeError, ValueError):
+            period = d["period_ms"]
+        out[name] = {"kind": kind, "amp": amp, "period_ms": period}
     return out
 
 
@@ -304,9 +369,14 @@ class RoleLibrary:
         if off["x"] or off["y"]:
             out["offset"] = off
         # P1-7 动画按形态分组：dict[str, list[str]]；每动作截断 FRAME_MAX
+        # v2.0.1：键支持内建 + 自定义命名帧动作
         anims = _norm_animations(fm.get("animations"))
         if anims:
             out["animations"] = anims
+        # v2.0.1：程序化合成动作（breathe/sway/nod）
+        procs = _norm_procs(fm.get("procs"))
+        if procs:
+            out["procs"] = procs
         # P1-7 帧间隔：可选全局间隔（缺省沿用 IDLE_FRAME_MS/EAT_FRAME_MS）
         aiv = fm.get("anim_interval_ms")
         if isinstance(aiv, (int, float)) and aiv > 0:
@@ -436,7 +506,9 @@ class RoleLibrary:
         for fm in role.get("forms") or []:
             names.append(fm.get("file"))
             names.append(fm.get("front"))
-            for act in ANIM_ACTIONS:
+            # v2.0.1：遍历全部动画动作键（内建 + 自定义命名帧动作），
+            # 保证自定义动作帧也参与删除/换图清理（漏收会导致孤儿文件残留）
+            for act in (fm.get("animations") or {}):
                 names.extend((fm.get("animations") or {}).get(act, []) or [])
             names.extend((fm.get("states") or {}).values())
         out = []
@@ -564,7 +636,12 @@ class RoleLibrary:
         out = []
         for fm in r.get("forms") or []:
             item = {}
-            for act in ANIM_ACTIONS:
+            # v2.0.1：遍历全部动作键（内建 + 自定义命名帧动作）；
+            # "interval_ms" 是帧间隔合并键（下方写入 int），跳过动作同名键
+            # 防帧路径 list 冒充间隔（_play_idle setInterval(int(list)) TypeError）
+            for act in (fm.get("animations") or {}):
+                if act == "interval_ms":
+                    continue
                 paths = []
                 ok = True
                 for fn in (fm.get("animations") or {}).get(act, []) or []:
@@ -585,6 +662,35 @@ class RoleLibrary:
                 item["interval_ms"] = int(aiv)
             out.append(item)
         return out
+
+    def custom_actions(self, role_id, form_idx=0):
+        """v2.0.1：该形态的命名动作清单 [(name, kind)]，kind = frames/proc。
+
+        含自定义帧动作（animations 中非内建键）与程序化动作（procs）；不含内建动作。"""
+        r = self.get(str(role_id or ""))
+        if r is None:
+            return []
+        forms = r.get("forms") or []
+        if not (0 <= form_idx < len(forms)):
+            return []
+        fm = forms[form_idx]
+        out = []
+        for act in (fm.get("animations") or {}):
+            if act not in ANIM_ACTIONS:
+                out.append((act, "frames"))
+        for name in sorted(fm.get("procs") or {}):
+            out.append((name, "proc"))
+        return out
+
+    def procs(self, role_id, form_idx=0):
+        """v2.0.1：该形态的程序化动作 {名字: {kind, amp, period_ms}}（已归一化）。"""
+        r = self.get(str(role_id or ""))
+        if r is None:
+            return {}
+        forms = r.get("forms") or []
+        if not (0 <= form_idx < len(forms)):
+            return {}
+        return dict(forms[form_idx].get("procs") or {})
 
     def form_state_paths(self, role_id):
         """P1-7：逐形态状态资源图绝对路径（与 form_metas 逐项对齐）。

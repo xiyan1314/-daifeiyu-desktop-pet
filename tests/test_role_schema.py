@@ -391,3 +391,94 @@ def test_edit_dialog_reorder_and_front(tmp_path, qapp):
     finally:
         dlg._cleanup()
 
+# ---------------- v2.0.1：动作自定义（命名帧动作 + 程序化合成动作） ----------------
+
+def test_norm_animations_custom_keys():
+    """自定义动作键（ASCII 安全名）保留；非法键/保留词/非 PNG/超限帧按口径丢弃截断。"""
+    v = {"idle": ["a.png"], "dance1": ["d1.png", "d2.png"], "bad name": ["x.png"],
+         123: ["n.png"], "eat": ["e.png"],
+         "jump": ["j.png"], "interval_ms": ["i.png"],
+         "spin": ["s%02d.png" % i for i in range(30)]}
+    out = pet_resources._norm_animations(v)
+    assert set(out) == {"idle", "dance1", "eat", "spin"}
+    assert out["dance1"] == ["d1.png", "d2.png"]
+    assert len(out["spin"]) == pet_resources.FRAME_MAX  # 超过上限截断
+    assert "bad name" not in out and 123 not in out
+    assert "jump" not in out and "interval_ms" not in out  # 保留词：死条目/合并键冲突 → 丢弃
+
+
+def test_norm_procs():
+    """程序化动作：kind 白名单、按 kind 钳 amp、非法/内建名/保留词丢弃。"""
+    v = {"sway": {"kind": "sway", "amp": 99, "period_ms": 10},
+         "bad": {"kind": "fly"},
+         "nod": {"kind": "nod", "amp": 0.02, "period_ms": 900},
+         "nod12": {"kind": "nod", "amp": 12.0, "period_ms": 400},
+         "bad name": {"kind": "breathe"},
+         "junk": "not-a-dict",
+         "idle": {"kind": "breathe", "amp": 0.5, "period_ms": 500},
+         "jump": {"kind": "sway"}}
+    out = pet_resources._norm_procs(v)
+    assert set(out) == {"sway", "nod", "nod12"}
+    # 与内建动作/保留词重名：play_action 分支永远命中不了 → 丢弃
+    assert "idle" not in out and "jump" not in out
+    assert out["sway"]["amp"] == 1.0 and out["sway"]["period_ms"] == 200  # 钳到边界
+    assert out["nod"]["amp"] == 1.0 and out["nod"]["period_ms"] == 900  # nod 像素口径下钳 1px
+    assert out["nod"]["kind"] == "nod"
+    assert out["nod12"]["amp"] == 12.0  # nod 像素口径：12px 默认值原样保留（不被钳死）
+
+
+def test_is_valid_custom_action():
+    """命名校验：保留词/内建名/非法名拒绝，与归一化丢弃同口径。"""
+    assert pet_resources.is_valid_custom_action("dance") is True
+    assert pet_resources.is_valid_custom_action("sway2") is True
+    for bad in ("idle", "eat", "poke", "sleep", "jump", "emote", "none",
+                "interval_ms", "bad name", "", "9abc", None, 123):
+        assert pet_resources.is_valid_custom_action(bad) is False, bad
+
+
+def test_custom_actions_accessors(tmp_path):
+    """custom_actions/procs 暴露自定义动作（不含内建动作）；未知角色/越界形态为空。"""
+    _write_index(tmp_path, [{
+        "id": "r1", "name": "x", "file": "r1.png", "form": "single",
+        "frames": ["r1_f00.png"],
+        "forms": [{"name": "常态", "file": "r1.png",
+                   "animations": {"idle": ["r1_f00.png"], "dance": ["d1.png"],
+                                  "sleep": ["s1.png"]},
+                   "procs": {"sway": {"kind": "sway", "amp": 0.05, "period_ms": 1600}}}],
+        "added": "",
+    }], active="r1")
+    lib = pet_resources.RoleLibrary(str(tmp_path))
+    acts = lib.custom_actions("r1", 0)
+    assert ("dance", "frames") in acts
+    assert ("sway", "proc") in acts
+    # 内建动作不在自定义清单里
+    assert all(a[0] not in pet_resources.ANIM_ACTIONS for a in acts)
+    procs = lib.procs("r1", 0)
+    assert procs["sway"] == {"kind": "sway", "amp": 0.05, "period_ms": 1600}
+    assert lib.custom_actions("nope") == [] and lib.custom_actions("r1", 9) == []
+    assert lib.procs("nope") == {} and lib.procs("r1", 9) == {}
+
+
+def test_delete_removes_custom_action_frames(tmp_path):
+    """v2.0.1：自定义帧动作的文件也参与角色删除清理（_role_paths 收全动作键）。"""
+    roles_dir = tmp_path / "roles"
+    roles_dir.mkdir()
+    for fn in ("r_base.png", "r_d1.png", "r_d2.png"):
+        _mk_png(str(roles_dir / fn), 24, 24)
+    _write_index(tmp_path, [{
+        "id": "r2", "name": "x", "file": "r_base.png", "form": "single",
+        "frames": ["r_base.png"],
+        "forms": [{"name": "常态", "file": "r_base.png",
+                   "animations": {"idle": ["r_base.png"],
+                                  "dance": ["r_d1.png", "r_d2.png"]}}],
+        "added": "",
+    }], active="r2")
+    lib = pet_resources.RoleLibrary(str(tmp_path))
+    assert pet_resources.animation_frames(lib.get("r2"), 0, "dance") == ["r_d1.png", "r_d2.png"]
+    ok, err = lib.delete("r2")
+    assert ok and not err, err
+    assert not (roles_dir / "r_d1.png").exists()
+    assert not (roles_dir / "r_d2.png").exists()
+    assert not (roles_dir / "r_base.png").exists()
+
+

@@ -24,6 +24,7 @@ sys.path.insert(0, HERE)
 
 FAILS = []
 CHECKS = []
+EXPECT_CHECKS = 161  # v2.0.1：检查总数硬断言（每次增删检查同步更新；本检查自身不计入）
 
 
 def check(name, cond, extra=""):
@@ -620,6 +621,123 @@ def main_flow():
     except Exception:
         pass  # 有意忽略：临时 wav 清理尽力而为
 
+    # ---- v2.0.1：动作自定义（命名帧动作 + 程序化合成动作） ----
+    check("norm animations custom key",
+          set(main.pet_resources._norm_animations({"idle": ["a.png"], "dance1": ["d.png"],
+                                                   "bad name": ["x.png"], "eat": ["e.png"]}))
+          == {"idle", "dance1", "eat"})
+    _np = main.pet_resources._norm_procs({"s": {"kind": "sway", "amp": 9, "period_ms": 1},
+                                          "b": {"kind": "fly"},
+                                          "n": {"kind": "nod", "amp": 0.02, "period_ms": 900},
+                                          "n12": {"kind": "nod", "amp": 12.0, "period_ms": 400},
+                                          "sleep": {"kind": "sway", "amp": 0.5, "period_ms": 500},
+                                          "jump": {"kind": "sway"}})
+    check("norm procs whitelist+clamp",
+          set(_np) == {"s", "n", "n12"} and _np["s"]["amp"] == 1.0 and _np["s"]["period_ms"] == 200
+          and _np["n"]["amp"] == 1.0 and _np["n"]["period_ms"] == 900
+          and _np["n12"]["amp"] == 12.0)  # nod 像素口径：默认 12px 不被钳死；内建/保留名丢弃
+    check("custom action name validation",
+          main.pet_resources.is_valid_custom_action("dance") is True
+          and main.pet_resources.is_valid_custom_action("jump") is False
+          and main.pet_resources.is_valid_custom_action("interval_ms") is False
+          and main.pet_resources.is_valid_custom_action("idle") is False)
+    # 构造带自定义动作的角色：dance 帧动作（2 帧）+ sway 合成动作（短周期便于快速验证）
+    _ca_dir = os.path.join(_tmp, "roles")
+    os.makedirs(_ca_dir, exist_ok=True)
+    for _fn in ("ca_base.png", "ca_d1.png", "ca_d2.png", "ca_e0.png", "ca_e1.png"):
+        make_test_png(os.path.join(_ca_dir, _fn), 96, 96)
+    pet.role_lib._data["roles"].append({
+        "id": "ca1", "name": "动作自定义", "file": "ca_base.png",
+        "form": "single", "file_full": "", "frames": ["ca_base.png"], "added": "",
+        "forms": [{"name": "常态", "file": "ca_base.png",
+                   "animations": {"idle": ["ca_base.png"],
+                                  "dance": ["ca_d1.png", "ca_d2.png"],
+                                  "eat": ["ca_e0.png", "ca_e1.png"]},
+                   "procs": {"sway": {"kind": "sway", "amp": 0.06, "period_ms": 200}}}],
+    })
+    pet.role_lib._save()
+    pet.apply_role("ca1")
+    check("custom role applied", pet._custom_role and pet.cfg.get("role") == "ca1")
+    check("custom actions listed", ("dance", "frames") in pet.custom_actions()
+          and ("sway", "proc") in pet.custom_actions())
+    check("cur procs exposed", pet._cur_procs().get("sway", {}).get("kind") == "sway")
+    _dset = pet.anim._sets.get("dance") or []
+    check("custom frame action wired", len(_dset) == 2
+          and all(isinstance(f, main.QPixmap) and not f.isNull() for f in _dset))
+    # 菜单动态列出自定义动作
+    class _MenuCA(main.QMenu):
+        def exec(self, *_a, **_k):
+            self._captured = self.actions()
+            return None
+    _real_menu_ca = main.QMenu
+    main.QMenu = _MenuCA
+    _cap_ca = None
+    try:
+        pet._open_menu(QPoint(100, 100))
+        import gc as _gc
+        for _o in _gc.get_objects():
+            if isinstance(_o, _MenuCA) and getattr(_o, "_captured", None) is not None:
+                _cap_ca = _o
+                break
+    except Exception as e:
+        check("menu custom actions build", False, repr(e))
+    finally:
+        main.QMenu = _real_menu_ca
+    _tca = []
+    if _cap_ca is not None:
+        def _walk_ca(acts):
+            for _a in acts:
+                if _a.text():
+                    _tca.append(_a.text())
+                _m2 = _a.menu()
+                if _m2 is not None:
+                    _walk_ca(_m2.actions())
+        _walk_ca(_cap_ca._captured)
+    # 捕获失败必须 FAIL（守卫式跳过会让护栏静默失明）
+    check("menu lists custom actions",
+          _cap_ca is not None and "✦ dance" in _tca and "✦ sway（合成）" in _tca,
+          "texts=%r" % (_tca,))
+    # 播放：命名帧动作 → 播完自动回待机
+    pet.actions.play_action("dance")
+    check("frame action plays", pet.anim_mode == "state" and pet.anim._timer.isActive())
+    _t0 = time.time()
+    while pet.anim_mode == "state" and time.time() - _t0 < 3:
+        app.processEvents()
+        time.sleep(0.02)
+    check("frame action back to idle", pet.anim_mode == "idle")
+    # 播放：程序化合成动作 → 变换生效，播完复位并回待机
+    pet.actions.play_action("sway")
+    check("proc action starts", pet.anim_mode == "state")
+    _t0 = time.time()
+    _moved = False
+    while time.time() - _t0 < 1.2:
+        app.processEvents()
+        time.sleep(0.02)
+        if abs(pet.squash_x - 1.0) > 1e-4:
+            _moved = True
+    check("proc transform applied", _moved)
+    check("proc resets to idle", pet.anim_mode == "idle" and abs(pet.squash_x - 1.0) < 1e-6
+          and abs(pet.squash_y - 1.0) < 1e-6 and pet._proc_offset_y == 0)
+    # 审查修复回归：合成动作播放中喂食 → 吃帧收尾不被顶掉，busy 必须释放
+    pet.actions.play_action("sway")
+    pet.feed("小鱼干")
+    _t0 = time.time()
+    while pet.busy and time.time() - _t0 < 6:
+        app.processEvents()
+        time.sleep(0.02)
+    check("feed during proc releases busy", not pet.busy and pet.anim_mode == "idle"
+          and abs(pet.squash_x - 1.0) < 1e-6 and pet._proc_offset_y == 0)
+    # 审查修复回归：角色切换立即停掉在途合成动作（新角色无残留振荡）
+    pet.actions.play_action("sway")
+    pet.apply_role("")
+    check("role switch stops proc", pet._tween_anim is None
+          and abs(pet.squash_x - 1.0) < 1e-6 and pet._proc_offset_y == 0)
+    # 清理：删除自定义动作角色，恢复默认
+    _okdel, _erdel = pet.role_lib.delete("ca1")
+    check("custom role cleanup", _okdel and pet.role_lib.get("ca1") is None, "err=%r" % (_erdel,))
+    pet.apply_role("")
+    check("restore default after custom", not pet._custom_role and pet.cfg.get("role") == "")
+
     # ---- 3. 音效导入 + 音效组 ----
     wav = os.path.join(_tmp, "tone.wav")
     make_test_wav(wav)
@@ -804,6 +922,10 @@ def main_flow():
         pet_dialogs._warn = _real_warn
 
     # ---- 8. 清理与退出 ----
+    # 护栏自检：检查总数硬断言——任何守卫式跳过（少跑检查）都会让这里 FAIL，
+    # 防止护栏静默失明（新增检查时同步更新 EXPECT_CHECKS）
+    check("v13 total checks", len(CHECKS) == EXPECT_CHECKS,
+          "total=%d expect=%d" % (len(CHECKS), EXPECT_CHECKS))
     pet._quit()  # 内部调 QApplication.quit()
     shutil.rmtree(_tmp, ignore_errors=True)
 

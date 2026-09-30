@@ -59,7 +59,7 @@ import pet_main
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -488,6 +488,10 @@ def _build_ai_sys_prompt(cfg):
 
 # ---------------- 主窗口 ----------------
 class PetWindow(QWidget):
+    # v2.0.1：帧间隔默认值以类属性暴露（pet_actions 等服务不 import 桌宠，须经实例访问）
+    IDLE_FRAME_MS = IDLE_FRAME_MS
+    EAT_FRAME_MS = EAT_FRAME_MS
+
     def __init__(self):
         super().__init__(
             None,
@@ -689,6 +693,7 @@ class PetWindow(QWidget):
         self._flight_vy = 0.0
         self._flight_last = 0.0
         self._land_squash = 1.0
+        self._proc_offset_y = 0     # v2.0.1：程序化「点头」动作竖向位移（恒 0 除非播放中）
         self._drag_samples = []     # [(t, x, y)] 拖拽轨迹采样（松手估速，只留最近 200ms）
         self._spring_vx = 0.0       # 过阻尼弹簧跟手状态（K=200/C=30）
         self._spring_vy = 0.0
@@ -864,6 +869,61 @@ class PetWindow(QWidget):
         anims = self._role_anims or []
         return anims[idx] if 0 <= idx < len(anims) else {}
 
+    def _cur_procs(self):
+        """v2.0.1：当前形态的程序化合成动作 {name: {kind, amp, period_ms}}。"""
+        if not self._custom_role:
+            return {}
+        rid = self.cfg.get("role", "")
+        idx = self.form_keys.index(self.form) if self.form in self.form_keys else 0
+        return self.role_lib.procs(rid, idx)
+
+    def custom_actions(self):
+        """v2.0.1：当前形态的命名动作清单 [(name, kind)]（frames/proc），供菜单/行为系统引用。"""
+        if not self._custom_role:
+            return []
+        rid = self.cfg.get("role", "")
+        idx = self.form_keys.index(self.form) if self.form in self.form_keys else 0
+        return self.role_lib.custom_actions(rid, idx)
+
+    def _play_proc(self, name, spec):
+        """v2.0.1：程序化合成动作——用角色自身贴图按参数振荡（呼吸/摇摆/点头）。"""
+        import math as _math
+        # 统一走归一化：默认值/钳制单一来源（DEFAULT_PROC_PARAMS/PROC_AMP_BOUNDS），
+        # 非法 spec 归一化为空 → 不播（菜单/行为系统传入的都是已归一化数据，此为兜底）
+        spec = pet_resources._norm_procs({str(name): spec or {}}).get(str(name))
+        if not spec:
+            return
+        kind = spec["kind"]
+        amp = float(spec["amp"])
+        period = float(spec["period_ms"])
+        cycles = 2  # 播 2 个周期
+
+        def _onv(v):
+            ph = _math.sin(v * cycles * 2 * _math.pi)
+            if kind == "nod":
+                self._proc_offset_y = int(round(amp * ph))
+            elif kind == "sway":
+                self.squash_x = 1.0 + amp * ph
+                self.squash_y = 1.0 - amp * 0.6 * ph
+            else:  # breathe
+                self.squash_x = 1.0 + amp * ph
+                self.squash_y = 1.0 + amp * ph
+            self._apply_transform()
+
+        def _done():
+            self.squash_x = 1.0
+            self.squash_y = 1.0
+            self._proc_offset_y = 0
+            self._apply_transform()
+            # 吃帧/其它互动进行中不回待机（避免 anim.play('idle') 内部 stop()
+            # 静默丢弃 _eat_done 等收尾回调 → busy 永久卡死；它们的收尾自会回待机）
+            if self.anim_mode != "eat" and not self.busy:
+                self._play_idle()  # v2.0.1：合成动作播完回待机（与命名帧动作 loops=1 同语义）
+
+        self.anim_mode = "state"
+        self._state_timer.stop()
+        self._run_anim(int(period * cycles), _onv, on_finished=_done)
+
     def _compute_base_size(self):
         """P1-7：窗口基准尺寸。旧角色 = 各形态侧图最大尺寸（现行为）；
         v2 角色 = 各形态 (宽×形态scale, 高×形态scale) 的最大值，保证
@@ -1011,24 +1071,21 @@ class PetWindow(QWidget):
     def _wire_anim_sets(self):
         """把当前角色对应的帧集注册进 FrameAnim（init 与角色切换共用）。
 
-        P1-7：自定义角色按「形态×动作」查表（forms[i].animations.{idle,eat,poke,sleep}，
-        RoleLibrary.form_animations 已解析为绝对路径）；旧角色级 frames 已由
-        RoleLibrary._load 迁移为 forms[0].animations.idle（兼容路径，行为不变）。
+        P1-7：自定义角色按「形态×动作」查表（forms[i].animations 内建
+        idle/eat/poke/sleep + v2.0.1 自定义命名帧动作，RoleLibrary.form_animations
+        已解析为绝对路径）；旧角色级 frames 已由 RoleLibrary._load 迁移为
+        forms[0].animations.idle（兼容路径，行为不变）。
         默认角色用内置 idle 帧；eat 集仅默认角色注册（自定义角色吃帧按形态查表）。
         """
         if self._custom_role:
             cur = self._cur_form_anim()
             # S1 修复：form_animations 返回的是绝对路径，必须转 QPixmap 再进 FrameAnim；
             # 任一帧损坏 → 整动作空集（回退静态），与 form_animations 的 isfile 语义一致
-            idle = self._pix_frames(cur.get("idle") or [])
-            eat = self._pix_frames(cur.get("eat") or [])
-            poke = self._pix_frames(cur.get("poke") or [])
-            sleep = self._pix_frames(cur.get("sleep") or [])
-            self.has_frames = bool(idle)
-            self.anim.add_set("idle", idle)
-            self.anim.add_set("eat", eat)
-            self.anim.add_set("poke", poke)
-            self.anim.add_set("sleep", sleep)
+            # v2.0.1：注册全部动作键（内建 idle/eat/poke/sleep + 自定义命名帧动作）
+            for act in (pet_resources.ANIM_ACTIONS + tuple(sorted(
+                    k for k in cur if k not in ("interval_ms",) and k not in pet_resources.ANIM_ACTIONS))):
+                self.anim.add_set(act, self._pix_frames(cur.get(act) or []))
+            self.has_frames = bool(self.anim._sets.get("idle"))
             return
         role_frames = self._role_frames() if self._custom_role else []
         self.has_frames = bool(role_frames) or (bool(self._idle_frames) and not self._custom_role)
@@ -1050,6 +1107,7 @@ class PetWindow(QWidget):
         """重建角色贴图 / 窗口尺寸 / 动画能力（角色切换与恢复默认共用）。"""
         if self._digest_timer is not None:
             self._digest_timer.stop()  # 切换角色：作废旧角色的消化定时器（L1）
+        self._stop_tween()  # v2.0.1：切角色立即停合成动作，防旧角色振荡残留到新角色
         self._build_sprites()
         self._build_state_pix()  # 自定义角色：程序化表情图随底图重建
         # P1-7：各形态尺寸可能不同：窗口按较大者定（v2 角色计入形态 scale），避免溢出/不居中
@@ -1080,7 +1138,7 @@ class PetWindow(QWidget):
             if pix is not None and not pix.isNull():
                 self.item.setPixmap(pix)
 
-    def _play_idle(self):
+    def _play_idle(self, _name=None):
         self._sleeping = False
         self._cur_state = None  # 离开表情/睡眠展示
         if self._custom_role:
@@ -1117,6 +1175,7 @@ class PetWindow(QWidget):
         self._apply_transform()
 
     def _play_eat(self):
+        self._stop_tween()  # v2.0.1：吃帧开始前停合成动作（防 squash 污染 + 收尾顶掉 _eat_done）
         self.anim_mode = "eat"
         # P1-7：帧间隔——自定义角色 forms[i].anim_interval_ms 优先，缺省沿用 EAT_FRAME_MS
         interval = EAT_FRAME_MS
@@ -1184,6 +1243,7 @@ class PetWindow(QWidget):
     POKE_STATES = ("puzzled", "angry", "hiss")
 
     def _show_state(self, state, duration_ms=STATE_DURATION_MS):
+        self._stop_tween()  # v2.0.1：戳戳/表情开始前停合成动作（与吃帧同语义，防振荡叠加）
         # P1-7：戳戳状态优先播「poke 动画帧」（一次），无配置则回退静态状态图
         if state in self.POKE_STATES and self._custom_role:
             poke_frames = self.anim._sets.get("poke") or []
@@ -1206,7 +1266,7 @@ class PetWindow(QWidget):
         self.item.setPixmap(pix)
         self._state_timer.start(duration_ms)
 
-    def _state_done(self):
+    def _state_done(self, _name=None):
         if self.anim_mode == "state":
             self._play_idle()
 
@@ -1406,11 +1466,13 @@ class PetWindow(QWidget):
             t.scale(sx, sy)
             t.translate(-self.base_w / 2.0, -self.base_h / 2.0)
         self.item.setTransform(t)
+        # v2.0.1：_proc_offset_y 为程序化「点头」动作的竖向位移（其余时间恒 0）
+        _poy = int(getattr(self, "_proc_offset_y", 0) or 0)
         if getattr(self, "_anchor_bottom", False):
             dy = self.base_h * self.scale * (self.squash_y - 1.0) / 2.0
-            self.item.setPos(0, -dy)
+            self.item.setPos(0, -dy + _poy)
         else:
-            self.item.setPos(0, 0)
+            self.item.setPos(0, _poy)
         self._update_click_mask()  # P3-1：缩放/贴图变化后重建穿透遮罩（关闭时清遮罩，开销可忽略）
 
     def set_scale(self, s):
@@ -1655,9 +1717,11 @@ class PetWindow(QWidget):
             except Exception as e:
                 _log_error("tween finish cb: %r" % (e,))
 
-    def _run_anim(self, duration, on_value, keyframes=None, end=1.0, easing=None, on_finished=None):
-        # P1-2：单动画槽——新动画启动前停掉上一个；stop() 不发 finished，
-        # 手动执行旧动画的收尾回调，防 busy/squash 状态滞留
+    def _stop_tween(self):
+        """v2.0.1：停掉在途 QVariantAnimation 并执行其收尾回调（幂等）。
+
+        单动画槽被顶替（_run_anim）之外，喂食/戳戳/切角色等走 FrameAnim 的路径
+        也要显式停合成动作，防 squash/_proc_offset_y 继续振荡污染新状态。"""
         if self._tween_anim is not None:
             try:
                 self._tween_anim.stop()
@@ -1666,6 +1730,11 @@ class PetWindow(QWidget):
                 pass  # 有意忽略：动画可能已被销毁（幂等清理）
             self._tween_anim = None
             self._finish_tween(self._tween_finish_cb)
+
+    def _run_anim(self, duration, on_value, keyframes=None, end=1.0, easing=None, on_finished=None):
+        # P1-2：单动画槽——新动画启动前停掉上一个；stop() 不发 finished，
+        # 手动执行旧动画的收尾回调，防 busy/squash 状态滞留
+        self._stop_tween()
         cb = on_finished if on_finished is not None else self._reset_squash
         self._tween_finish_cb = cb
         anim = QVariantAnimation(self)

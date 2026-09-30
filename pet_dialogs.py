@@ -1513,6 +1513,26 @@ class RoleEditDialog(QDialog):
         self._states_status = QLabel("")
         self._states_status.setWordWrap(True)
         right.addWidget(self._states_status)
+
+        # v2.0.1：自定义动作（当前形态）：命名帧动作 + 程序化合成动作
+        act_head = QHBoxLayout()
+        act_head.addWidget(QLabel("自定义动作"))
+        self._act_list = QListWidget()
+        self._act_list.setMaximumHeight(80)
+        act_head.addWidget(self._act_list, 1)
+        act_btns = QVBoxLayout()
+        b_add_f = QPushButton("＋帧动作…")
+        b_add_f.clicked.connect(self._add_frame_action)
+        b_add_p = QPushButton("＋合成…")
+        b_add_p.clicked.connect(self._add_proc_action)
+        b_del = QPushButton("删除")
+        b_del.clicked.connect(self._del_action)
+        act_btns.addWidget(b_add_f)
+        act_btns.addWidget(b_add_p)
+        act_btns.addWidget(b_del)
+        act_head.addLayout(act_btns)
+        right.addLayout(act_head)
+
         body.addLayout(right, 1)
         root.addLayout(body)
 
@@ -1590,6 +1610,7 @@ class RoleEditDialog(QDialog):
         finally:
             self._loading = False
         self._update_statuses()
+        self._refresh_act_list()  # v2.0.1：切形态刷新自定义动作列表
 
     def _update_statuses(self):
         idx = self._cur_idx
@@ -1785,6 +1806,7 @@ class RoleEditDialog(QDialog):
             _warn(self, "编辑角色", "角色名不能为空")
             return
         patch_forms = copy.deepcopy(self._forms)
+        just_staged = []  # 本次保存尝试新暂存的文件（失败只回收这些，不动先前会话的暂存）
         # 处理结果写入 roles/ 目录（新文件名，不换 id）
         try:
             for kind, key, tmp_path in getattr(self, "_process_list", []):
@@ -1792,6 +1814,7 @@ class RoleEditDialog(QDialog):
                 if staged is None:
                     raise RuntimeError("写入角色目录失败")
                 self._staged.append(staged)
+                just_staged.append(staged)
                 if kind == "image":
                     patch_forms[key]["file"] = staged
                 elif kind == "front":
@@ -1806,7 +1829,15 @@ class RoleEditDialog(QDialog):
                 if src is None:
                     patch_forms[idx].setdefault("states", {}).pop(st, None)
         except Exception:
-            self._cleanup_staged()
+            for s in just_staged:
+                p = self._lib.resolve(s)
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass  # 有意忽略：本次写入残留清理尽力而为
+                if s in self._staged:
+                    self._staged.remove(s)
             _warn(self, "编辑角色", "素材写入失败")
             return
         # M1 修复：旧引用集合用库的 _role_paths 全量收集（含 animations 帧），
@@ -1814,7 +1845,15 @@ class RoleEditDialog(QDialog):
         old_refs = set(self._lib._role_paths(self._role))
         ok, err = self._lib.update(self._role_id, {"name": name, "forms": patch_forms})
         if not ok:
-            self._cleanup_staged()
+            for s in just_staged:
+                p = self._lib.resolve(s)
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass  # 有意忽略：本次写入残留清理尽力而为
+                if s in self._staged:
+                    self._staged.remove(s)
             _warn(self, "编辑角色", err or "保存失败")
             return
         # 成功：清理不再被引用的旧素材文件
@@ -1827,6 +1866,17 @@ class RoleEditDialog(QDialog):
                         os.remove(p)
                 except Exception:
                     pass  # 有意忽略：旧文件清理尽力而为（索引已更新，残留仅占空间）
+        # v2.0.1：本次暂存但最终未被引用的新文件（如刚添加又删除的动作帧）同样回收，
+        # 否则 roles/ 目录会残留孤儿帧文件
+        for fn in list(self._staged):
+            p = self._lib.resolve(fn)
+            if os.path.abspath(p) not in new_refs:
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass  # 有意忽略：暂存文件清理尽力而为（不阻塞保存）
+                self._staged.remove(fn)
         self.accept()
 
     def _cleanup_staged(self):
@@ -1845,8 +1895,152 @@ class RoleEditDialog(QDialog):
             shutil.rmtree(self._tmpdir, ignore_errors=True)
             self._tmpdir = None
 
+    # ---------- v2.0.1：自定义动作（当前形态） ----------
+    def _refresh_act_list(self):
+        """列出当前形态的自定义动作（帧动作 + 程序化合成）。"""
+        self._act_list.clear()
+        if self._cur_idx is None or self._loading:
+            return
+        fm = self._forms[self._cur_idx]
+        for act in (fm.get("animations") or {}):
+            if act not in pet_resources.ANIM_ACTIONS:
+                self._act_list.addItem("%s（帧）" % act)
+        for name in sorted(fm.get("procs") or {}):
+            self._act_list.addItem("%s（合成）" % name)
+
+    def _add_frame_action(self):
+        """多选图片 → 统一画布管线 → 立即入角色目录（staged，取消时回收）。"""
+        files, _f = QFileDialog.getOpenFileNames(
+            self, "选择动作帧图片（2 张起）", "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if len(files) < 2:
+            _warn(self, "帧动作", "帧动作至少 2 张图")
+            return
+        max_frames = int(pet_resources.FRAME_MAX)
+        if len(files) > max_frames:
+            _warn(self, "帧动作", "最多 %d 帧（可在设置里调整）" % max_frames)
+            return
+        name, ok = QInputDialog.getText(self, "帧动作", "动作名（英文字母开头，字母/数字/下划线 ≤24 字符）")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if not pet_resources.CUSTOM_ACTION_RE.match(name):
+            _warn(self, "帧动作", "动作名不合法（英文字母开头，字母/数字/下划线）")
+            return
+        if name in pet_resources.ANIM_ACTIONS or name in pet_resources.ACTION_RESERVED:
+            _warn(self, "帧动作", "动作名与内建动作/保留名重名（%s），换一个名字"
+                  % "、".join(pet_resources.ANIM_ACTIONS + pet_resources.ACTION_RESERVED))
+            return
+        idx = self._cur_idx
+        if idx is None or self._lib is None:
+            return
+        if name in (self._forms[idx].get("procs") or {}):
+            _warn(self, "帧动作", "该形态已有同名合成动作，帧动作会被遮蔽，换一个名字")
+            return
+        tmpdir = tempfile.mkdtemp(prefix="role_act_")
+        staged = []
+        try:
+            outs, notes = _prepare_role_frames(files, tmpdir, same_size=False)
+            if outs is None:
+                _warn(self, "帧动作", "处理失败：%s" % (notes,))
+                return
+            for o in outs:
+                s = self._lib.stage_file(o)
+                if s is None:
+                    raise RuntimeError("写入角色目录失败")
+                staged.append(s)
+                self._staged.append(s)
+            self._forms[idx].setdefault("animations", {})[name] = staged
+            self._refresh_act_list()
+        except Exception as e:
+            # 只回收本次尝试暂存的文件——_cleanup_staged() 会连带删掉同会话先前
+            # 已成功添加的动作帧，保存后动作静默变空
+            for s in staged:
+                p = self._lib.resolve(s)
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass  # 有意忽略：本次导入残留清理尽力而为
+                if s in self._staged:
+                    self._staged.remove(s)
+            _warn(self, "帧动作", "导入失败：%s" % e)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _add_proc_action(self):
+        """添加程序化合成动作（呼吸/摇摆/点头，用角色自身贴图合成，无需素材）。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("程序化合成动作")
+        dlg.setStyleSheet(DIALOG_QSS)
+        lay = QVBoxLayout(dlg)
+        nm = QLineEdit()
+        nm.setPlaceholderText("动作名（英文/数字/下划线）")
+        lay.addWidget(nm)
+        kind_box = QComboBox()
+        kind_box.addItem("呼吸（整体轻微缩放）", "breathe")
+        kind_box.addItem("摇摆（左右晃动）", "sway")
+        kind_box.addItem("点头（上下位移）", "nod")
+        lay.addWidget(kind_box)
+        amp = QDoubleSpinBox()
+        amp.setDecimals(3)
+        lay.addWidget(amp)
+        period = QSpinBox()
+        period.setRange(200, 10000)
+        lay.addWidget(period)
+
+        def _apply_proc_defaults():
+            # 幅度/周期默认与钳制范围随 kind 走单一来源（DEFAULT_PROC_PARAMS/PROC_AMP_BOUNDS）
+            k = kind_box.currentData()
+            lo, hi = pet_resources.PROC_AMP_BOUNDS.get(k, (0.001, 1.0))
+            d = pet_resources.DEFAULT_PROC_PARAMS[k]
+            amp.setRange(lo, hi)
+            amp.setValue(float(d["amp"]))
+            period.setValue(int(d["period_ms"]))
+        kind_box.currentIndexChanged.connect(lambda _i: _apply_proc_defaults())
+        _apply_proc_defaults()
+        ok = QPushButton("添加")
+        ok.clicked.connect(dlg.accept)
+        lay.addWidget(ok)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = nm.text().strip()
+        if not pet_resources.CUSTOM_ACTION_RE.match(name):
+            _warn(self, "合成动作", "动作名不合法（英文字母开头，字母/数字/下划线）")
+            return
+        if name in pet_resources.ANIM_ACTIONS or name in pet_resources.ACTION_RESERVED:
+            _warn(self, "合成动作", "动作名与内建动作/保留名重名（%s），会无法从菜单播放，换一个名字"
+                  % "、".join(pet_resources.ANIM_ACTIONS + pet_resources.ACTION_RESERVED))
+            return
+        if self._cur_idx is None or self._lib is None:
+            return
+        if name in (self._forms[self._cur_idx].get("animations") or {}):
+            _warn(self, "合成动作", "该形态已有同名帧动作，合成动作会被遮蔽，换一个名字")
+            return
+        self._forms[self._cur_idx].setdefault("procs", {})[name] = {
+            "kind": kind_box.currentData(), "amp": amp.value(), "period_ms": period.value()}
+        self._refresh_act_list()
+
+    def _del_action(self):
+        """删除选中的自定义动作（按条目后缀只删对应类型：帧/合成同名互不影响）。"""
+        item = self._act_list.currentItem()
+        if item is None or self._cur_idx is None:
+            return
+        text = item.text()
+        fm = self._forms[self._cur_idx]
+        removed = False
+        if text.endswith("（帧）"):
+            fm.setdefault("animations", {}).pop(text[:-len("（帧）")], None)
+            removed = True
+        elif text.endswith("（合成）"):
+            fm.setdefault("procs", {}).pop(text[:-len("（合成）")], None)
+            removed = True
+        if removed:
+            self._refresh_act_list()
+
     def closeEvent(self, event):
         self._cleanup()
+        if self.result() != QDialog.DialogCode.Accepted:
+            self._cleanup_staged()  # v2.0.1：取消/关闭时回收未提交的新文件
         super().closeEvent(event)
 
 
