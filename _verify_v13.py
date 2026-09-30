@@ -40,6 +40,7 @@ import 桌宠 as main  # noqa: E402
 main.DATA_DIR = _tmp
 main.CONFIG_PATH = os.path.join(_tmp, "config.json")
 main.USAGE_PATH = os.path.join(_tmp, "usage.json")
+main.MEMORY_PATH = os.path.join(_tmp, "memory.json")  # P1-6：对话记忆同样隔离到临时目录
 
 
 def make_test_png(path, w=256, h=256):

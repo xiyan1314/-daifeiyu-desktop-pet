@@ -1016,6 +1016,65 @@ class RoleImportDialog(QDialog):
 
 
 # ---------------- a) 角色面板 ----------------
+class AISettingsDialog(QDialog):
+    """AI 接口/模型/人设/回复长度设置（P1-10，OpenAI 兼容，支持本地 Ollama）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(_qt_parent(parent))
+        self._pet = parent
+        self.setWindowTitle("AI 设置")
+        self.setStyleSheet(DIALOG_QSS)
+        self.resize(560, 500)
+        cfg = _get(parent, "cfg") or {}
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("接口地址（OpenAI 兼容；留空 = DeepSeek 官方）"))
+        self._base = QLineEdit(cfg.get("ai_base_url", ""))
+        self._base.setPlaceholderText("https://api.deepseek.com")
+        root.addWidget(self._base)
+        root.addWidget(QLabel("模型名（本地 Ollama 可填 qwen2.5 之类）"))
+        self._model = QLineEdit(cfg.get("ai_model", "deepseek-chat"))
+        root.addWidget(self._model)
+        root.addWidget(QLabel("人设提示词（留空 = 内置大肥鱼人设）"))
+        self._prompt = QPlainTextEdit()
+        self._prompt.setPlainText(cfg.get("ai_system_prompt", ""))
+        self._prompt.setPlaceholderText("留空使用内置人设")
+        root.addWidget(self._prompt, 1)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("回复字数上限"))
+        self._reply = QSpinBox()
+        self._reply.setRange(4, 50)
+        self._reply.setValue(int(cfg.get("ai_reply_len", 25) or 25))
+        row.addWidget(self._reply)
+        row.addWidget(QLabel("max_tokens"))
+        self._tokens = QSpinBox()
+        self._tokens.setRange(16, 512)
+        self._tokens.setValue(int(cfg.get("ai_max_tokens", 60) or 60))
+        row.addWidget(self._tokens)
+        row.addStretch(1)
+        root.addLayout(row)
+        btns = QHBoxLayout()
+        ok = QPushButton("保存")
+        cancel = QPushButton("取消")
+        ok.setDefault(True)
+        ok.clicked.connect(self._save)
+        cancel.clicked.connect(self.reject)
+        btns.addStretch(1)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        root.addLayout(btns)
+
+    def _save(self):
+        data = {
+            "ai_base_url": self._base.text().strip().rstrip("/"),
+            "ai_model": self._model.text().strip() or "deepseek-chat",
+            "ai_system_prompt": self._prompt.toPlainText().strip(),
+            "ai_reply_len": self._reply.value(),
+            "ai_max_tokens": self._tokens.value(),
+        }
+        _call(self._pet, "apply_ai_settings", data)
+        self.accept()
+
+
 class RolePanel(QWidget):
     """角色列表 + 预览 + 导入 / 设为当前 / 删除 / 恢复默认。"""
 

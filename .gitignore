@@ -4,6 +4,8 @@ config.json.tmp
 usage.json
 usage.json.tmp
 memory.log
+memory.json
+memory.json.tmp
 error.log
 error.log.old
 .write_probe

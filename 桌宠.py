@@ -47,7 +47,7 @@ import pet_dialogs
 
 
 APP_NAME = "大肥鱼桌宠"
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 PAD = 1.25  # 窗口相对角色的透明边距（为压扁/回弹预留空间）
 IDLE_FRAME_MS = 140      # 待机帧间隔
 EAT_FRAME_MS = 110       # 进食帧间隔
@@ -131,6 +131,12 @@ DEFAULT_CONFIG = {
     "budget": 0.0,       # 今日预算提醒（<=0 关闭）
     "balance_alert": 0.0,  # 余额预警阈值（<=0 关闭）
     "scale_compensated_role": "",  # 旧版超大角色素材的 scale 一次性补偿标记（文件名）
+    "chat_memory_rounds": 3,  # P1-6：对话上下文轮数（0~10；0=不带记忆）
+    "ai_base_url": "",        # P1-10：AI 接口地址（空=默认 api.deepseek.com）
+    "ai_model": "deepseek-chat",  # P1-10：模型名（OpenAI 兼容，支持本地 Ollama）
+    "ai_system_prompt": "",   # P1-10：人设（空=内置大肥鱼人设）
+    "ai_max_tokens": 60,
+    "ai_reply_len": 25,
 }
 
 # 气泡样式（配置驱动；apply_bubble_style 更新，Bubble.paintEvent 读取）
@@ -175,6 +181,9 @@ def _to_bool(v):
 # 脱敏 key 缓存（未设置 = None，设置后为空串表示「无 key」）
 _redact_key = None
 
+# P0-2：DEBUG 开关——DFY_DEBUG=1 时 _log_error 同时打到 stderr，便于排障
+DEBUG = os.environ.get("DFY_DEBUG") == "1"
+
 
 def set_redact_key(key):
     """由 PetWindow 在 key 载入 / 修改 / 清除后同步，避免 _redact 每次重读并解密 config。"""
@@ -194,10 +203,25 @@ def _redact(msg):
         pass
     msg = re.sub(r"(sk-[A-Za-z0-9_-]{6,})", "sk-***", msg)
     msg = re.sub(r"(Bearer\s+)[A-Za-z0-9._-]+", r"\1***", msg)
+    # P2-1：覆盖 api_key= 字段形态（阈值 6、含 URL 编码字符）与裸 ?key= 查询参数形态
+    msg = re.sub(r"(api[_-]?key\s*[=:]\s*[\"']?)[A-Za-z0-9._\-%/+]{6,}", r"\1***", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"([?&]key\s*=\s*[\"']?)[^\s&\"']{6,}", r"\1***", msg, flags=re.IGNORECASE)
     return msg
 
 
+_logging_error = False  # P0-2：_log_error 重入标志（防 日志→_redact→load_config→日志 套环）
+
+
 def _log_error(msg):
+    global _logging_error
+    if _logging_error:
+        # 重入：直写 stderr 立即返回，阻断套环；外层调用会正常走完整脱敏+落盘
+        try:
+            sys.stderr.write("[DFY] %s\n" % msg)
+        except Exception:
+            pass
+        return
+    _logging_error = True
     try:
         msg = _redact(msg)
         path = os.path.join(DATA_DIR, "error.log")
@@ -206,10 +230,38 @@ def _log_error(msg):
                 os.replace(path, path + ".old")
         except Exception:
             pass
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            # 写盘失败（只读目录等）：回退 stderr，日志坏了也不能静默（P0-2）
+            try:
+                sys.stderr.write("[DFY] %s\n" % msg)
+                sys.stderr.flush()
+            except Exception:
+                pass
     except Exception:
-        pass
+        if DEBUG:
+            raise  # 调试模式：异常直抛，方便定位
+        try:
+            sys.stderr.write("[DFY] log error: %s\n" % msg)
+        except Exception:
+            pass
+    finally:
+        _logging_error = False
+
+
+def _remove_files(paths):
+    """批量删除运行时文件（尽力而为），返回删除条数。清 Key / 清日志 / 退出共用。"""
+    removed = 0
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                removed += 1
+        except Exception:
+            pass
+    return removed
 
 
 def load_config():
@@ -221,8 +273,9 @@ def load_config():
             for k, v in data.items():
                 if k in DEFAULT_CONFIG:
                     cfg[k] = v
-    except Exception:
-        pass
+    except Exception as e:
+        _log_error("load_config 读取失败（按默认值运行）: %r" % (e,))
+        set_redact_key("")  # 配置读不到=没有 key：同步脱敏缓存，阻断 _redact 兜底重读的日志环
     try:
         cfg["scale"] = max(0.2, min(4.0, float(cfg.get("scale", 1.0))))
     except (TypeError, ValueError):
@@ -241,6 +294,17 @@ def load_config():
     # ---- v1.3 新增配置归一化 ----
     cfg["role"] = str(cfg.get("role", "") or "")
     cfg["scale_compensated_role"] = str(cfg.get("scale_compensated_role", "") or "")
+    try:
+        cfg["chat_memory_rounds"] = max(0, min(10, int(cfg.get("chat_memory_rounds", 3) or 3)))
+        cfg["ai_max_tokens"] = max(16, min(512, int(cfg.get("ai_max_tokens", 60) or 60)))
+        cfg["ai_reply_len"] = max(4, min(50, int(cfg.get("ai_reply_len", 25) or 25)))
+    except (TypeError, ValueError):
+        cfg["chat_memory_rounds"] = 3
+        cfg["ai_max_tokens"] = 60
+        cfg["ai_reply_len"] = 25
+    cfg["ai_base_url"] = str(cfg.get("ai_base_url", "") or "").strip().rstrip("/")
+    cfg["ai_model"] = str(cfg.get("ai_model", "deepseek-chat") or "deepseek-chat").strip()
+    cfg["ai_system_prompt"] = str(cfg.get("ai_system_prompt", "") or "")
     cfg["sound_group"] = "custom" if cfg.get("sound_group") == "custom" else "default"
     try:
         bs = cfg.get("bubble_style")
@@ -608,6 +672,40 @@ signals = Signals()
 # USAGE_PATH 仅为旧版 usage.json 的清理/迁移入口，不再写入。
 USAGE_PATH = os.path.join(DATA_DIR, "usage.json")
 
+# P1-6：对话记忆持久化（全量落盘，上下文只取最近 N 轮）
+MEMORY_PATH = os.path.join(DATA_DIR, "memory.json")
+_MEMORY_MAX = 200  # 最多保留 100 轮对话（每条一问一答）
+
+
+def load_chat_memory():
+    """读取 memory.json 对话历史 [(role, content), ...]；缺失/损坏返回 []。"""
+    try:
+        with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("history"), list):
+            out = []
+            for item in data["history"]:
+                # 跳过畸形条目（非二元组/非字符串），不让一条坏数据毁掉整段记忆
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    r, c = item
+                    if isinstance(r, str) and isinstance(c, str):
+                        out.append((r, c))
+            return out[-_MEMORY_MAX:]
+    except Exception as e:
+        _log_error("load_chat_memory 读取失败（从空记忆开始）: %r" % (e,))
+    return []
+
+
+def save_chat_memory(hist):
+    """原子落盘对话记忆；失败进日志（不再静默）。"""
+    try:
+        tmp = MEMORY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"history": list(hist)[-_MEMORY_MAX:]}, f, ensure_ascii=False)
+        os.replace(tmp, MEMORY_PATH)
+    except Exception as e:
+        _log_error("save_chat_memory 写盘失败: %r" % (e,))
+
 
 # ---------------- 食物：图标 / 托盘 / 飞行 ----------------
 _FOOD_PIX_CACHE = {}
@@ -941,10 +1039,11 @@ class PetWindow(QWidget):
         self._currency = "CNY"
         self._manual_pending = False
         self._pending_manual = False  # 在途自动刷新结束后需补发的手动查询
+        self._closing = False  # P1-5：退出标志（在途网络请求信号守卫）
         self._weather_inflight = False
         self._ai_inflight = False
         self._save_scale_timer = None
-        self._chat_history = []  # [(role, content), ...] 最近对话，最多 6 条
+        self._chat_history = load_chat_memory()  # P1-6：全量对话记忆（重启仍记得）
         self._history_lock = threading.Lock()  # 保护 _chat_history 的跨线程读写
         self._drag_timer = QTimer(self)
         self._drag_timer.setInterval(30)
@@ -1057,6 +1156,8 @@ class PetWindow(QWidget):
         self._walk_interval = WALK_INTERVAL_MS
         self._wander_target = None
         self._tween_anim = None
+        self._tween_finish_cb = None  # P1-2：当前动画的收尾回调（被顶替时手动执行）
+        self._mem_epoch = 0  # P1-6：记忆代次（清理记忆后 +1，在途 AI 回复据此判断是否入记忆）
         self._fly_timer = None
         self._anchor_bottom = False
 
@@ -1637,6 +1738,8 @@ class PetWindow(QWidget):
         return int((self.height() - self.base_h * self.scale) / 2)
 
     def show_bubble(self, text):
+        if self._closing:
+            return  # P1-5：退出后不再弹气泡（在途信号守卫）
         if not text:
             return
         pad_top = self._pad_top()
@@ -1787,6 +1890,8 @@ class PetWindow(QWidget):
         self._position_badge()
 
     def _on_balance_updated(self, total, currency, granted):
+        if self._closing:
+            return  # P1-5：退出中不再响应在途余额结果
         self._fetching_balance = False
         if self._pending_manual:
             self._pending_manual = False
@@ -1834,6 +1939,8 @@ class PetWindow(QWidget):
         anim.start()
 
     def _on_balance_err(self):
+        if self._closing:
+            return  # P1-5：退出中不再响应在途余额错误
         self._fetching_balance = False
         if self._pending_manual:
             self._pending_manual = False
@@ -1886,7 +1993,28 @@ class PetWindow(QWidget):
         threading.Thread(target=self._balance_worker, args=(key,), daemon=True).start()
 
     # ---------- 互动 ----------
+    def _finish_tween(self, cb):
+        """收尾回调统一出口：自然结束与被顶替共用；幂等，异常不向外抛。"""
+        self._tween_finish_cb = None
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:
+                _log_error("tween finish cb: %r" % (e,))
+
     def _run_anim(self, duration, on_value, keyframes=None, end=1.0, easing=None, on_finished=None):
+        # P1-2：单动画槽——新动画启动前停掉上一个；stop() 不发 finished，
+        # 手动执行旧动画的收尾回调，防 busy/squash 状态滞留
+        if self._tween_anim is not None:
+            try:
+                self._tween_anim.stop()
+                self._tween_anim.deleteLater()
+            except RuntimeError:
+                pass
+            self._tween_anim = None
+            self._finish_tween(self._tween_finish_cb)
+        cb = on_finished if on_finished is not None else self._reset_squash
+        self._tween_finish_cb = cb
         anim = QVariantAnimation(self)
         anim.setDuration(duration)
         anim.setStartValue(0.0)
@@ -1897,7 +2025,7 @@ class PetWindow(QWidget):
         if easing is not None:
             anim.setEasingCurve(easing)
         anim.valueChanged.connect(on_value)
-        anim.finished.connect(on_finished if on_finished is not None else self._reset_squash)
+        anim.finished.connect(lambda: self._finish_tween(cb))
         anim.finished.connect(anim.deleteLater)
         self._tween_anim = anim
         anim.start()
@@ -2212,16 +2340,13 @@ class PetWindow(QWidget):
         self._manual_pending = False
         with self._history_lock:
             self._chat_history.clear()  # 聊天记忆一并清空（与 _ai_worker 追加互斥）
+            self._mem_epoch += 1  # 代次 +1：在途 AI 回复检测到后不再把本次对话写回记忆
         if self.book is not None:
             self.book.reset_balance_baseline()  # 只清余额基准，手动记账保留
         self._usage = self.book.today_usage() if self.book is not None else 0.0
-        for p in (USAGE_PATH, os.path.join(DATA_DIR, "error.log"),
-                  CONFIG_PATH + ".tmp", USAGE_PATH + ".tmp"):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
+        _remove_files((USAGE_PATH, os.path.join(DATA_DIR, "error.log"),
+                       CONFIG_PATH + ".tmp", USAGE_PATH + ".tmp",
+                       MEMORY_PATH, MEMORY_PATH + ".tmp"))  # P1-6：清 Key 连带清对话记忆文件
         self.show_bubble("API Key 已清空，余额基准和日志擦干净啦（手动记账保留）~")
 
     PRAISE_KEYWORDS = ("夸", "棒", "可爱", "漂亮", "好看", "喜欢", "厉害", "乖", "萌", "聪明")
@@ -2261,22 +2386,32 @@ class PetWindow(QWidget):
         threading.Thread(target=self._ai_worker, args=(msg, self.cfg.get("api_key", "")), daemon=True).start()
 
     def _ai_worker(self, msg, key):
+        # P1-10：接口/模型/人设/长度全部配置驱动（OpenAI 兼容，支持本地 Ollama）
+        # 配置读取与转换全部在 try 内：任何异常都走统一的"网络不好"回复，绝不卡死 _ai_inflight
         try:
+            base_url = (self.cfg.get("ai_base_url") or "").strip().rstrip("/")
+            url = (base_url + "/chat/completions") if base_url else "https://api.deepseek.com/chat/completions"
+            model = (self.cfg.get("ai_model") or "").strip() or "deepseek-chat"
+            sys_prompt = (self.cfg.get("ai_system_prompt") or "").strip() or SYSTEM_PROMPT
+            max_tokens = int(self.cfg.get("ai_max_tokens", 60) or 60)
+            reply_len = int(self.cfg.get("ai_reply_len", MAX_REPLY_LEN) or MAX_REPLY_LEN)
+            rounds = int(self.cfg.get("chat_memory_rounds", 3) or 3)
+            mem_epoch = self._mem_epoch  # 记录清记忆代次：清理动作发生在请求在途时，本次回复不入记忆
             with self._history_lock:
-                history = list(self._chat_history[-6:])
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                history = list(self._chat_history[-(rounds * 2):]) if rounds > 0 else []
+            messages = [{"role": "system", "content": sys_prompt}]
             messages += [{"role": r, "content": c} for r, c in history]
             messages.append({"role": "user", "content": msg})
             resp = requests.post(
-                "https://api.deepseek.com/chat/completions",
+                url,
                 headers={
                     "Authorization": "Bearer " + key,
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "deepseek-chat",
+                    "model": model,
                     "messages": messages,
-                    "max_tokens": 60,
+                    "max_tokens": max_tokens,
                     "temperature": 1.0,
                 },
                 timeout=20,
@@ -2293,17 +2428,21 @@ class PetWindow(QWidget):
             resp.raise_for_status()
             data = resp.json()
             text = data["choices"][0]["message"]["content"].strip().replace("\n", " ")
-            if len(text) > MAX_REPLY_LEN:
-                text = text[:MAX_REPLY_LEN]
+            if len(text) > reply_len:
+                text = text[:reply_len]
             with self._history_lock:
-                # Key 已被清除时丢弃本次对话记忆（清除语义不可被在途请求撤销）。
+                # Key 已被清除 / 记忆被清理（代次变化）时丢弃本次对话记忆，
+                # 清除语义不可被在途请求撤销。
                 # 注：_history_lock 只互斥 _chat_history 的 append/clear；cfg["api_key"]
                 # 字段本身由 GIL 保证单条赋值原子性，不在此锁覆盖范围。
-                if self.cfg.get("api_key"):
+                if self.cfg.get("api_key") and self._mem_epoch == mem_epoch:
                     self._chat_history.append(("user", msg))
                     self._chat_history.append(("assistant", text))
-                    if len(self._chat_history) > 6:
-                        del self._chat_history[:len(self._chat_history) - 6]
+                    snapshot = list(self._chat_history)
+                else:
+                    snapshot = None
+            if snapshot is not None:
+                save_chat_memory(snapshot)  # P1-6：锁外落盘，原子写不阻塞其他线程
             signals.reply_ok.emit()  # 回复成功：由主线程播任务完成音（线程安全）
             signals.reply.emit(text)
         except Exception as e:
@@ -2614,6 +2753,13 @@ class PetWindow(QWidget):
         key_act.triggered.connect(self._set_api_key)
         clear_key_act = set_menu.addAction("🧹 清除DeepSeek API Key")
         clear_key_act.triggered.connect(self._clear_api_key)
+        set_menu.addSeparator()
+        ai_set_act = set_menu.addAction("🤖 AI设置…")  # P1-10：接口/模型/人设/长度
+        ai_set_act.triggered.connect(self._open_ai_settings)
+        mem_act = set_menu.addAction("🧠 对话记忆…")  # P1-6：上下文轮数
+        mem_act.triggered.connect(self._set_chat_rounds)
+        clear_logs_act = set_menu.addAction("🧹 清理日志…")  # P2-1：日志/记忆卫生
+        clear_logs_act.triggered.connect(self._clear_logs)
         menu.addSeparator()
 
         praise_act = menu.addAction("❤️ 夸夸她")
@@ -2822,6 +2968,58 @@ class PetWindow(QWidget):
         except Exception as e:
             _log_error("lines dialog failed: %r" % (e,))
 
+    # ---------- P1-10 / P1-6 / P2-1：AI 设置 / 对话记忆 / 日志清理 ----------
+    def _open_ai_settings(self):
+        try:
+            dlg = pet_dialogs.AISettingsDialog(self)
+            pet_dialogs.modal(dlg)
+        except Exception as e:
+            _log_error("ai settings dialog failed: %r" % (e,))
+
+    def apply_ai_settings(self, data=None):
+        """应用 AI 设置（对话框保存后回调；data 为 {配置键: 值}）。"""
+        if not isinstance(data, dict):
+            return
+        for k, v in data.items():
+            if k in DEFAULT_CONFIG:
+                self.cfg[k] = v
+        save_config(self.cfg)
+        self.show_bubble("AI 设置已更新，下次聊天就按新口味来~")
+
+    def _set_chat_rounds(self):
+        # 与 _ask_amount 同套路：置顶 + 显式焦点，规避主窗口 WindowDoesNotAcceptFocus 的前台锁
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("对话记忆")
+        dlg.setLabelText("聊天时带最近几轮上下文？（0 = 不带记忆，1~10）")
+        dlg.setInputMode(QInputDialog.InputMode.IntInput)
+        dlg.setIntRange(0, 10)
+        dlg.setIntValue(int(self.cfg.get("chat_memory_rounds", 3) or 3))
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.setFocus()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        val = dlg.intValue()
+        self.cfg["chat_memory_rounds"] = val
+        save_config(self.cfg)
+        if val:
+            self.show_bubble("记住最近 %d 轮对话啦~" % val)
+        else:
+            self.show_bubble("不带记忆啦，每次都是全新的鱼~")
+
+    def _clear_logs(self):
+        """清理 error.log(.old) / memory.log / 对话记忆文件（P2-1 日志卫生）。"""
+        removed = _remove_files((os.path.join(DATA_DIR, "error.log"),
+                                 os.path.join(DATA_DIR, "error.log.old"),
+                                 os.path.join(DATA_DIR, "memory.log"),
+                                 MEMORY_PATH, MEMORY_PATH + ".tmp"))
+        with self._history_lock:
+            self._chat_history.clear()
+            self._mem_epoch += 1  # 代次 +1：在途 AI 回复不再把本次对话写回记忆
+        self.show_bubble("日志和对话记忆都清干净啦~" if removed else "本来就干干净净的~")
+
     def _add_manual_record(self):
         if self.book is None:
             return
@@ -2897,6 +3095,7 @@ class PetWindow(QWidget):
 
     def _quit(self):
         """退出：停止全部定时器/动画、隐藏窗口、清理临时文件，然后结束进程。"""
+        self._closing = True  # P1-5：先立退出标志，在途网络请求信号/气泡被守卫拦下
         try:
             self.bubble.hide()
             self.badge.hide()
@@ -2933,16 +3132,12 @@ class PetWindow(QWidget):
                     self._preview_player.stop()
             except Exception:
                 pass
-            for p in (CONFIG_PATH + ".tmp", USAGE_PATH + ".tmp",
-                      os.path.join(DATA_DIR, "ledger.json.tmp"),
-                      os.path.join(DATA_DIR, "ledger_archive.json.tmp"),
-                      os.path.join(DATA_DIR, "roles.json.tmp"),
-                      os.path.join(DATA_DIR, "audio.json.tmp")):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
+            _remove_files((CONFIG_PATH + ".tmp", USAGE_PATH + ".tmp",
+                           os.path.join(DATA_DIR, "ledger.json.tmp"),
+                           os.path.join(DATA_DIR, "ledger_archive.json.tmp"),
+                           os.path.join(DATA_DIR, "roles.json.tmp"),
+                           os.path.join(DATA_DIR, "audio.json.tmp"),
+                           MEMORY_PATH + ".tmp"))  # P1-6：退出清记忆原子写残留
         except Exception:
             pass
         QApplication.quit()  # 事件循环退出后主线程结束，daemon 线程随进程回收
